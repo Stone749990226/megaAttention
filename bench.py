@@ -25,7 +25,7 @@ import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
 import reference as ref
-from megaattn_oproj_ar_sm90 import HopperWgmmaGemmPersistentKernel
+from megaattn_oproj_ar_sm90 import OProjARFusedKernelSM90
 
 # Match tp_attention/tp_overlap NVLS setup.
 os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
@@ -111,22 +111,23 @@ def main():
     assert hC.has_multicast_support, "symmetric memory has no multicast support"
     c_mc_ptr = hC.multicast_ptr
 
-    flag = symm_mem.empty(num_tiles, device=device, dtype=torch.int32)
+    # flag layout: [0, num_tiles) per-tile readiness, [num_tiles, num_tiles+nSM)
+    # per-SM completion barrier (RS+AG). nSM = physical SM count (>= grid size).
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    flag = symm_mem.empty(num_tiles + num_sms, device=device, dtype=torch.int32)
     flag.zero_()
     hF = symm_mem.rendezvous(flag, gname)
     flag_mc_ptr = hF.multicast_ptr
 
-    out = torch.zeros(M, N, device=device, dtype=ref.DTYPE)
-    out_i32 = out.view(torch.int32)                          # [M, N//2]
+    # RS+AG writes the AllReduce result in place into the symmetric C (no `out`).
 
     # ---- cute tensors (M,*,L=1) ----
     a_ct = from_dlpack(_t3(O_local), assumed_align=16)
     b_ct = from_dlpack(_t3(B), assumed_align=16)
     c_ct = from_dlpack(_t3(C), assumed_align=16)
-    out_ct = from_dlpack(_t3(out_i32), assumed_align=16)
     flag_ct = from_dlpack(flag, assumed_align=4)
 
-    kernel = HopperWgmmaGemmPersistentKernel(
+    kernel = OProjARFusedKernelSM90(
         cutlass.Float32, (BLOCK_M, BLOCK_N), (1, 1), swizzle_size=1, raster_along_m=True
     )
     hw = cutlass.utils.HardwareInfo()
@@ -138,7 +139,7 @@ def main():
     if rank == 0:
         print("[megaattn] compiling fused kernel ...")
     compiled = cute.compile(
-        kernel, a_ct, b_ct, c_ct, out_ct, flag_ct,
+        kernel, a_ct, b_ct, c_ct, flag_ct,
         c_mc_ptr, flag_mc_ptr, rank, ws, max_active_clusters, stream,
     )
 
@@ -146,14 +147,14 @@ def main():
         C.zero_()
         flag.zero_()
         dist.barrier(device_ids=[lr])
-        compiled(a_ct, b_ct, c_ct, out_ct, flag_ct, stream)
+        compiled(a_ct, b_ct, c_ct, flag_ct, stream)
 
     # ---- correctness ----
     if args.check:
         run_fused()
         torch.cuda.synchronize()
         ref_out = ref.reference_out(O_local, W_o, group=group)
-        max_abs, max_rel, mean_abs = ref.compare(out, ref_out)
+        max_abs, max_rel, mean_abs = ref.compare(C, ref_out)
         # bf16 reduction: gate on absolute error (relative error is meaningless
         # for the many near-zero output entries).
         ok = max_abs <= args.tol_abs
@@ -168,7 +169,7 @@ def main():
 
     # ---- timing ----
     # fused kernel launches on `stream` (== torch_stream); record events there.
-    t_fused = bench_cuda(lambda: compiled(a_ct, b_ct, c_ct, out_ct, flag_ct, stream),
+    t_fused = bench_cuda(lambda: compiled(a_ct, b_ct, c_ct, flag_ct, stream),
                          args.warmup, args.iters, torch_stream=torch_stream)
 
     partial = torch.empty(M, N, device=device, dtype=ref.DTYPE)

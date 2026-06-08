@@ -10,17 +10,18 @@ bf16-accumulation tolerance. We compute the reference in fp32 and reduce with
 torch.distributed.all_reduce so the comparison isolates the kernel's numerics
 (bf16 inputs, fp32 WGMMA accumulate, NVLS bf16 reduction) from layout/scheduling.
 
-Shapes (DeepSeek dense MHA, bf16, W=8) -- mirrors /workspace/tp_attention.py:
-    M = BATCH*SEQ      = 2*4096 = 8192     (tokens)
-    K = local_heads*HEAD_DIM = 7*128 = 896 (per-rank attention output width)
-    N = HIDDEN         = 7168               (model hidden)
+Shapes (DeepSeek-V3 dense MHA, bf16, W=8) -- mirrors /workspace/tp_attention.py:
+    M = BATCH*SEQ      = 2*4096 = 8192       (tokens)
+    K = local_heads*HEAD_DIM = 16*128 = 2048 (per-rank attention output width)
+    N = HIDDEN         = 7168                 (model hidden)
 """
 import torch
 import torch.distributed as dist
 
 # ---- problem shape (keep in sync with /workspace/tp_attention.py) ----
+# DeepSeek-V3 attention scale: hidden 7168, 128 heads x 128 head_dim.
 HIDDEN = 7168
-NUM_HEADS = 56
+NUM_HEADS = 128
 HEAD_DIM = 128
 SEQ = 4096
 BATCH = 2
@@ -31,8 +32,8 @@ M = BATCH * SEQ          # 8192
 
 def shapes(world_size: int):
     """Return (M, K, N) for the O_proj GEMM given the TP world size."""
-    local_heads = NUM_HEADS // world_size      # 7 for W=8
-    K = local_heads * HEAD_DIM                  # 896
+    local_heads = NUM_HEADS // world_size      # 16 for W=8
+    K = local_heads * HEAD_DIM                  # 2048
     N = HIDDEN                                  # 7168
     return M, K, N
 

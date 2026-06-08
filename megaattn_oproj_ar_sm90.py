@@ -26,226 +26,50 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
 from typing import Optional, Tuple, Type
 import math
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 
 """
-A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
-using CuTe DSL.
-- Matrix A is MxKxL, L is batch dimension, A can be row-major("K") or column-major("M")
-- Matrix B is NxKxL, L is batch dimension, B can be row-major("N") or column-major("K")
-- Matrix C is MxNxL, L is batch dimension, C can be row-major("N") or column-major("M")
+Fused row-parallel O_proj GEMM + intra-node NVLS Reduce-Scatter + AllGather
+(LDMCxSTMC) for SM90 / Hopper (CuTe DSL). See gemm_allreduce.md / plan.md.
 
-This GEMM kernel supports the following features:
-    - Utilizes Tensor Memory Access (TMA) for efficient memory operations
-    - Utilizes Hopper's WGMMA for matrix multiply-accumulate (MMA) operations
-    - Implements TMA multicast with cluster to reduce L2 memory traffic
-    - Support persistent tile scheduling to better overlap memory load/store with MMA between tiles
-    - Support warp specialization to avoid explicit pipelining between mainloop load and MMA
+    O_local [M,K] @ W_o [K,N] -> partial [M,N]   (per-rank, k-major A / k-major B)
+    out = sum_{r=0..W-1} partial                 (NVLS RS+AG; result written in place
+                                                  into the symmetric buffer C, every rank
+                                                  ends up with the full [M,N] result)
 
-This GEMM works as follows:
-1. DMA warp: Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
-2. MMA warp:
-   - Perform matrix multiply-accumulate (MMA) operations using WGMMA instruction.
-   - Store results from registers (RMEM) to shared memory (SMEM), then to global memory (GMEM) with TMA operations.
-
-Hopper WGMMA instructions operate as follows:
-- Read matrix A from SMEM
-- Read matrix B from SMEM
-- Perform MMA operation and store the result in Accumulator(register)
-
-To run this example:
-
-.. code-block:: bash
-
-    python examples/hopper/dense_gemm_persistent.py                        \
-      --mnkl 8192,8192,8192,1 --tile_shape_mn 128,256                      \
-      --cluster_shape_mn 1,1 --a_dtype Float16 --b_dtype Float16           \
-      --c_dtype Float16 --acc_dtype Float32                                \
-      --a_major k --b_major k --c_major n
-
-The above example command compute batched gemm with M=8192, N=8192, K=8192,
-batch_count=1. The Hopper WGMMA tile shape is 128x256x64 and the cluster shape
-is (1,1). The input, mma accumulator and output data type are set as fp16, fp32
-and fp16, respectively.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/hopper/dense_gemm.py                               \
-      --mnkl 8192,8192,8192,1 --tile_shape_mn 128,256                      \
-      --cluster_shape_mn 1,1 --a_dtype Float16 --b_dtype Float16           \
-      --c_dtype Float16 --acc_dtype Float32                                \
-      --a_major k --b_major k --c_major n
-
-Constraints are same as dense_gemm.py:
-* Supported input data types: fp16, fp8 (e4m3fn, e5m2), int8, uint8
-* For fp16 types, A and B must have the same data type
-* For fp8 types, A and B can have different types (e4m3fn or e5m2)
-* For 8-bit integer types, A and B can have different types (int8 or uint8)
-* 8-bit types (e4m3fn, e5m2, int8, uint8) only support k-major layout
-* CTA tile shape M must be 64/128
-* CTA tile shape N must be 64/128/256
-* CTA tile shape K must be 64
-* Cluster shape M/N must be positive and power of 2, total cluster size <= 4
-* The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
-  i.e, number of elements is a multiple of 8, 16 for Float16, and Float8, respectively.
+One persistent warp-specialized kernel: a DMA warp group feeds WGMMA, the MMA warp group(s)
+produce each tile's partial and TMA-store it into a *symmetric* buffer C, and a dedicated
+comm warp group walks the identical tile schedule. Once all ranks have written a tile
+(per-tile cross-rank flag), rank r reduces only its own M-shard (BLOCK_M/W rows) of the
+tile: `multimem.ld_reduce` over the multicast view C_mc gathers+sums all ranks' shard rows
+in the NVSwitch, then `multimem.st` on the *same* C_mc pointer broadcasts the sum back into
+every rank's C (in place -> no separate `out` buffer). A single per-SM sys-scope completion
+barrier at kernel exit guarantees all ranks' stores have landed before C is read. The comm
+of tile t overlaps the GEMM of later tiles. Derived from CUTLASS's
+hopper/dense_gemm_persistent.py; the RS+AG epilogue follows the SM100 LDMCxSTMC reference.
 """
 
 
-# Helpers to parse args
-def parse_comma_separated_ints(s: str):
-    try:
-        return tuple([int(x.strip()) for x in s.split(",")])
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            "Invalid format. Expected comma-separated integers."
-        )
+class OProjARFusedKernelSM90:
+    """Fused O_proj GEMM + one-shot NVLS multimem AllReduce (bf16 in / fp32 acc, SM90).
 
+    :param acc_dtype: WGMMA accumulator dtype (Float32).
+    :param tile_shape_mn: CTA output tile (M,N); M in {64,128}, N in {64,128,256}, K is 64.
+    :param cluster_shape_mn: cluster dims (kept (1,1) for this fused design).
+    :param swizzle_size / raster_along_m: persistent-scheduler L2 locality knobs.
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Example of MxNxKxL GEMM on Hopper.")
-
-    parser.add_argument(
-        "--mnkl",
-        type=parse_comma_separated_ints,
-        default=(4096, 4096, 4096, 1),
-        help="mnkl dimensions (comma-separated)",
-    )
-    parser.add_argument(
-        "--tile_shape_mn",
-        type=parse_comma_separated_ints,
-        choices=[(128, 128), (128, 256), (128, 64), (64, 64)],
-        default=(128, 128),
-        help="Cta tile shape (comma-separated)",
-    )
-    parser.add_argument(
-        "--cluster_shape_mn",
-        type=parse_comma_separated_ints,
-        choices=[(1, 1), (2, 1), (1, 2), (2, 2)],
-        default=(1, 1),
-        help="Cluster shape (comma-separated)",
-    )
-    parser.add_argument(
-        "--swizzle_size",
-        type=int,
-        default=1,
-        help="Swizzling size in the unit of cluster for improving L2 cache hit rate",
-    )
-    parser.add_argument(
-        "--raster_order",
-        type=str,
-        choices=["along_m", "along_n"],
-        default="along_m",
-        help="Rasterization order of clusters",
-    )
-    parser.add_argument(
-        "--a_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float16,
-    )
-    parser.add_argument(
-        "--b_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float16,
-    )
-    parser.add_argument(
-        "--c_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float16,
-    )
-    parser.add_argument(
-        "--acc_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float32,
-    )
-    parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
-    parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
-    parser.add_argument("--c_major", choices=["n", "m"], type=str, default="n")
-    parser.add_argument(
-        "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
-    )
-    parser.add_argument(
-        "--warmup_iterations", type=int, default=0, help="Warmup iterations"
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=1,
-        help="Number of iterations to run the kernel",
-    )
-    parser.add_argument(
-        "--skip_ref_check", action="store_true", help="Skip reference checking"
-    )
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        default=False,
-        help="Use circular buffer tensor sets to ensure L2 cold cache",
-    )
-
-    args = parser.parse_args()
-
-    if len(args.mnkl) != 4:
-        parser.error("--mnkl must contain exactly 4 values")
-    if len(args.tile_shape_mn) != 2:
-        parser.error("--tile_shape_mn must contain exactly 2 values")
-    if len(args.cluster_shape_mn) != 2:
-        parser.error("--cluster_shape_mn must contain exactly 2 values")
-
-    return args
-
-
-class HopperWgmmaGemmPersistentKernel:
-    """
-    This class implements batched matrix multiplication (C = A x B) with support for various data types
-    and architectural features specific to Hopper GPUs.
-
-    :param acc_dtype: Data type for accumulation during computation
-    :type acc_dtype: type[cutlass.Numeric]
-    :param tile_shape_mn: Shape of the CTA tile (M,N)
-    :type tile_shape_mn: Tuple[int, int]
-    :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
-    :type cluster_shape_mn: Tuple[int, int]
-
-    :note: Supported A/B data types:
-        - Float16
-          A and B must have the same data type
-        - Float8E4M3FN/Float8E5M2
-          A and B can have different types (Float8E4M3FN/Float8E5M2)
-          only support k-major layout
-        - Int8/Uint8
-          A and B can have different types (Int8/Uint8)
-          only support k-major layout
-
-    :note: Supported accumulation types:
-        - Float32/Float16 (for all floating point inputs)
-        - Int32 (for Int8/Uint8 inputs)
-
-    :note: Constraints:
-        - CTA tile M must be 64/128
-        - CTA tile N must be 64/128/256
-        - CTA tile K must be 64
-        - Cluster shape M/N must be positive and power of 2, total cluster size <= 4
-
-    Example:
-        >>> gemm = HopperWgmmaGemmPersistentKernel(
-        ...     acc_dtype=cutlass.Float32,
-        ...     tile_shape_mn=(128, 256),
-        ...     cluster_shape_mn=(1, 1)
-        ... )
-        >>> gemm(a_tensor, b_tensor, c_tensor, stream)
+    Call (see bench.py): builds TMA atoms + the multicast C/flag views from raw symmetric
+    -memory multicast pointers, then launches one kernel that produces partials into the
+    symmetric C and reduces them in place via NVLS RS+AG (result ends up in C).
     """
 
     def __init__(
@@ -294,7 +118,7 @@ class HopperWgmmaGemmPersistentKernel:
         self.occupancy = 1
         self.num_dma_warp_groups = 1
         self.num_mma_warp_groups = math.prod(self.atom_layout_mnk)
-        # MegaAttn: one extra warp group does the one-shot multimem AllReduce,
+        # MegaAttn: one extra warp group does the NVLS RS+AG (LDMCxSTMC) AllReduce,
         # overlapping the AR of tile t with the GEMM of tile t+1 (plan section 2/6).
         self.num_comm_warp_groups = 1
         self.num_warps_per_warp_group = 4
@@ -423,7 +247,6 @@ class HopperWgmmaGemmPersistentKernel:
         a: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
-        out: cute.Tensor,
         flag: cute.Tensor,
         c_mc_ptr: cutlass.Constexpr,
         flag_mc_ptr: cutlass.Constexpr,
@@ -549,7 +372,6 @@ class HopperWgmmaGemmPersistentKernel:
             tma_tensor_b,
             tma_atom_c,
             tma_tensor_c,
-            out,
             c_mc,
             flag,
             flag_mc,
@@ -580,7 +402,6 @@ class HopperWgmmaGemmPersistentKernel:
         mB_nkl: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
-        mOut_mnl: cute.Tensor,
         mC_mc_mnl: cute.Tensor,
         flag: cute.Tensor,
         flag_mc: cute.Tensor,
@@ -718,23 +539,21 @@ class HopperWgmmaGemmPersistentKernel:
         # MegaAttn: number of N-tiles -> global (rank-independent) tile id =
         # m_idx * num_n_tiles + n_idx, used to index the cross-rank flag.
         num_n_tiles = cute.size(gC_mnl, mode=[3])
-        # Multicast view of C (NVLS in-switch reduce target) and the local
-        # AllReduce output, tiled the same way as C.
-        gC_mc_mnl = cute.local_tile(
+        # MegaAttn RS+AG: tile the multicast view of C by the per-rank M-shard
+        # (BLOCK_M/W rows). rank r owns shard row-block r of every BLOCK_M output
+        # tile; for GEMM tile (cm,cn) rank r's shard is shard-tile (cm*W + r, cn).
+        # ld_reduce + st (LDMCxSTMC) both act on this shard view, in place.
+        # Requires BLOCK_M % world_size == 0 and (BLOCK_M/W) % 8 == 0.
+        m_shard = self.tile_shape_mnk[0] // world_size
+        shard_tiler = (m_shard, self.tile_shape_mnk[1], 1)
+        gC_mc_shard = cute.local_tile(
             mC_mc_mnl,
-            cute.slice_(self.tile_shape_mnk, (None, None, 0)),
+            cute.slice_(shard_tiler, (None, None, 0)),
             (None, None, None),
         )
-        # mOut is the int32 view of the bf16 output (N_i32 = N//2). A (BLOCK_M,
-        # BLOCK_N) bf16 tile is a (BLOCK_M, BLOCK_N//2) int32 tile; the local store
-        # uses 32-bit copies (the tv-partitioned slot only proves 32-bit static
-        # alignment, which a 128-bit atom would reject).
-        out_tiler = (self.tile_shape_mnk[0], self.tile_shape_mnk[1] // 2, 1)
-        gOut_mnl = cute.local_tile(
-            mOut_mnl,
-            cute.slice_(out_tiler, (None, None, 0)),
-            (None, None, None),
-        )
+        # number of M-tiles -> total tile count = num_m_tiles * num_n_tiles, used
+        # to offset the per-SM completion-barrier slots past the per-tile region.
+        num_m_tiles = cute.size(gC_mnl, mode=[2])
 
         # Partition shared tensor for TMA load A/B
         # TMA load A partition_S/D
@@ -1066,29 +885,33 @@ class HopperWgmmaGemmPersistentKernel:
             tma_store_pipeline.producer_tail()
 
         # ==================================================================
-        # MegaAttn comm warp group: one-shot multimem AllReduce
+        # MegaAttn comm warp group: NVLS Reduce-Scatter + AllGather (LDMCxSTMC)
         # ------------------------------------------------------------------
         # Walks the *identical* persistent tile schedule as the MMA group. For
         # each tile it waits on the cross-rank flag (all ranks wrote that tile's
-        # partial into the symmetric buffer C), then issues multimem.ld_reduce
-        # over C_mc (NVSwitch sums all 8 ranks in-network) and stores the full
-        # result locally into `out`. Because this runs on its own warp group,
-        # the AllReduce of tile t overlaps the GEMM of tiles t+1.. (plan s.2/5/6).
+        # full BLOCK_M partial into the symmetric buffer C), then operates only on
+        # this rank's M-shard (BLOCK_M/W rows): multimem.ld_reduce over C_mc gathers
+        # +sums all ranks' shard rows in the NVSwitch -> regs, and multimem.st on
+        # the *same* C_mc pointer broadcasts the sum back into every rank's C (in
+        # place). Because this runs on its own warp group, the RS+AG of tile t
+        # overlaps the GEMM of tiles t+1.. A single per-SM sys-scope completion
+        # barrier at the end guarantees all ranks' stores have landed.
         # ==================================================================
         if is_comm_warp_group:
             comm_tidx = (
                 tidx - self.comm_warp_group_idx * self.num_threads_per_warp_group
             )
-            # 128-bit vectorized tiled copies over a (BLOCK_M, BLOCK_N) tile.
-            # thr layout (8,16)=128 threads; each thread owns BLOCK_M/8 rows and
-            # one 128-bit vector along N (=8 bf16 = 4 i32).
+            # 128-bit vectorized partition over this rank's (M_SHARD, BLOCK_N) shard
+            # of each output tile. thr (8,16)=128 threads; each thread owns
+            # M_SHARD/8 rows and one 128-bit vector (=8 bf16) along N.
             vec_bf16 = 128 // self.c_dtype.width
             thr_layout_comm = cute.make_ordered_layout((8, 16), order=(1, 0))
             val_layout_cmc = cute.make_ordered_layout(
-                (self.tile_shape_mnk[0] // 8, vec_bf16), order=(1, 0)
+                (m_shard // 8, vec_bf16), order=(1, 0)
             )
-            # 128-bit partition over C_mc (used only for its per-slot .iterator
-            # fed to multimem.ld_reduce -> no cute.copy alignment check there).
+            # 128-bit partition over the C_mc shard (used only for its per-slot
+            # .iterator fed to multimem.ld_reduce / multimem.st -> no cute.copy
+            # alignment check there).
             load_atom_128 = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 self.c_dtype,
@@ -1098,20 +921,6 @@ class HopperWgmmaGemmPersistentKernel:
                 load_atom_128, thr_layout_comm, val_layout_cmc
             )
             thr_copy_cmc = tiled_copy_cmc.get_slice(comm_tidx)
-            # int32 partition over `out` (same 16-row x 1-vec-per-thread mapping);
-            # store the reduced 4xi32 as 4 x 32-bit copies.
-            val_layout_out = cute.make_ordered_layout(
-                (self.tile_shape_mnk[0] // 8, 4), order=(1, 0)
-            )
-            store_atom_32 = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                cutlass.Int32,
-                num_bits_per_copy=32,
-            )
-            tiled_copy_out = cute.make_tiled_copy_tv(
-                store_atom_32, thr_layout_comm, val_layout_out
-            )
-            thr_copy_out = tiled_copy_out.get_slice(comm_tidx)
 
             comm_tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -1122,8 +931,9 @@ class HopperWgmmaGemmPersistentKernel:
                 cm_idx, cn_idx, cl_idx = comm_work_tile.tile_idx
                 c_tile_id = cm_idx * num_n_tiles + cn_idx
 
-                # Cross-rank readiness: spin until all `world_size` ranks have
-                # incremented this tile's flag, then reset it to 0 (acquire).
+                # (b) Cross-rank readiness: spin until all `world_size` ranks have
+                # incremented this tile's flag (= all ranks wrote the tile's full
+                # BLOCK_M partial into C), then reset it to 0 (acquire).
                 if comm_tidx == 0:
                     utils.distributed.spin_lock_atom_cas_acquire_wait(
                         flag.iterator + c_tile_id,
@@ -1133,29 +943,48 @@ class HopperWgmmaGemmPersistentKernel:
                     )
                 self.comm_sync_barrier.arrive_and_wait()
 
-                cmc_tile = gC_mc_mnl[(None, None, cm_idx, cn_idx, cl_idx)]
-                out_tile = gOut_mnl[(None, None, cm_idx, cn_idx, cl_idx)]
-                tcmc = thr_copy_cmc.partition_S(cmc_tile)
-                tout = thr_copy_out.partition_D(out_tile)
+                # (c) RS+AG on this rank's M-shard of the tile. shard-tile index in
+                # M is cm_idx*W + rank (contiguous BLOCK_M/W row-block r).
+                shard_m_idx = cm_idx * world_size + rank
+                cmc_shard = gC_mc_shard[(None, None, shard_m_idx, cn_idx, cl_idx)]
+                tcmc = thr_copy_cmc.partition_S(cmc_shard)
 
                 (_, rest_m), _, _ = tcmc.shape
                 for i in cutlass.range_constexpr(rest_m):
-                    # NVSwitch sums all ranks' C tile in-network -> 4xi32 (=8 bf16).
-                    x, y, z, w = utils.distributed.multimem_ld_reduce_8xbf16(
-                        tcmc[(None, i), 0, 0].iterator
-                    )
-                    frg_i = cute.make_fragment(4, cutlass.Int32)
-                    frg_i[0] = x
-                    frg_i[1] = y
-                    frg_i[2] = z
-                    frg_i[3] = w
-                    # store the reduced result locally to `out` (int32 view): the
-                    # int32 partition is ((1,(4,16)),1,1) so slot i's 4 i32 live at
-                    # tout[(0,(None,i)),0,0] -> shape (4,), copied as 4x 32-bit.
-                    cute.copy(store_atom_32, frg_i, tout[(0, (None, i)), 0, 0])
+                    mc_ptr = tcmc[(None, i), 0, 0].iterator
+                    # RS: NVSwitch sums all ranks' shard slot in-network -> 4xi32.
+                    x, y, z, w = utils.distributed.multimem_ld_reduce_8xbf16(mc_ptr)
+                    # AG: broadcast the sum back into every rank's C at same slot.
+                    utils.distributed.multimem_st_4xb32(mc_ptr, x, y, z, w)
 
                 comm_tile_sched.advance_to_next_work()
                 comm_work_tile = comm_tile_sched.get_current_work()
+
+            # End-of-kernel per-SM cross-rank completion barrier. Ensures (1) no
+            # rank exits while peers still issue ld_reduce, and (2) every rank's
+            # multimem.st have become visible system-wide before C is read. Uses
+            # flag slots *past* the per-tile region: [num_tiles .. num_tiles+nSM).
+            # NOTE: the `flag` buffer must be sized (num_m_tiles*num_n_tiles + nSM).
+            self.comm_sync_barrier.arrive_and_wait()
+            if comm_tidx == 0:
+                num_tiles_total = num_m_tiles * num_n_tiles
+                bidx_g, bidy_g, bidz_g = cute.arch.block_idx()
+                gdx, gdy, gdz = cute.arch.grid_dim()
+                sm_id_linear = bidx_g + bidy_g * gdx + bidz_g * gdx * gdy
+                done_off = num_tiles_total + sm_id_linear
+                # release-order so this SM's stores precede its flag increment as
+                # observed by the NVSwitch / other ranks.
+                utils.distributed.multimem_red_add1(
+                    flag_mc.iterator + done_off,
+                    scope="sys",
+                    order="release",
+                )
+                utils.distributed.spin_lock_atom_cas_acquire_wait(
+                    flag.iterator + done_off,
+                    expected_val=world_size,
+                    reset_val=0,
+                    scope="sys",
+                )
 
     @staticmethod
     def _compute_stages(
@@ -1440,361 +1269,3 @@ class HopperWgmmaGemmPersistentKernel:
             num_multicast=mcast_dim,
         )
         return tma_atom, tma_tensor
-
-    @staticmethod
-    def is_valid_dtypes(
-        a_dtype: Type[cutlass.Numeric],
-        b_dtype: Type[cutlass.Numeric],
-        acc_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-    ) -> bool:
-        """
-        Check if the dtypes are valid
-
-        :param a_dtype: The data type of tensor A
-        :type a_dtype: Type[cutlass.Numeric]
-        :param b_dtype: The data type of tensor B
-        :type b_dtype: Type[cutlass.Numeric]
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param a_major: major mode of tensor A
-        :type a_major: str
-        :param b_major: major mode of tensor B
-        :type b_major: str
-
-        :return: True if the dtypes are valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        valid_ab_dtypes = {
-            cutlass.Float16,
-            cutlass.Float8E4M3FN,
-            cutlass.Float8E5M2,
-            cutlass.Uint8,
-            cutlass.Int8,
-        }
-        if a_dtype not in valid_ab_dtypes:
-            is_valid = False
-        if b_dtype not in valid_ab_dtypes:
-            is_valid = False
-
-        # make sure a_dtype == b_dtype for Float16
-        if a_dtype.width == 16 and a_dtype != b_dtype:
-            is_valid = False
-        if a_dtype.width != b_dtype.width:
-            is_valid = False
-        if not a_dtype.is_same_kind(b_dtype):
-            is_valid = False
-
-        # for 8-bit types, this implementation only supports k-major layout
-        if (a_dtype.width == 8 and a_major != "k") or (
-            b_dtype.width == 8 and b_major != "k"
-        ):
-            is_valid = False
-
-        # Define compatibility mapping between accumulator type and AB type
-        acc_ab_compatibility = {
-            cutlass.Float32: {
-                cutlass.Float16,
-                cutlass.Float8E4M3FN,
-                cutlass.Float8E5M2,
-            },
-            cutlass.Float16: {
-                cutlass.Float16,
-                cutlass.Float8E4M3FN,
-                cutlass.Float8E5M2,
-            },
-            cutlass.Int32: {cutlass.Uint8, cutlass.Int8},
-        }
-        # Check compatibility between accumulator type and A type
-        if a_dtype not in acc_ab_compatibility[acc_dtype]:
-            is_valid = False
-
-        # Define compatibility mapping between accumulator type and C type
-        acc_c_compatibility = {
-            cutlass.Float32: {
-                cutlass.Float32,
-                cutlass.Float16,
-                cutlass.Float8E4M3FN,
-                cutlass.Float8E5M2,
-            },
-            cutlass.Float16: {
-                cutlass.Float32,
-                cutlass.Float16,
-                cutlass.Float8E4M3FN,
-                cutlass.Float8E5M2,
-            },
-            cutlass.Int32: {
-                cutlass.Float32,
-                cutlass.Float16,
-                cutlass.Int32,
-                cutlass.Int8,
-                cutlass.Uint8,
-            },
-        }
-        # Check compatibility between accumulator type and C type
-        if c_dtype not in acc_c_compatibility[acc_dtype]:
-            is_valid = False
-
-        return is_valid
-
-    @staticmethod
-    def is_valid_tensor_alignment(
-        m: int,
-        n: int,
-        k: int,
-        l: int,
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """
-        Check if the tensor alignment is valid
-
-        :param m: The number of rows in the A tensor
-        :type m: int
-        :param n: The number of columns in the B tensor
-        :type n: int
-        :param k: The number of columns in the A tensor
-        :type k: int
-        :param l: The number of columns in the C tensor
-        :type l: int
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param a_major: The major axis of the A tensor
-        :type a_major: str
-        :param b_major: The major axis of the B tensor
-        :type b_major: str
-        :param c_major: The major axis of the C tensor
-        :type c_major: str
-
-        :return: True if the problem shape is valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
-            major_mode_idx = 0 if is_mode0_major else 1
-            num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // dtype.width
-            return num_major_elements % num_contiguous_elements == 0
-
-        if (
-            not check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, l))
-            or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
-            or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
-        ):
-            is_valid = False
-        return is_valid
-
-
-def run(
-    mnkl: Tuple[int, int, int, int],
-    a_dtype: Type[cutlass.Numeric],
-    b_dtype: Type[cutlass.Numeric],
-    c_dtype: Type[cutlass.Numeric],
-    acc_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-    tile_shape_mn: Tuple[int, int],
-    cluster_shape_mn: Tuple[int, int],
-    swizzle_size: int = 1,
-    raster_along_m: bool = True,
-    tolerance: float = 1e-01,
-    warmup_iterations: int = 0,
-    iterations: int = 1,
-    skip_ref_check: bool = False,
-    use_cold_l2: bool = False,
-    **kwargs,
-):
-    """
-    Prepare A/B/C tensors, launch GPU kernel, and reference checking.
-
-    :param mnkl: Problem size (M, N, K, L)
-    :type mnkl: Tuple[int, int, int, int]
-    :param a_dtype: Data type for input tensor A
-    :type a_dtype: Type[cutlass.Numeric]
-    :param b_dtype: Data type for input tensor B
-    :type b_dtype: Type[cutlass.Numeric]
-    :param c_dtype: Data type for output tensor C
-    :type c_dtype: Type[cutlass.Numeric]
-    :param acc_dtype: Data type for accumulation during matrix multiplication
-    :type acc_dtype: Type[cutlass.Numeric]
-    :param a_major/b_major/c_major: Memory layout of tensor A/B/C
-    :type a_major/b_major/c_major: str
-    :param tile_shape_mn: CTA tile shape (M, N)
-    :type tile_shape_mn: Tuple[int, int]
-    :param cluster_shape_mn: Cluster shape (M, N)
-    :type cluster_shape_mn: Tuple[int, int]
-    :param tolerance: Tolerance value for reference validation comparison
-    :type tolerance: float
-    :param warmup_iterations: Number of warmup iterations before benchmarking, defaults to 0
-    :type warmup_iterations: int, optional
-    :param iterations: Number of benchmark iterations to run, defaults to 1
-    :type iterations: int, optional
-    :param skip_ref_check: Whether to skip reference result validation, defaults to False
-    :type skip_ref_check: bool, optional
-    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
-    :type use_cold_l2: bool, optional
-    :return: Execution time of the GEMM kernel in microseconds
-    :rtype: float
-    """
-    import torch
-    import cutlass.torch as cutlass_torch
-
-    print("Running Hopper Persistent Dense GEMM with:")
-    print(f"mnkl: {mnkl}")
-    print(
-        f"A dtype: {a_dtype}, B dtype: {b_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}"
-    )
-    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
-    print(f"Tile Shape: {tile_shape_mn}, Cluster Shape: {cluster_shape_mn}")
-    print(
-        f"Swizzle size: {swizzle_size}, Raster order:",
-        "along_m" if raster_along_m else "along_n",
-    )
-    print(f"Tolerance: {tolerance}")
-    print(f"Warmup iterations: {warmup_iterations}")
-    print(f"Iterations: {iterations}")
-    print(f"Skip reference checking: {skip_ref_check}")
-    print(f"Use cold L2: {use_cold_l2}")
-
-    # Unpack parameters
-    m, n, k, l = mnkl
-
-    if not HopperWgmmaGemmPersistentKernel.is_valid_dtypes(
-        a_dtype, b_dtype, acc_dtype, c_dtype, a_major, b_major
-    ):
-        raise TypeError(
-            f"unsupported combination of types and majors: A {a_dtype}, B {b_dtype}, Acc {acc_dtype}, C {c_dtype}, {a_major=}, {b_major=}"
-        )
-    if not HopperWgmmaGemmPersistentKernel.is_valid_tensor_alignment(
-        m, n, k, l, a_dtype, c_dtype, a_major, b_major, c_major
-    ):
-        raise TypeError(
-            "the contiguous dimension of A/B/C tensors is not 16 bytes aligned"
-        )
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU is required to run this example!")
-
-    # Create and permute tensor A/B/C
-    a_torch_cpu = cutlass_torch.matrix(l, m, k, a_major == "m", a_dtype)
-    b_torch_cpu = cutlass_torch.matrix(l, n, k, b_major == "n", b_dtype)
-    c_torch_cpu = cutlass_torch.matrix(l, m, n, c_major == "m", c_dtype)
-    a_tensor, _ = cutlass_torch.cute_tensor_like(
-        a_torch_cpu, a_dtype, is_dynamic_layout=True, assumed_align=16
-    )
-    b_tensor, _ = cutlass_torch.cute_tensor_like(
-        b_torch_cpu, b_dtype, is_dynamic_layout=True, assumed_align=16
-    )
-    c_tensor, c_torch_gpu = cutlass_torch.cute_tensor_like(
-        c_torch_cpu, c_dtype, is_dynamic_layout=True, assumed_align=16
-    )
-
-    gemm = HopperWgmmaGemmPersistentKernel(
-        acc_dtype, tile_shape_mn, cluster_shape_mn, swizzle_size, raster_along_m
-    )
-
-    # Compute max active clusters on current device
-    hardware_info = cutlass.utils.HardwareInfo()
-    max_active_clusters = hardware_info.get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
-
-    torch_stream = torch.cuda.Stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-    # Compile gemm kernel
-    compiled_gemm = cute.compile(
-        gemm, a_tensor, b_tensor, c_tensor, max_active_clusters, stream
-    )
-
-    if not skip_ref_check:
-        compiled_gemm(a_tensor, b_tensor, c_tensor, stream)
-        torch.cuda.synchronize()
-
-        # Compute reference result
-        ref = torch.einsum(
-            "mkl,nkl->mnl",
-            a_torch_cpu.to(dtype=torch.float32),
-            b_torch_cpu.to(dtype=torch.float32),
-        )
-
-        # Convert ref to c_dtype
-        _, ref_torch_gpu = cutlass_torch.cute_tensor_like(
-            ref, c_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        ref_c = ref_torch_gpu.cpu()
-
-        # Assert close results
-        torch.testing.assert_close(c_torch_gpu.cpu(), ref_c, atol=tolerance, rtol=1e-03)
-
-    def generate_tensors():
-        a_tensor_workspace, _ = cutlass_torch.cute_tensor_like(
-            a_torch_cpu, a_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        b_tensor_workspace, _ = cutlass_torch.cute_tensor_like(
-            b_torch_cpu, b_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        c_tensor_workspace, _ = cutlass_torch.cute_tensor_like(
-            c_torch_cpu, c_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        return testing.JitArguments(
-            a_tensor_workspace, b_tensor_workspace, c_tensor_workspace, stream
-        )
-
-    workspace_count = 1
-    if use_cold_l2:
-        one_workspace_bytes = (
-            a_torch_cpu.numel() * a_torch_cpu.element_size()
-            + b_torch_cpu.numel() * b_torch_cpu.element_size()
-            + c_torch_cpu.numel() * c_torch_cpu.element_size()
-        )
-        workspace_count = testing.get_workspace_count(
-            one_workspace_bytes, warmup_iterations, iterations
-        )
-
-    exec_time = testing.benchmark(
-        compiled_gemm,
-        workspace_generator=generate_tensors,
-        workspace_count=workspace_count,
-        stream=stream,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-    )
-
-    return exec_time  # Return execution time in microseconds
-
-
-if __name__ == "__main__":
-    args = parse_arguments()
-    run(
-        args.mnkl,
-        args.a_dtype,
-        args.b_dtype,
-        args.c_dtype,
-        args.acc_dtype,
-        args.a_major,
-        args.b_major,
-        args.c_major,
-        args.tile_shape_mn,
-        args.cluster_shape_mn,
-        args.swizzle_size,
-        True if args.raster_order == "along_m" else False,
-        args.tolerance,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.use_cold_l2,
-    )
-    print("PASS")
