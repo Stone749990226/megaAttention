@@ -8,12 +8,16 @@ Implements `plan.md` on 8×H200 with CuTe DSL (`nvidia-cutlass-dsl` 4.5.2, `/usr
   - a 3rd **comm warp group** (DMA=wg0, MMA=wg1, comm=wg2; 384 threads, 1 CTA/SM);
   - symmetric-memory params: local `out`, multicast `c_mc`/`flag_mc` built in-JIT via
     `cute.make_ptr(handle.multicast_ptr, gmem)` + `make_tensor`;
-  - producer side: after each tile's partial is TMA-stored into the **symmetric C**,
-    `multimem_red_add1(flag_mc+tile_id, sys, release)` marks the tile ready (per-tile,
-    rank-independent `tile_id = m_idx*num_n_tiles + n_idx`);
-  - comm side: walks the *identical* persistent schedule, `spin_lock_atom_cas_acquire_wait`
-    on `flag[tile_id]==W`, then `multimem_ld_reduce_8xbf16(C_mc)` (NVSwitch sums 8 ranks)
-    → local 32-bit store into `out`.
+  - producer side: tiles are TMA-stored into the **symmetric C** as before, but the
+    cross-rank handshake is now **per-batch** (G = `comm_batch_tiles`, default 8): only
+    at the end of each G-tile batch (or the SM's last tile) does the epi-store warp
+    `cp_async_bulk_wait_group(0)`-drain that batch's stores and bump the batch flag once
+    via `multimem_red_add1(flag_mc+batch_slot, sys, release)`. Rank-independent
+    `batch_slot = sm_id*max_batches_per_sm + (p//G)`, p = local execution index.
+  - comm side: walks the *identical* persistent schedule; at each batch start
+    (`comm_p % G == 0`) `spin_lock_atom_cas_acquire_wait` on `flag[batch_slot]==W` +
+    one comm-barrier, then per tile `multimem_ld_reduce_8xbf16(C_mc)` (NVSwitch sums 8
+    ranks) → `multimem_st_4xb32` in place. G=1 reproduces the old per-tile behaviour.
 - `reference.py` — fp32 shadow: `O_local@W_o → all_reduce`.
 - `bench.py` — `torch.distributed._symmetric_memory` init, multicast ptrs, compile/run,
   numeric check vs fp32 ref, timing.
@@ -23,23 +27,34 @@ Implements `plan.md` on 8×H200 with CuTe DSL (`nvidia-cutlass-dsl` 4.5.2, `/usr
 (must use `/usr/bin/python` — that's where cutlass-dsl is installed; the `torchrun` on
 PATH is vllm-venv's and lacks it.)
 
-## Results (8×H200, M=8192 K=896 N=7168, bf16)
-- **Correctness: ALL PASS.** max_abs 0.0078 vs ref |max| 1.633 (~0.5%), mean_abs 3.7e-4 — bf16-accurate.
-- **Performance: NOT yet a win.** fused GEMM+AR = **2.62 ms** vs un-fused baseline
-  (torch GEMM 0.147 ms + NVLS all_reduce 0.504 ms = 0.65 ms). ~4× slower.
+## Results (8×H200, M=8192 K=2048 N=7168, bf16; 3584 tiles = 64×56, grid=132)
+- **Correctness: ALL PASS** at every G (max_abs 0.0078 vs ref |max| 1.57, ~0.5%, mean_abs 3.7e-4).
+- **Per-batch handshake is a clear win.** Fused GEMM+AR wall-clock (bench.py, 30 iters):
 
-## Why it's slow (diagnosis / next steps)
-1. **Per-tile cross-rank barrier** (3584 tiles): each tile does a sys-scope multicast
-   `multimem_red_add1` + a CAS-acquire spin. plan §5 calls for **per-SM, per-wave**
-   barriers (~132×7 ≈ 924) — batch the barrier over a wave of tiles, not per tile.
-2. **`cp_async_bulk_wait_group(0)` per tile** in the epilogue drains the whole TMA-store
-   pipeline every tile → serializes store/compute and likely kills GEMM/comm overlap.
-   Track per-tile store completion without a full drain.
-3. **Comm throughput**: 132 CTAs × 128 threads of `ld_reduce` is not yet saturating
-   NVLink the way NCCL NVLS does (0.50 ms). Needs nsys/ncu to confirm overlap and tune
-   the comm thread/vector mapping.
-4. Confirm with nsys that comm warp group actually overlaps the next tiles' WGMMA.
+  | G | num_batch_slots | fused (ms) | exposed-AR (ms) | speedup vs un-fused baseline |
+  |---|---|---|---|---|
+  | 1 (per-tile, old) | 3696 | 0.7249 | 0.4155 | 1.128× |
+  | **4** | 924 | **0.5596** | **0.2486** | **1.465×** |
+  | 8 (default) | 528 | 0.5759 | 0.2651 | 1.421× |
+  | 16 | 264 | 0.6522 | 0.3415 | 1.254× |
+  | 28 (single batch) | 132 | 0.7903 | 0.4796 | 1.038× |
 
-The mechanism (fusion + one-shot multimem AR + symmetric memory + per-SM-correct flags)
-is in place and verified correct; reaching the plan's ~20–25% target is a profiling-driven
-optimization pass on items 1–4.
+  Logs: `/myworkspace/log/megaattn_batch_G*.log`. un-fused baseline ≈ 0.817 ms,
+  torch GEMM-only ≈ 0.31 ms, NVLS all_reduce-only ≈ 0.51 ms.
+
+- **Inflection exactly as planned.** Batching cuts the 3584 serial cross-rank
+  round-trips to ~3584/G; exposed-AR drops ~40% (0.42→0.25 ms) at G=4–8. G=28
+  (one batch/SM) regresses *below* G=1 — comm wg idles waiting for the whole SM's
+  GEMM, killing GEMM↔comm overlap (the documented failure mode). Sweet spot G∈[4,8];
+  G=4 edged out G=8 here (within run-to-run noise), default kept at 8 per plan.
+
+## Done / next steps
+1. ✅ Per-tile → per-batch cross-rank flag + `cp_async_bulk_wait_group(0)` drain (this change).
+2. **Not yet done:** batch-internal "all-`ld_reduce` → all-`st`" to raise in-flight multimem
+   (report pt 4); deferred to avoid register spill — current comm side still does per-tile
+   `ld→st`. Try with a bumped `comm_register_requirement` if more AR throughput is wanted.
+3. Optional ncu re-profile (worker rank + SourceCounters, per `oproj-ar-ncu-gotchas`) to
+   confirm the `:910/:922` sync-stall share dropped and multimem in-flight rose.
+
+The mechanism (fusion + one-shot multimem AR + symmetric memory + per-batch rank-independent
+flags) is verified correct and now beats the un-fused baseline by ~1.42–1.47× at G=4–8.

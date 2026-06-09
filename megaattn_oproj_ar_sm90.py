@@ -51,6 +51,7 @@ class OProjARFusedKernelSM90:
         cluster_shape_mn: tuple[int, int],
         swizzle_size: int,
         raster_along_m: bool,
+        comm_batch_tiles: int = 8,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -88,6 +89,12 @@ class OProjARFusedKernelSM90:
         self.tiled_mma = None
 
         self.occupancy = 1
+        # MegaAttn: cross-rank AllReduce handshake granularity. Each SM does ONE
+        # flag bump + spin per batch of `comm_batch_tiles` (G) tiles (in its
+        # persistent execution order) instead of one per tile, cutting cross-rank
+        # NVLink round-trips ~G x (plan: per-tile -> per-batch). G=1 reproduces
+        # the per-tile behaviour (numerical regression baseline).
+        self.comm_batch_tiles = comm_batch_tiles
         self.num_dma_warp_groups = 1
         self.num_mma_warp_groups = math.prod(self.atom_layout_mnk)
         # MegaAttn: one extra warp group does the NVLS RS+AG (LDMCxSTMC) AllReduce,
@@ -524,8 +531,30 @@ class OProjARFusedKernelSM90:
             (None, None, None),
         )
         # number of M-tiles -> total tile count = num_m_tiles * num_n_tiles, used
-        # to offset the per-SM completion-barrier slots past the per-tile region.
+        # to offset the per-SM completion-barrier slots past the per-batch region.
         num_m_tiles = cute.size(gC_mnl, mode=[2])
+
+        # MegaAttn per-batch handshake params (plan: per-tile -> per-batch).
+        # The persistent scheduler gives SM `sm_id` the linear tiles
+        # sm_id, sm_id+grid, sm_id+2*grid, ... A "batch" = G consecutive tiles in
+        # that SM's *execution order* (local index p // G). The flag slot only
+        # depends on (sm_id, p//G, max_batches_per_sm) -> rank-independent, since
+        # all ranks launch the same grid and walk the same schedule.
+        #   batch flag slot = sm_id * max_batches_per_sm + (p // G)
+        # max_batches_per_sm / grid_size use the *same* formula as bench.py so the
+        # host flag allocation and device slot indexing agree exactly.
+        comm_batch_tiles = self.comm_batch_tiles
+        num_tiles_total = num_m_tiles * num_n_tiles
+        bidx_sm, bidy_sm, bidz_sm = cute.arch.block_idx()
+        gdx_sm, gdy_sm, gdz_sm = cute.arch.grid_dim()
+        grid_size = gdx_sm * gdy_sm * gdz_sm
+        sm_id = bidx_sm + bidy_sm * gdx_sm + bidz_sm * gdx_sm * gdy_sm
+        # cdiv(cdiv(num_tiles_total, grid_size), G)
+        tiles_per_sm = (num_tiles_total + grid_size - 1) // grid_size
+        max_batches_per_sm = (
+            tiles_per_sm + comm_batch_tiles - 1
+        ) // comm_batch_tiles
+        num_batch_slots = grid_size * max_batches_per_sm
 
         # Partition shared tensor for TMA load A/B
         # TMA load A partition_S/D
@@ -831,28 +860,37 @@ class OProjARFusedKernelSM90:
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 # MegaAttn: this tile's partial is now fully TMA-stored into the
-                # symmetric buffer C. Make the stores visible system-wide, then
-                # bump the cross-rank flag for this tile so that every rank's comm
-                # warp group knows tile `tile_id` is ready to be reduced.
-                # tile_id is the global (rank-independent) tile index, so the same
-                # SM/tile maps to the same flag slot on every rank (plan section 5b).
-                m_idx, n_idx, l_idx = tile_coord_mnl
-                tile_id = m_idx * num_n_tiles + n_idx
-                if warp_idx == self.epi_store_warp_id:
-                    # Ensure all bulk TMA stores of this tile have committed+landed.
-                    cute.arch.cp_async_bulk_wait_group(0, read=False)
-                    with cute.arch.elect_one():
-                        # release-order so the C writes precede the flag increment
-                        # as observed by the NVSwitch / other ranks.
-                        cute.arch.fence_proxy("alias")
-                        utils.distributed.multimem_red_add1(
-                            flag_mc.iterator + tile_id,
-                            scope="sys",
-                            order="release",
-                        )
-
+                # symmetric buffer C. We defer the cross-rank handshake to the end
+                # of each G-tile batch: only after the *last* tile of a batch (or
+                # the SM's final tile, for a short tail batch) do we drain all of
+                # the batch's bulk TMA stores and bump the batch flag once. This
+                # cuts cross-rank NVLink round-trips ~G x vs one bump per tile.
+                # `p_cur` = this tile's local execution index p; captured BEFORE
+                # advance so it labels the tile just produced. flush condition uses
+                # the *next* tile's validity to detect the SM's last tile.
+                p_cur = tile_sched.num_tiles_executed
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                is_last = not work_tile.is_valid_tile
+                do_flush = ((p_cur + 1) % comm_batch_tiles == 0) or is_last
+                if warp_idx == self.epi_store_warp_id:
+                    if do_flush:
+                        # Ensure all bulk TMA stores of this batch's tiles have
+                        # committed+landed before signalling peers.
+                        cute.arch.cp_async_bulk_wait_group(0, read=False)
+                        with cute.arch.elect_one():
+                            # release-order so the C writes precede the flag
+                            # increment as observed by the NVSwitch / other ranks.
+                            cute.arch.fence_proxy("alias")
+                            batch_slot = (
+                                sm_id * max_batches_per_sm
+                                + p_cur // comm_batch_tiles
+                            )
+                            utils.distributed.multimem_red_add1(
+                                flag_mc.iterator + batch_slot,
+                                scope="sys",
+                                order="release",
+                            )
 
             tma_store_pipeline.producer_tail()
 
@@ -901,19 +939,27 @@ class OProjARFusedKernelSM90:
 
             while comm_work_tile.is_valid_tile:
                 cm_idx, cn_idx, cl_idx = comm_work_tile.tile_idx
-                c_tile_id = cm_idx * num_n_tiles + cn_idx
 
-                # (b) Cross-rank readiness: spin until all `world_size` ranks have
-                # incremented this tile's flag (= all ranks wrote the tile's full
-                # BLOCK_M partial into C), then reset it to 0 (acquire).
-                if comm_tidx == 0:
-                    utils.distributed.spin_lock_atom_cas_acquire_wait(
-                        flag.iterator + c_tile_id,
-                        expected_val=world_size,
-                        reset_val=0,
-                        scope="sys",
-                    )
-                self.comm_sync_barrier.arrive_and_wait()
+                # (b) Cross-rank readiness, ONCE per batch. At each batch start
+                # (local tile index comm_p % G == 0) spin until all `world_size`
+                # ranks have bumped this batch's flag (= every rank stored all of
+                # the batch's tiles into C), then reset it to 0 (acquire). The
+                # spin + barrier are amortised over the batch's G tiles. The
+                # batch_slot formula matches the producer side exactly.
+                comm_p = comm_tile_sched.num_tiles_executed
+                if comm_p % comm_batch_tiles == 0:
+                    if comm_tidx == 0:
+                        batch_slot = (
+                            sm_id * max_batches_per_sm
+                            + comm_p // comm_batch_tiles
+                        )
+                        utils.distributed.spin_lock_atom_cas_acquire_wait(
+                            flag.iterator + batch_slot,
+                            expected_val=world_size,
+                            reset_val=0,
+                            scope="sys",
+                        )
+                    self.comm_sync_barrier.arrive_and_wait()
 
                 # (c) RS+AG on this rank's M-shard of the tile. shard-tile index in
                 # M is cm_idx*W + rank (contiguous BLOCK_M/W row-block r).
@@ -935,15 +981,12 @@ class OProjARFusedKernelSM90:
             # End-of-kernel per-SM cross-rank completion barrier. Ensures (1) no
             # rank exits while peers still issue ld_reduce, and (2) every rank's
             # multimem.st have become visible system-wide before C is read. Uses
-            # flag slots *past* the per-tile region: [num_tiles .. num_tiles+nSM).
-            # NOTE: the `flag` buffer must be sized (num_m_tiles*num_n_tiles + nSM).
+            # flag slots *past* the per-batch region:
+            # [num_batch_slots .. num_batch_slots+nSM).
+            # NOTE: the `flag` buffer must be sized (num_batch_slots + nSM).
             self.comm_sync_barrier.arrive_and_wait()
             if comm_tidx == 0:
-                num_tiles_total = num_m_tiles * num_n_tiles
-                bidx_g, bidy_g, bidz_g = cute.arch.block_idx()
-                gdx, gdy, gdz = cute.arch.grid_dim()
-                sm_id_linear = bidx_g + bidy_g * gdx + bidz_g * gdx * gdy
-                done_off = num_tiles_total + sm_id_linear
+                done_off = num_batch_slots + sm_id
                 # release-order so this SM's stores precede its flag increment as
                 # observed by the NVSwitch / other ranks.
                 utils.distributed.multimem_red_add1(

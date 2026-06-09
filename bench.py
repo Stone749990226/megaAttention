@@ -75,9 +75,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
+    # Profiling warm-up: number of fully-initialised run_fused() launches to fire
+    # BEFORE the (profiled) correctness launch, so caches / clocks / symmetric-mem
+    # first-touch are warm. Pair with ncu `--launch-skip <prof_warmup>` so ncu skips
+    # these and profiles a steady-state launch instead of the cold first one.
+    ap.add_argument("--prof-warmup", type=int, default=0)
     ap.add_argument("--check", action="store_true", default=True)
     ap.add_argument("--tol_abs", type=float, default=0.5)
     ap.add_argument("--tol_rel", type=float, default=5e-2)
+    # MegaAttn: cross-rank handshake granularity G. Each SM does one flag bump +
+    # spin per batch of G tiles instead of per tile (plan: per-tile -> per-batch).
+    # G=1 reproduces the per-tile behaviour (numerical regression baseline).
+    ap.add_argument("--comm-batch-tiles", type=int, default=8)
     args = ap.parse_args()
 
     rank = int(os.environ.get("RANK", 0))
@@ -111,11 +120,28 @@ def main():
     assert hC.has_multicast_support, "symmetric memory has no multicast support"
     c_mc_ptr = hC.multicast_ptr
 
-    # flag layout: [0, num_tiles) per-tile readiness, [num_tiles, num_tiles+nSM)
-    # per-SM completion barrier (RS+AG). nSM = physical SM count (>= grid size).
+    # MegaAttn per-batch handshake (plan: per-tile -> per-batch). flag layout:
+    #   [0, num_batch_slots)              per-batch readiness
+    #   [num_batch_slots, +nSM)           per-SM completion barrier (RS+AG)
+    # nSM = physical SM count (>= grid size). The batch-slot count must match the
+    # device-side formula exactly: a "batch" = G consecutive tiles in an SM's
+    # persistent execution order, so each SM owns up to max_batches_per_sm slots.
+    #   grid_size          = min(num_tiles, max_active_clusters)   [cluster=(1,1)]
+    #   max_batches_per_sm = cdiv(cdiv(num_tiles, grid_size), G)
+    #   num_batch_slots    = grid_size * max_batches_per_sm
+    G = args.comm_batch_tiles
+    hw = cutlass.utils.HardwareInfo()
+    max_active_clusters = hw.get_max_active_clusters(1)
+    grid_size = min(num_tiles, int(max_active_clusters))
+    max_batches_per_sm = cdiv(cdiv(num_tiles, grid_size), G)
+    num_batch_slots = grid_size * max_batches_per_sm
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    flag = symm_mem.empty(num_tiles + num_sms, device=device, dtype=torch.int32)
+    flag = symm_mem.empty(num_batch_slots + num_sms, device=device, dtype=torch.int32)
     flag.zero_()
+    if rank == 0:
+        print(f"[megaattn] comm_batch_tiles(G)={G} grid_size={grid_size} "
+              f"max_batches_per_sm={max_batches_per_sm} "
+              f"num_batch_slots={num_batch_slots} (nSM={num_sms})")
     hF = symm_mem.rendezvous(flag, gname)
     flag_mc_ptr = hF.multicast_ptr
 
@@ -128,10 +154,9 @@ def main():
     flag_ct = from_dlpack(flag, assumed_align=4)
 
     kernel = OProjARFusedKernelSM90(
-        cutlass.Float32, (BLOCK_M, BLOCK_N), (1, 1), swizzle_size=1, raster_along_m=True
+        cutlass.Float32, (BLOCK_M, BLOCK_N), (1, 1), swizzle_size=1, raster_along_m=True,
+        comm_batch_tiles=G,
     )
-    hw = cutlass.utils.HardwareInfo()
-    max_active_clusters = hw.get_max_active_clusters(1)
 
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -148,6 +173,15 @@ def main():
         flag.zero_()
         dist.barrier(device_ids=[lr])
         compiled(a_ct, b_ct, c_ct, flag_ct, stream)
+
+    # ---- profiling warm-up ----
+    # Fire N fully-initialised launches so the launch ncu actually profiles
+    # (skipped to via --launch-skip N) runs with warm caches / settled clocks.
+    # Each run_fused() re-zeroes C/flag and barriers, so state stays correct.
+    for _ in range(args.prof_warmup):
+        run_fused()
+    if args.prof_warmup:
+        torch.cuda.synchronize()
 
     # ---- correctness ----
     if args.check:
