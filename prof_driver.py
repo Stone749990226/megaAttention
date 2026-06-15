@@ -27,7 +27,7 @@ import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
 import reference as ref
-from megaattn_oproj_ar_sm90 import OProjARFusedKernelSM90
+from oproj_ar_sm90 import OProjARFusedKernelSM90
 
 os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
 os.environ.setdefault("NCCL_ALGO", "NVLS")

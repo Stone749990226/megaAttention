@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # ncu profiling for the fused O_proj GEMM + one-shot NVLS AllReduce SM90 kernel
-# (megaattn_oproj_ar_sm90.py :: OProjARFusedKernelSM90).
+# (oproj_ar_sm90.py :: OProjARFusedKernelSM90).
 #
 # Modeled on the multi-GPU warp-specialization+NVSHMEM reference script:
 #   - one ncu instance PER RANK, all launched concurrently;
@@ -135,11 +135,11 @@ SECTIONS1=(
   --section ComputeWorkloadAnalysis
   --section MemoryWorkloadAnalysis
   --section SchedulerStats
-  --section WarpStateStats         # stall-reason breakdown (key for a comm-overlapped kernel)
-  --section Occupancy
-  --section InstructionStats
-  --section LaunchStats
-  --section WorkloadDistribution
+  # --section WarpStateStats         # stall-reason breakdown (key for a comm-overlapped kernel)
+  # --section Occupancy
+  # --section InstructionStats
+  # --section LaunchStats
+  # --section WorkloadDistribution
 )
 
 # --- The old monolithic "SET 2" (NVLink+C2C+Memory tables+SourceCounters+2x
@@ -257,7 +257,7 @@ echo "[ncu_oproj_ar] waiting for ${NUM_PROCESSES} instances ..."
 # per-pass progress only lands in ncu.rank*.out -- so heartbeat the current pass
 # into the main log, and abort if NO pass advances for STALL_LIMIT seconds
 # (catches a deadlock in minutes instead of waiting indefinitely).
-STALL_LIMIT=${STALL_LIMIT:-300}            # seconds with no forward progress => abort
+STALL_LIMIT=${STALL_LIMIT:-600}            # seconds with no forward progress => abort
 last_pass=-1; last_change=$(date +%s)
 rc=0
 while :; do

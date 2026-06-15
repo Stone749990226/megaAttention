@@ -25,7 +25,7 @@ import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
 import reference as ref
-from megaattn_oproj_ar_sm90 import OProjARFusedKernelSM90
+from oproj_ar_sm90 import OProjARFusedKernelSM90
 
 # Match tp_attention/tp_overlap NVLS setup.
 os.environ.setdefault("NCCL_NVLS_ENABLE", "1")

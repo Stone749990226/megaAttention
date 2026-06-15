@@ -51,7 +51,7 @@ class OProjARFusedKernelSM90:
         cluster_shape_mn: tuple[int, int],
         swizzle_size: int,
         raster_along_m: bool,
-        comm_batch_tiles: int = 8,
+        comm_batch_tiles: int = 4,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.

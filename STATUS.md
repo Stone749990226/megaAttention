@@ -3,7 +3,7 @@
 Implements `plan.md` on 8×H200 with CuTe DSL (`nvidia-cutlass-dsl` 4.5.2, `/usr/bin/python`).
 
 ## Files
-- `megaattn_oproj_ar_sm90.py` — forked from CUTLASS `hopper/dense_gemm_persistent.py`
+- `oproj_ar_sm90.py` — forked from CUTLASS `hopper/dense_gemm_persistent.py`
   (persistent warp-specialized WGMMA GEMM). Added:
   - a 3rd **comm warp group** (DMA=wg0, MMA=wg1, comm=wg2; 384 threads, 1 CTA/SM);
   - symmetric-memory params: local `out`, multicast `c_mc`/`flag_mc` built in-JIT via
@@ -41,6 +41,23 @@ PATH is vllm-venv's and lacks it.)
 
   Logs: `/myworkspace/log/megaattn_batch_G*.log`. un-fused baseline ≈ 0.817 ms,
   torch GEMM-only ≈ 0.31 ms, NVLS all_reduce-only ≈ 0.51 ms.
+
+### Cross-impl comparison vs Triton-distributed GemmARLayer (NVSHMEM)
+Same problem (per-rank GEMM [8192,2048]@[7168,2048].T, 8×H200). Triton-distributed
+run in its own venv (`/myworkspace/.venv-tritondist`, prebuilt cp312 wheel v0.0.1-rc);
+driver `bench_triton_gemm_ar.py`, runner `compare_gemm_ar.sh`.
+
+  | impl | fused GEMM+AR (ms) | exposed-AR (ms) |
+  |---|---|---|
+  | megaattn CuTe DSL (G=4) | 0.560 | 0.249 |
+  | megaattn CuTe DSL (G=8) | 0.576 | 0.265 |
+  | Triton-distributed (NUM_COMM_SMS=16) | **0.539** | **0.229** |
+
+  Triton-dist is ~3% faster than megaattn's best G here — same ballpark. Two env
+  gotchas to run triton-dist on this CUDA-13 box (NOT a cu13 incompatibility):
+  force the wheel's bundled cu12.8 ptxas (`TRITON_PTXAS_PATH`), and keep
+  `NVSHMEM_DISABLE_CUDA_VMM=0` (its AR kernel needs NVLS multicast). Logs:
+  `/myworkspace/log/triton_gemm_ar_vmm*.log`, `compare_*`.
 
 - **Inflection exactly as planned.** Batching cuts the 3584 serial cross-rank
   round-trips to ~3584/G; exposed-AR drops ~40% (0.42→0.25 ms) at G=4–8. G=28
