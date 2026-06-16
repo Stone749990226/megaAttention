@@ -820,6 +820,92 @@ WGMMA 已 wait 完
 所有 warp 回到 CTA 内一致的同步点
 ```
 
+这里的“收尾”是 drain，不是 reset。drain 表示当前 task 不再有正在飞行的 TMA/WGMMA，
+所有已经消费过的 pipeline stage 都完成了 release，后续 mode 可以安全覆盖 tensor shared
+memory。drain 不表示 SMEM mbarrier 对象回到 kernel 刚启动时的初始 phase。
+
+persistent kernel 内同一个 CTA 会在一个 kernel launch 中连续执行多个 task。mbarrier 位于
+SMEM，kernel start 初始化一次，后续 task 复用同一组 mbarrier。CuTe/CUTLASS 的
+`PipelineState` 是寄存器/SSA 中的软件游标，包含当前 circular stage 的 `index` 和
+`phase`；`PipelineTmaAsync` 的 wait/arrive 操作会用这个 `index/phase` 去操作 SMEM
+mbarrier。两者必须同步推进：
+
+```text
+PipelineState:
+    软件游标，存在寄存器/SSA 值里
+    make_pipeline_state 初始化
+    state.advance() 推进 index，绕回 stage 0 时翻转 phase
+
+SMEM mbarrier:
+    硬件同步对象，存在 shared memory 里
+    PipelineTmaAsync.create 初始化
+    producer_acquire / consumer_wait / consumer_release 推进内部 phase/arrival 状态
+```
+
+因此不能在每个 FA 或 O_proj task 内重新 `make_pipeline_state`，除非同时重新初始化对应
+SMEM mbarrier。重新创建 `PipelineState` 只会把软件游标恢复到初始 `index/phase`，不会重置
+mbarrier 内部状态；下一次 `wait(state.index, state.phase)` 可能等待错误的 phase 并导致
+hang。第一版设计采用长寿命 pipeline state：
+
+```text
+kernel start:
+    初始化 FA mbarrier、O_proj mbarrier
+    创建 PipelineTmaAsync 对象
+
+dispatch loop 外:
+    创建每个 mode 的 PipelineState 软件游标
+
+每个 task:
+    使用传入的 PipelineState
+    payload 内正常 acquire/wait/release/advance
+    task 结束时 drain，但不重建 state，也不重置 mbarrier
+```
+
+每个 CTA 至少需要下列长寿命 state。它们不放 SMEM，也不放 global memory；它们是 kernel
+局部变量，在 dispatch loop 外创建，在 payload 内推进：
+
+```text
+FA K pipeline:
+    fa_k_prod  # WG0 下一次写 K stage 的 producer state
+    fa_k_cons  # WG1/WG2 下一次读 K stage 的 consumer state
+
+FA V pipeline:
+    fa_v_prod  # WG0 下一次写 V stage 的 producer state
+    fa_v_cons  # WG1/WG2 下一次读 V stage 的 consumer state
+
+O_proj A/Wo pipeline:
+    oproj_ab_prod  # WG0 下一次写 A/Wo shared stage 的 producer state
+    oproj_ab_cons  # WG1/WG2 下一次读 A/Wo shared stage 的 consumer state
+```
+
+伪代码结构：
+
+```python
+# kernel start: mbarrier / pipeline object 初始化一次
+pipeline_k  = PipelineTmaAsync.create(barrier_storage=mbar_k,  ...)
+pipeline_v  = PipelineTmaAsync.create(barrier_storage=mbar_v,  ...)
+pipeline_ab = PipelineTmaAsync.create(barrier_storage=mbar_ab, ...)
+
+# dispatch loop 外：长寿命软件游标
+fa_k_prod = make_pipeline_state(Producer, kv_stages)
+fa_v_prod = make_pipeline_state(Producer, kv_stages)
+fa_k_cons = make_pipeline_state(Consumer, kv_stages)
+fa_v_cons = make_pipeline_state(Consumer, kv_stages)
+
+oproj_ab_prod = make_pipeline_state(Producer, oproj_stages)
+oproj_ab_cons = make_pipeline_state(Consumer, oproj_stages)
+
+while not done:
+    mode, arg = schedule_and_broadcast()
+
+    if mode == FA:
+        run_fa_payload(..., pipeline_k, pipeline_v,
+                       fa_k_prod, fa_v_prod, fa_k_cons, fa_v_cons)
+
+    if mode == OPROJ:
+        run_oproj_payload(..., pipeline_ab, oproj_ab_prod, oproj_ab_cons)
+```
+
 ## FA Mode Warp Specialization
 
 FA mode 使用 12 warps，也就是 3 个 warp group：
@@ -1245,6 +1331,70 @@ per thread block usable upper bound ~= 227 KB
 shared_storage = max(FA_mode_smem, O_proj_AR_mode_smem)
                  + mbarrier / padding / alignment overhead
 ```
+
+overlay 只用于 tensor payload buffer，不用于 mbarrier。mbarrier 是 pipeline 的同步对象，
+有独立 phase/arrival 状态，必须按 pipeline 类型单独分配并在 kernel start 初始化一次。
+FA mode 的 K/V mbarrier 和 O_proj mode 的 A/Wo mbarrier 不能互相覆盖。tensor shared
+memory 则可以覆盖，因为任一 CTA 同一时刻只执行一种 mode，且 mode 切换前要求当前 mode
+完全 drain。
+
+第一版 shared storage 采用如下概念结构：
+
+```text
+SharedStorage
+
++-------------------------------------------------------------+
+| mode broadcast / CTA-local small scalars                    |
++-------------------------------------------------------------+
+| FA mbarriers                                                |
+|   mbar_k : K pipeline full/empty barriers                   |
+|   mbar_v : V pipeline full/empty barriers                   |
+|   mbar_q : 可选，若 Q 后续改成 TMA/cp.async pipeline         |
++-------------------------------------------------------------+
+| O_proj mbarriers                                            |
+|   mbar_ab : shared A/Wo pipeline full/empty barriers         |
++-------------------------------------------------------------+
+| tensor_overlay : MemRange[dtype, max(FA_tensor, OPROJ_tensor)] |
+|   同一块字节在不同 mode 下按不同 layout 和 offset 解释        |
++-------------------------------------------------------------+
+```
+
+FA mode 进入时，`tensor_overlay` 被解释为：
+
+```text
+FA tensor view:
+    sQ = overlay[off_fa_sQ : off_fa_sQ + cosize(sQ_layout)]
+    sK = overlay[off_fa_sK : off_fa_sK + cosize(sK_layout)]
+    sV = overlay[off_fa_sV : off_fa_sV + cosize(sV_layout)]
+
+FA_tensor = aligned_cosize(sQ_layout)
+          + aligned_cosize(sK_layout)
+          + aligned_cosize(sV_layout)
+```
+
+O_proj mode 进入时，同一个 `tensor_overlay` 被解释为：
+
+```text
+O_proj tensor view:
+    sA  = overlay[off_op_sA  : off_op_sA  + cosize(sA_layout)]
+    sWo = overlay[off_op_sWo : off_op_sWo + cosize(sWo_layout)]
+
+OPROJ_tensor = aligned_cosize(sA_layout)
+             + aligned_cosize(sWo_layout)
+```
+
+最终分配：
+
+```text
+tensor_overlay_cosize = max(FA_tensor, OPROJ_tensor)
+```
+
+CuTe DSL 中没有 C/C++ union 语法，但 FA4 Hopper 已经使用过同类 reinterpret 思路：
+`Q_in_regs=True` 时只分配一块 `MemRange[max(cosize(sQ), cosize(sV))]`，然后同一个
+storage 字段既可以用 `sQ_layout` 取 `sQ` view，也可以用 `sV_layout` 取 `sV` view。
+本设计在此基础上多一步：同一个大 `tensor_overlay` 内部按 offset carving 出多段，再分别
+用 FA 或 O_proj 的 layout 取 tensor view。实现时必须以 `cute.cosize(layout)` 和 alignment
+后的 offset 为准，不能只按手算 KB 数硬编码。
 
 第一版目标：
 
