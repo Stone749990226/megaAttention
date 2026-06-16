@@ -358,17 +358,23 @@ class FaWsAttnPacked:
         sV_l = self._smem(dt, self.N, self.D, self.kv_stages)
 
         op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
-        # Permute the packed K/V gmem view [tot, H, D] -> [tot, D, H] so the rank-2
-        # TMA tiler (N, D) maps positionally onto (token, D) instead of (token, head)
-        # — cta_v_map = composition(identity(gmem.shape), tiler) tiles by mode order,
-        # and with head at mode 1 the box's D-extent would collapse to H. Head becomes
-        # mode 2, selected at runtime in-kernel.
-        mK_t = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=[0, 2, 1]))
-        mV_t = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=[0, 2, 1]))
+        # FA4 SM90 recipe (flash_fwd_sm90.py): logical view [tot,H,D] -> [tot,D,H]
+        # (head LAST) so the rank-2 TMA tiler (N, D) maps onto (token, D) only; head
+        # is mode 2 and is NOT in the TMA box (sliced at runtime in-kernel). This is a
+        # view transform (no physical transpose).
+        mK_v = qlu.select(mK, [0, 2, 1])
+        mV_v = qlu.select(mV, [0, 2, 1])
+        # FA4 flash_fwd_sm90.py:288 — build the atom over the FULL 3D [tot,D,H] view.
+        # The rank-2 tiler (N, D) maps onto modes 0,1 = (token, D); head (mode 2) is a
+        # non-box iteration mode (sliced into the base pointer at runtime in-kernel).
+        # make_tiled_tma_atom returns (atom, tma_tensor). The tma_tensor carries the
+        # BASIS strides that the atom's gbasis references; the gmem partition MUST use
+        # it (tK/tV), NOT the original concrete-strided view (FA4 flash_fwd_sm90.py:359
+        # passes tma_tensor_K, not mK).
         tma_k, tK = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            op, mK_t, cute.slice_(sK_l, (None, None, 0)), (self.N, self.D), num_multicast=1)
+            op, mK_v, cute.select(sK_l, mode=[0, 1]), (self.N, self.D), num_multicast=1)
         tma_v, tV = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            op, mV_t, cute.slice_(sV_l, (None, None, 0)), (self.N, self.D), num_multicast=1)
+            op, mV_v, cute.select(sV_l, mode=[0, 1]), (self.N, self.D), num_multicast=1)
 
         mma_qk = sm90_utils.make_trivial_tiled_mma(
             dt, dt, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.K,
@@ -386,7 +392,7 @@ class FaWsAttnPacked:
             sK: cute.struct.Align[cute.struct.MemRange[dt, cute.cosize(sK_l)], self.align]
             sV: cute.struct.Align[cute.struct.MemRange[dt, cute.cosize(sV_l)], self.align]
 
-        self.kernel(mQ, tma_k, mK_t, tma_v, mV_t, mOscr, mCuQ, mCuK, mFaB, mFaMb, mTask,
+        self.kernel(mQ, tma_k, tK, tma_v, tV, mOscr, mCuQ, mCuK, mFaB, mFaMb, mTask,
                     mma_qk, mma_pv, sQ_l, sK_l, sV_l, Smem).launch(
             grid=[1, 1, 1], block=[self.threads, 1, 1], cluster=(1, 1, 1), stream=stream)
 
@@ -459,17 +465,19 @@ class FaWsAttnPacked:
 
         # FA4 packed-varlen addressing: offset the packed tensor by the batch's
         # token start, slice the (runtime) head, then tile by (N, D).
-        # mK/mV are the permuted [tot, D, H] views. Offset token (mode0); KEEP the head
-        # mode (the atom's gbasis references mode 2) — tile (tot->N blocks, D fixed),
-        # head stays as a full mode and is selected at the copy index below.
-        mK_off = cute.domain_offset((k_start, 0, 0), mK)     # [tot, D, H]
-        mV_off = cute.domain_offset((k_start, 0, 0), mV)
-        gK = cute.local_tile(mK_off, (self.N, self.D), (None, None, None))  # [N,D,n_tblk,1,H]
-        gV = cute.local_tile(mV_off, (self.N, self.D), (None, None, None))
+        # FA4 recipe: mK/mV are the [tot,D,H] views. Offset token (mode0), slice the
+        # runtime head (mode2) -> [tot, D], then tile (token->N blocks, D fixed at tile 0).
+        # Box covers (token, D) only; head is already sliced out.
+        mK_cur = cute.domain_offset((k_start, None, None), mK)[None, None, head]   # [tot, D]
+        mV_cur = cute.domain_offset((k_start, None, None), mV)[None, None, head]
+        gK = cute.local_tile(mK_cur, (self.N, self.D), (None, 0))      # [N, D, n_tblk]
+        gV = cute.local_tile(mV_cur, (self.N, self.D), (None, 0))
         tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
-            tma_k, 0, cute.make_layout(1), cute.group_modes(sK, 0, 2), cute.group_modes(gK, 0, 2))
+            tma_k, 0, cute.make_layout(1),
+            cute.group_modes(sK, 0, cute.rank(sK) - 1), cute.group_modes(gK, 0, cute.rank(gK) - 1))
         tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
-            tma_v, 0, cute.make_layout(1), cute.group_modes(sV, 0, 2), cute.group_modes(gV, 0, 2))
+            tma_v, 0, cute.make_layout(1),
+            cute.group_modes(sV, 0, cute.rank(sV) - 1), cute.group_modes(gV, 0, cute.rank(gV) - 1))
 
         # ---- WG0: producer (dynamic nblk) ----
         if wg_idx == 0:
@@ -479,11 +487,11 @@ class FaWsAttnPacked:
                 vp = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stages)
                 for j in cutlass.range(nblk, unroll=1):
                     pl_k.producer_acquire(kp)
-                    cute.copy(tma_k, tKgK[(None, j, 0, head)], tKsK[(None, kp.index)],
+                    cute.copy(tma_k, tKgK[(None, j)], tKsK[(None, kp.index)],
                               tma_bar_ptr=pl_k.producer_get_barrier(kp))
                     pl_k.producer_commit(kp)
                     pl_v.producer_acquire(vp)
-                    cute.copy(tma_v, tVgV[(None, j, 0, head)], tVsV[(None, vp.index)],
+                    cute.copy(tma_v, tVgV[(None, j)], tVsV[(None, vp.index)],
                               tma_bar_ptr=pl_v.producer_get_barrier(vp))
                     pl_v.producer_commit(vp)
                     kp.advance()
