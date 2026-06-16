@@ -19,7 +19,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from row_desc import build_row_desc, oproj_task_counts
+from row_desc import ROW_M_TILE, build_row_desc, oproj_task_counts
 from fused_fa_oproj_ar_sm90 import FusedFaOprojArSkeleton, NUM_CTRL
 
 
@@ -104,33 +104,33 @@ def _assert_shape(r):
 
 # ---------------------------------------------------------------- cases ----
 def test_small_uniform():
-    r = run_skeleton(seqlens=[256, 192, 320, 128], M_TILE=64, H_local=4,
+    r = run_skeleton(seqlens=[256, 192, 320, 128], M_TILE=ROW_M_TILE, H_local=4,
                      hidden=1024, N_TILE=128, super_group_n_tiles=4)
     _assert_shape(r)
 
 
 def test_tail_partial_tiles():
     # non-divisible seqlens -> tail partial row tiles exercised in row_desc
-    r = run_skeleton(seqlens=[130, 65, 257, 1, 200], M_TILE=64, H_local=8,
+    r = run_skeleton(seqlens=[130, 65, 257, 1, 200], M_TILE=ROW_M_TILE, H_local=8,
                      hidden=2048, N_TILE=128, super_group_n_tiles=4)
     _assert_shape(r)
 
 
 def test_super_group_8():
-    r = run_skeleton(seqlens=[512, 512, 512], M_TILE=64, H_local=8,
+    r = run_skeleton(seqlens=[512, 512, 512], M_TILE=ROW_M_TILE, H_local=8,
                      hidden=4096, N_TILE=128, super_group_n_tiles=8)
     _assert_shape(r)
 
 
 def test_more_contention():
     # ~64 row tiles x 8 heads = 512 FA tasks across all SMs
-    r = run_skeleton(seqlens=[64 * 64], M_TILE=64, H_local=8,
+    r = run_skeleton(seqlens=[64 * 128], M_TILE=ROW_M_TILE, H_local=8,
                      hidden=2048, N_TILE=128, super_group_n_tiles=4)
     _assert_shape(r)
 
 
 def test_single_row_tile():
-    r = run_skeleton(seqlens=[40], M_TILE=64, H_local=4,
+    r = run_skeleton(seqlens=[40], M_TILE=ROW_M_TILE, H_local=4,
                      hidden=1024, N_TILE=128, super_group_n_tiles=4)
     _assert_shape(r)
 

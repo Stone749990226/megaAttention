@@ -156,14 +156,14 @@ if __name__ == "__main__":
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     ws = 8
     seqlens = [200, 64, 130, 1]
-    meta = build_row_desc(seqlens, M_TILE=64)
+    meta = build_row_desc(seqlens)
     Q, K, V, W_o = make_qkv_inputs(0, ws, seqlens, device=dev)
     O, Yp, Yf = full_chain_reference(Q, K, V, W_o, meta)
     h_local, d, hidden, k_local = shapes(ws)
     assert O.shape == (sum(seqlens), h_local, d), O.shape
     assert Yp.shape == (sum(seqlens), hidden), Yp.shape
     scratch = o_scratch_reference(O, meta)
-    assert scratch.shape == (meta.num_row_tiles, 64, h_local, d), scratch.shape
+    assert scratch.shape == (meta.num_row_tiles, meta.M_TILE, h_local, d), scratch.shape
     print(f"[reference_fused] OK on {dev}: tot_q={sum(seqlens)} H_local={h_local} "
           f"K_local={k_local} hidden={hidden} num_row_tiles={meta.num_row_tiles}")
     print(f"  O absmax={O.abs().max():.4f}  Y_partial absmax={Yp.abs().max():.4f}")

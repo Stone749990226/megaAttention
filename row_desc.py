@@ -2,27 +2,30 @@
 """
 Host-side metadata for the fused FA + O_proj + NVLS AllReduce kernel.
 
-Tile-size model (设计文稿.md, revised): FA and O_proj use DIFFERENT M tiles.
+Tile-size model (causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md):
+FA, O_proj and AR all share ONE 128-row row tile.
 
-    FA_M_TILE    = 128   # FA tile; the two consumer warp groups each take 64 rows
-    OPROJ_M_TILE = 64    # O_proj / AR tile
+    ROW_M_TILE = FA_M_TILE = OPROJ_M_TILE = AR_M_TILE = 128
 
-Each FA tile (128 Q rows) maps to up to 2 O_proj subtiles (64 rows each), indexed
-by sub_m in {0, 1}. The persistent kernel recovers varlen coordinates on the hot
-path with a single table read (NOT a prefix-sum search), so we build, on the host:
+The two consumer warp groups split a tile along M (WG1 rows 0..63, WG2 rows
+64..127); softmax/accumulators stay within each WG's 64 rows, so no sub-tile
+descriptor is needed. A single flattened `row_tile_id` indexes O_scratch,
+C_sym and every control array:
 
-    cu_fa_m_blocks[b]   = sum_{i<b} ceil(seqlen_q[i] / 128)
-    fa_row_desc[t]      = {batch_idx, fa_m_block}             # FA task -> coords
-    cu_oproj_m_blocks[b]= sum_{i<b} ceil(seqlen_q[i] / 64)
-    oproj_row_desc[t]   = {batch_idx, oproj_m_block}          # O_proj task -> coords
+    cu_m_blocks[b] = sum_{i<b} ceil(seqlen_q[i] / ROW_M_TILE)
+    row_desc[t]    = {batch_idx, m_block}          # task id -> varlen coords
+    num_row_tiles  = cu_m_blocks[num_batch]
 
-Mapping (FA tile -> O_proj subtile), all per 设计文稿.md:
-    oproj_row_tile_id = cu_oproj_m_blocks[batch] + fa_m_block * 2 + sub_m
-    oproj_m_start     = fa_m_block * 128 + sub_m * 64
-    valid_m           = min(64, q_len - oproj_m_start)        # subtile exists iff > 0
+O_proj / AR task identity is a single `slot_id` (no descriptor):
 
-Everything else (q_start/k_start/k_len) stays derivable from cu_seqlens at runtime
-and is intentionally NOT cached here.
+    slot_id        = row_tile_id * num_super_groups + n_super_group
+    row_tile_id    = slot_id // num_super_groups
+    n_super_group  = slot_id %  num_super_groups
+
+Everything else (q_start/k_start/k_len/valid_m) stays derivable from cu_seqlens
+on the hot path and is intentionally NOT cached. First version requires every
+sequence to satisfy q_len == k_len (complete prompt prefill); build_row_desc
+asserts this when seqlens_k is given.
 """
 from __future__ import annotations
 
@@ -30,9 +33,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-FA_M_TILE = 128
-OPROJ_M_TILE = 64
-OPROJ_SUBTILES_PER_FA_TILE = FA_M_TILE // OPROJ_M_TILE  # 2
+# FA, O_proj and AR share one 128-row row tile (设计稿: Tile 尺寸约定).
+ROW_M_TILE = 128
+FA_M_TILE = ROW_M_TILE
+OPROJ_M_TILE = ROW_M_TILE
+AR_M_TILE = ROW_M_TILE
 
 
 def cdiv(a: int, b: int) -> int:
@@ -47,7 +52,7 @@ def cu_seqlens_from_seqlens(seqlens: np.ndarray) -> np.ndarray:
     return cu
 
 
-def _build_row_desc(seqlens_q: np.ndarray, m_tile: int):
+def _build_tile_desc(seqlens_q: np.ndarray, m_tile: int):
     """Return (cu_m_blocks[B+1], batch_idx[T], m_block[T]) for tile size m_tile."""
     num_batch = int(seqlens_q.shape[0])
     nblk = np.array([cdiv(int(s), m_tile) for s in seqlens_q], dtype=np.int64)
@@ -65,54 +70,49 @@ def _build_row_desc(seqlens_q: np.ndarray, m_tile: int):
 
 
 @dataclass
-class FusedMeta:
-    """FA (128-row) + O_proj (64-row) schedule metadata for one varlen batch."""
+class RowDescMeta:
+    """Unified 128-row schedule metadata for one varlen batch.
+
+    `t` denotes a flattened row_tile_id in [0, num_row_tiles). FA task id is
+    `t * H_local + head`; O_proj/AR slot id is `t * num_super_groups + nsg`.
+    """
 
     num_batch: int
+    M_TILE: int
     cu_seqlens_q: np.ndarray
     cu_seqlens_k: np.ndarray
-    # FA tiles (128 rows)
-    num_fa_row_tiles: int
-    cu_fa_m_blocks: np.ndarray
-    fa_batch_idx: np.ndarray          # fa_row_desc[t].batch_idx
-    fa_m_block: np.ndarray            # fa_row_desc[t].fa_m_block
-    # O_proj tiles (64 rows)
-    num_oproj_row_tiles: int
-    cu_oproj_m_blocks: np.ndarray
-    oproj_batch_idx: np.ndarray       # oproj_row_desc[t].batch_idx
-    oproj_m_block: np.ndarray         # oproj_row_desc[t].oproj_m_block (= fa_m_block*2+sub_m)
+    num_row_tiles: int
+    cu_m_blocks: np.ndarray           # [B+1] prefix of ceil(seqlen_q / M_TILE)
+    batch_idx: np.ndarray             # row_desc[t].batch_idx
+    m_block: np.ndarray               # row_desc[t].m_block (tile index within seq)
 
-    # ---- FA-tile derivations (host mirror) ----
-    def fa_q_len(self, t: int) -> int:
-        b = int(self.fa_batch_idx[t])
+    # ---- per-tile derivations (host mirror of the kernel's hot-path math) ----
+    def q_len(self, t: int) -> int:
+        b = int(self.batch_idx[t])
         return int(self.cu_seqlens_q[b + 1] - self.cu_seqlens_q[b])
 
-    def fa_q_tile_start(self, t: int) -> int:
-        b = int(self.fa_batch_idx[t])
-        return int(self.cu_seqlens_q[b]) + int(self.fa_m_block[t]) * FA_M_TILE
+    def k_len(self, t: int) -> int:
+        b = int(self.batch_idx[t])
+        return int(self.cu_seqlens_k[b + 1] - self.cu_seqlens_k[b])
 
-    def fa_valid_m(self, t: int) -> int:
-        return min(FA_M_TILE, self.fa_q_len(t) - int(self.fa_m_block[t]) * FA_M_TILE)
+    def q_tile_start(self, t: int) -> int:
+        b = int(self.batch_idx[t])
+        return int(self.cu_seqlens_q[b]) + int(self.m_block[t]) * self.M_TILE
 
-    # ---- O_proj-subtile derivations ----
-    def oproj_fa_row_tile(self, t: int) -> int:
-        """Which FA tile (O_scratch row) this O_proj subtile reads from."""
-        b = int(self.oproj_batch_idx[t])
-        fa_m_block = int(self.oproj_m_block[t]) // OPROJ_SUBTILES_PER_FA_TILE
-        return int(self.cu_fa_m_blocks[b]) + fa_m_block
-
-    def oproj_sub_m(self, t: int) -> int:
-        return int(self.oproj_m_block[t]) % OPROJ_SUBTILES_PER_FA_TILE
-
-    def oproj_valid_m(self, t: int) -> int:
-        b = int(self.oproj_batch_idx[t])
-        q_len = int(self.cu_seqlens_q[b + 1] - self.cu_seqlens_q[b])
-        oproj_m_start = int(self.oproj_m_block[t]) * OPROJ_M_TILE
-        return min(OPROJ_M_TILE, q_len - oproj_m_start)
+    def valid_m(self, t: int) -> int:
+        return min(self.M_TILE, self.q_len(t) - int(self.m_block[t]) * self.M_TILE)
 
 
-def build_fused_meta(seqlens_q, seqlens_k=None) -> FusedMeta:
-    """Build FA (128) + O_proj (64) schedule metadata from per-sequence lengths."""
+def build_row_desc(seqlens_q, M_TILE: int = ROW_M_TILE, seqlens_k=None) -> RowDescMeta:
+    """Build unified 128-row schedule metadata from per-sequence lengths.
+
+    First version is complete prompt prefill: when `seqlens_k` is supplied it
+    must equal `seqlens_q` (q_len == k_len precondition); otherwise k defaults
+    to q.
+    """
+    assert int(M_TILE) == ROW_M_TILE, (
+        "first version requires unified 128-row tiles "
+        "(FA_M_TILE == OPROJ_M_TILE == AR_M_TILE == 128)")
     seqlens_q = np.asarray(seqlens_q, dtype=np.int64)
     assert seqlens_q.ndim == 1 and seqlens_q.shape[0] > 0
     assert (seqlens_q >= 0).all()
@@ -120,42 +120,61 @@ def build_fused_meta(seqlens_q, seqlens_k=None) -> FusedMeta:
         seqlens_k = seqlens_q
     seqlens_k = np.asarray(seqlens_k, dtype=np.int64)
     assert seqlens_k.shape == seqlens_q.shape
+    assert (seqlens_k == seqlens_q).all(), (
+        "first version requires q_len == k_len (complete prompt prefill)")
 
-    cu_fa, fa_b, fa_mb = _build_row_desc(seqlens_q, FA_M_TILE)
-    cu_op, op_b, op_mb = _build_row_desc(seqlens_q, OPROJ_M_TILE)
-    return FusedMeta(
+    cu, b, mb = _build_tile_desc(seqlens_q, M_TILE)
+    return RowDescMeta(
         num_batch=int(seqlens_q.shape[0]),
+        M_TILE=int(M_TILE),
         cu_seqlens_q=cu_seqlens_from_seqlens(seqlens_q),
         cu_seqlens_k=cu_seqlens_from_seqlens(seqlens_k),
-        num_fa_row_tiles=int(cu_fa[-1]),
-        cu_fa_m_blocks=cu_fa,
-        fa_batch_idx=fa_b,
-        fa_m_block=fa_mb,
-        num_oproj_row_tiles=int(cu_op[-1]),
-        cu_oproj_m_blocks=cu_op,
-        oproj_batch_idx=op_b,
-        oproj_m_block=op_mb,
+        num_row_tiles=int(cu[-1]),
+        cu_m_blocks=cu,
+        batch_idx=b,
+        m_block=mb,
     )
 
 
-def oproj_task_counts(num_oproj_row_tiles: int, hidden: int, N_TILE: int,
+def oproj_task_counts(num_row_tiles: int, hidden: int, N_TILE: int,
                       super_group_n_tiles: int):
-    """O_proj / AR task-space sizes (设计文稿.md O_proj 规模估算).
+    """O_proj / AR task-space sizes (设计稿: O_proj 规模估算).
 
     Returns (num_out_n_tiles, num_super_groups, total_oproj_tasks).
     """
     num_out_n_tiles = cdiv(hidden, N_TILE)
     num_super_groups = cdiv(num_out_n_tiles, super_group_n_tiles)
-    total_oproj_tasks = num_oproj_row_tiles * num_super_groups
+    total_oproj_tasks = num_row_tiles * num_super_groups
     return num_out_n_tiles, num_super_groups, total_oproj_tasks
 
 
 def decode_oproj_slot(slot_id: int, num_super_groups: int,
                       super_group_n_tiles: int, hidden: int, N_TILE: int):
-    """slot_id -> (oproj_row_tile_id, n_super_group, base_out_n_tile, valid_n_tiles)."""
-    oproj_row_tile_id = slot_id // num_super_groups
+    """slot_id -> (row_tile_id, n_super_group, base_out_n_tile, valid_n_tiles)."""
+    row_tile_id = slot_id // num_super_groups
     n_super_group = slot_id % num_super_groups
     base_out_n_tile = n_super_group * super_group_n_tiles
     num_out_n_tiles = cdiv(hidden, N_TILE)
     valid_n_tiles = min(super_group_n_tiles, num_out_n_tiles - base_out_n_tile)
-    return oproj_row_tile_id, n_super_group, base_out_n_tile, valid_n_tiles
+    return row_tile_id, n_super_group, base_out_n_tile, valid_n_tiles
+
+
+# --------------------------------------------- tile-padded workspace sizing ---
+def oscratch_numel(num_row_tiles: int, H_local: int, D: int,
+                   M_TILE: int = ROW_M_TILE) -> int:
+    """O_scratch_local element count: [num_row_tiles, M_TILE, H_local, D]."""
+    return num_row_tiles * M_TILE * H_local * D
+
+
+def csym_numel(num_row_tiles: int, hidden: int, N_TILE: int,
+               M_TILE: int = ROW_M_TILE) -> int:
+    """C_sym in-place partial/final element count, tile-padded:
+
+        [num_row_tiles, M_TILE, num_out_n_tiles, N_TILE]
+
+    Sized by physical tile padding (NOT logical T*hidden): tail rows
+    (valid_m < M_TILE) and tail hidden (valid_n < N_TILE) still occupy address
+    space; stores/reduces mask them with valid_m / valid_n predicates.
+    """
+    num_out_n_tiles = cdiv(hidden, N_TILE)
+    return num_row_tiles * M_TILE * num_out_n_tiles * N_TILE
