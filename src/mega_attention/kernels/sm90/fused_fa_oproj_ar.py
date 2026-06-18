@@ -123,35 +123,39 @@ def try_pop_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor):
 
 
 @cute.jit
-def try_claim_ar(ctrl: cute.Tensor, ar_probe: cute.Tensor,
-                 total_oproj: cutlass.Constexpr):
-    """Scan (from a cursor hint) for a ready AR tile and CAS-claim it (1->2).
+def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
+                 owner_words_alloc: cutlass.Constexpr, tp_size: cutlass.Constexpr,
+                 rank: cutlass.Constexpr):
+    """Scan this rank's owner-local ar_ready_bits (uint64 bitset) from a word cursor,
+    ffs-via-popc the lowest set bit, atomicAnd-clear it (CAS-free single-owner claim).
 
-    Returns (found, ar_slot_id). Single-owner: only the CAS winner proceeds.
-    O(total) worst case -- fine for the skeleton's modest task space.
+    Returns (found, ar_slot_id). owner_idx = word*64 + bit_index;
+    ar_slot_id = owner_idx*tp_size + rank (设计稿 确定性 owner 反解)。
     """
     found = cutlass.Int32(0)
     arg = cutlass.Int32(-1)
+    found_w = cutlass.Uint32(0)
     start = cute.arch.atomic_add(ctrl.iterator + C_AR_CURSOR, cutlass.Uint32(0),
                                  sem="relaxed", scope="gpu")
     i = cutlass.Uint32(0)
-    n = cutlass.Uint32(total_oproj)
+    n = cutlass.Uint32(owner_words_alloc)
     while (i < n) and (found == 0):
-        idx = (start + i) % n
-        p = cute.arch.atomic_add(ar_probe.iterator + idx, cutlass.Uint32(0),
-                                 sem="acquire", scope="gpu")
-        if p == 1:
-            old = cute.arch.atomic_cas(ar_probe.iterator + idx,
-                                       cmp=cutlass.Uint32(1), val=cutlass.Uint32(2),
-                                       sem="acquire", scope="gpu")
-            if old == 1:
+        w = (start + i) % n
+        word = cute.arch.atomic_add(ar_ready_bits.iterator + w, cutlass.Int64(0),
+                                    sem="acquire", scope="gpu")
+        if word != cutlass.Int64(0):
+            lowest = word & (cutlass.Int64(0) - word)         # isolate lowest set bit
+            bit_index = cute.arch.popc(lowest - cutlass.Int64(1))   # trailing-zero count
+            old = cute.arch.atomic_and(ar_ready_bits.iterator + w, ~lowest,
+                                       sem="acq_rel", scope="gpu")
+            if (old & lowest) != cutlass.Int64(0):            # we cleared it -> won
                 found = cutlass.Int32(1)
-                arg = idx.to(cutlass.Int32)
+                found_w = w
+                owner_idx = w.to(cutlass.Int32) * cutlass.Int32(64) + bit_index.to(cutlass.Int32)
+                arg = owner_idx * cutlass.Int32(tp_size) + cutlass.Int32(rank)
         i = i + cutlass.Uint32(1)
     if found != 0:
-        # advance cursor hint past the claimed slot (relaxed; best-effort)
-        cute.arch.atomic_exch(ctrl.iterator + C_AR_CURSOR,
-                              arg.to(cutlass.Uint32) + cutlass.Uint32(1),
+        cute.arch.atomic_exch(ctrl.iterator + C_AR_CURSOR, found_w,
                               sem="relaxed", scope="gpu")
     return found, arg
 
@@ -204,8 +208,25 @@ def do_fa(ctrl: cute.Tensor, head_marker: cute.Tensor, fa_exec: cute.Tensor,
 
 
 @cute.jit
+def publish_ar_ready(ready_count_owner: cute.Tensor, ar_ready_bits: cute.Tensor,
+                     ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr):
+    """push-to-owner ready: bump owner-local ready_count[owner_idx]; the last arriver
+    (== tp_size) sets the owner-local ar_ready_bits bit (设计稿 确定性 owner 映射).
+    owner_rank = ar_slot_id % tp_size (this rank for tp=1); owner_idx = ar_slot_id // tp_size.
+    """
+    owner_idx = ar_slot_id // cutlass.Int32(tp_size)
+    old = cute.arch.atomic_add(ready_count_owner.iterator + owner_idx.to(cutlass.Uint32),
+                               cutlass.Uint32(1), sem="acq_rel", scope="gpu")
+    if (old + cutlass.Uint32(1)) == cutlass.Uint32(tp_size):
+        word = (owner_idx // cutlass.Int32(64)).to(cutlass.Uint32)
+        bit = cutlass.Int64(1) << (owner_idx % cutlass.Int32(64)).to(cutlass.Int64)
+        cute.arch.atomic_or(ar_ready_bits.iterator + word, bit,
+                            sem="release", scope="gpu")
+
+
+@cute.jit
 def do_oproj(ctrl: cute.Tensor, head_marker: cute.Tensor, oproj_exec: cute.Tensor,
-             ready_count_owner: cute.Tensor, ar_probe: cute.Tensor,
+             ready_count_owner: cute.Tensor, ar_ready_bits: cute.Tensor,
              partial_check: cute.Tensor, slot_id: cutlass.Int32,
              H_local: cutlass.Constexpr, num_super_groups: cutlass.Constexpr,
              tp_size: cutlass.Constexpr):
@@ -230,37 +251,41 @@ def do_oproj(ctrl: cute.Tensor, head_marker: cute.Tensor, oproj_exec: cute.Tenso
     # stub "partial" checksum
     partial_check[slot_id.to(cutlass.Uint32)] = (
         row_tile * cutlass.Int32(1000) + nsg + cutlass.Int32(1)).to(cutlass.Uint32)
-    # push-to-owner ready_count (single rank: tp_size==1 => immediate last-arriver)
-    cute.arch.fence_acq_rel_gpu()                           # (sys-scope in Phase 4)
-    old = cute.arch.atomic_add(
-        ready_count_owner.iterator + slot_id.to(cutlass.Uint32),
-        cutlass.Uint32(1), sem="acq_rel", scope="gpu")
-    if (old + cutlass.Uint32(1)) == cutlass.Uint32(tp_size):
-        cute.arch.atomic_exch(ar_probe.iterator + slot_id.to(cutlass.Uint32),
-                              cutlass.Uint32(1), sem="release", scope="gpu")
+    # push-to-owner ready (single rank: tp_size==1 => immediate last-arriver)
+    cute.arch.fence_acq_rel_gpu()
+    publish_ar_ready(ready_count_owner, ar_ready_bits, slot_id, tp_size)
     cute.arch.atomic_add(ctrl.iterator + C_OP_DONE, cutlass.Uint32(1),
                          sem="release", scope="gpu")
 
 
 @cute.jit
-def do_ar(ctrl: cute.Tensor, ar_done_flag: cute.Tensor, ar_exec: cute.Tensor,
-          ar_slot_id: cutlass.Int32):
-    """STUB AR owner: terminal-protected once-only completion (identity reduce)."""
+def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor, ar_exec: cute.Tensor,
+         ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr):
+    """AR owner: set owner-local done bit (terminal), then reduce/store + count once.
+
+    tp_size==1: AR is the identity (C_sym partial already == final), so the data
+    reduce is a no-op; the real multimem.ld_reduce/multimem.st on C_sym_mc lands
+    here in the multi-rank phase. owner_idx = ar_slot_id // tp_size.
+    """
+    owner_idx = ar_slot_id // cutlass.Int32(tp_size)
+    word = (owner_idx // cutlass.Int32(64)).to(cutlass.Uint32)
+    bit = cutlass.Int64(1) << (owner_idx % cutlass.Int32(64)).to(cutlass.Int64)
     cute.arch.atomic_add(ar_exec.iterator + ar_slot_id.to(cutlass.Uint32),
                          cutlass.Uint32(1), sem="relaxed", scope="gpu")
-    old_done = cute.arch.atomic_cas(ar_done_flag.iterator + ar_slot_id.to(cutlass.Uint32),
-                                    cmp=cutlass.Uint32(0), val=cutlass.Uint32(1),
-                                    sem="acq_rel", scope="gpu")
-    if old_done == 0:
-        # Phase 4: multimem.ld_reduce + multimem.st here. Skeleton: identity.
+    old_done = cute.arch.atomic_or(ar_done_bits.iterator + word, bit,
+                                   sem="acq_rel", scope="gpu")
+    if (old_done & bit) == cutlass.Int64(0):
+        # multi-rank: multimem.ld_reduce.add + multimem.st over C_sym_mc here.
         cute.arch.atomic_add(ctrl.iterator + C_AR_DONE, cutlass.Uint32(1),
                              sem="release", scope="gpu")
 
 
 # ===================================================== schedule (leader) ====
 @cute.jit
-def schedule_pick(ctrl, oproj_queue, ar_probe,
-                  cls, num_fa: cutlass.Constexpr, total_oproj: cutlass.Constexpr):
+def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
+                  cls, num_fa: cutlass.Constexpr, total_oproj: cutlass.Constexpr,
+                  owner_words_alloc: cutlass.Constexpr, tp_size: cutlass.Constexpr,
+                  rank: cutlass.Constexpr, local_owned_ar: cutlass.Constexpr):
     """Leader-only: return (mode, arg). DONE iff all three targets met."""
     mode = cutlass.Int32(MODE_IDLE)
     arg = cutlass.Int32(-1)
@@ -271,7 +296,7 @@ def schedule_pick(ctrl, oproj_queue, ar_probe,
                                 sem="acquire", scope="gpu")
     ar_d = cute.arch.atomic_add(ctrl.iterator + C_AR_DONE, cutlass.Uint32(0),
                                 sem="acquire", scope="gpu")
-    all_done = (fa_d >= num_fa) and (op_d >= total_oproj) and (ar_d >= total_oproj)
+    all_done = (fa_d >= num_fa) and (op_d >= total_oproj) and (ar_d >= local_owned_ar)
 
     if all_done:
         mode = cutlass.Int32(MODE_DONE)
@@ -299,7 +324,7 @@ def schedule_pick(ctrl, oproj_queue, ar_probe,
                 if src == MODE_OPROJ:
                     f, a = try_pop_oproj(ctrl, oproj_queue)
                 if src == MODE_AR:
-                    f, a = try_claim_ar(ctrl, ar_probe, total_oproj)
+                    f, a = try_claim_ar(ctrl, ar_ready_bits, owner_words_alloc, tp_size, rank)
                 if f != 0:
                     found = cutlass.Int32(1)
                     mode = src
@@ -314,7 +339,7 @@ class FusedFaOprojArSkeleton:
     Phase 2 widens to 3 warp groups (384) and fills do_fa with real FA."""
 
     def __init__(self, num_fa, num_row_tiles, H_local, num_super_groups,
-                 total_oproj, num_ctas, tp_size=1, threads_per_cta=128):
+                 total_oproj, num_ctas, tp_size=1, rank=0, threads_per_cta=128):
         self.num_fa = num_fa
         self.num_row_tiles = num_row_tiles
         self.H_local = H_local
@@ -322,14 +347,18 @@ class FusedFaOprojArSkeleton:
         self.total_oproj = total_oproj
         self.num_ctas = num_ctas
         self.tp_size = tp_size
+        self.rank = rank
+        self.owner_slots_alloc = (total_oproj + tp_size - 1) // tp_size
+        self.owner_words_alloc = (self.owner_slots_alloc + 63) // 64
+        self.local_owned_ar_tasks = ((max(total_oproj - rank, 0)) + tp_size - 1) // tp_size
         self.threads_per_cta = threads_per_cta
 
     @cute.jit
     def __call__(self, ctrl, head_ready, oproj_queue, ready_count_owner,
-                 ar_probe, ar_done_flag, head_marker, fa_exec, oproj_exec,
+                 ar_ready_bits, ar_done_bits, head_marker, fa_exec, oproj_exec,
                  ar_exec, partial_check, stream: cuda.CUstream):
-        self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_probe,
-                    ar_done_flag, head_marker, fa_exec, oproj_exec, ar_exec,
+        self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
+                    ar_done_bits, head_marker, fa_exec, oproj_exec, ar_exec,
                     partial_check).launch(
             grid=[self.num_ctas, 1, 1],
             block=[self.threads_per_cta, 1, 1],
@@ -339,7 +368,7 @@ class FusedFaOprojArSkeleton:
     @cute.kernel
     def kernel(self, ctrl: cute.Tensor, head_ready: cute.Tensor,
                oproj_queue: cute.Tensor, ready_count_owner: cute.Tensor,
-               ar_probe: cute.Tensor, ar_done_flag: cute.Tensor,
+               ar_ready_bits: cute.Tensor, ar_done_bits: cute.Tensor,
                head_marker: cute.Tensor, fa_exec: cute.Tensor,
                oproj_exec: cute.Tensor, ar_exec: cute.Tensor,
                partial_check: cute.Tensor):
@@ -352,6 +381,9 @@ class FusedFaOprojArSkeleton:
         H_local = cutlass.const_expr(self.H_local)
         num_super_groups = cutlass.const_expr(self.num_super_groups)
         tp_size = cutlass.const_expr(self.tp_size)
+        rank = cutlass.const_expr(self.rank)
+        owner_words_alloc = cutlass.const_expr(self.owner_words_alloc)
+        local_owned_ar = cutlass.const_expr(self.local_owned_ar_tasks)
         num_ctas = cutlass.const_expr(self.num_ctas)
 
         # smem broadcast of (mode, arg) from leader to the whole CTA
@@ -364,8 +396,9 @@ class FusedFaOprojArSkeleton:
         looping = True
         while looping:
             if tidx == 0:
-                mode, arg = schedule_pick(ctrl, oproj_queue, ar_probe, cls,
-                                          num_fa, total_oproj)
+                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, cls,
+                                          num_fa, total_oproj, owner_words_alloc,
+                                          tp_size, rank, local_owned_ar)
                 sma[0] = mode
                 sma[1] = arg
             cute.arch.sync_threads()
@@ -381,44 +414,16 @@ class FusedFaOprojArSkeleton:
                               arg, H_local, num_super_groups)
                     if mode == MODE_OPROJ:
                         do_oproj(ctrl, head_marker, oproj_exec, ready_count_owner,
-                                 ar_probe, partial_check, arg, H_local,
+                                 ar_ready_bits, partial_check, arg, H_local,
                                  num_super_groups, tp_size)
                     if mode == MODE_AR:
-                        do_ar(ctrl, ar_done_flag, ar_exec, arg)
+                        do_ar(ctrl, ar_done_bits, ar_exec, arg, tp_size)
                 cute.arch.sync_threads()      # mode-switch teardown barrier
 
         gsync(ctrl, C_GS_EXIT, num_ctas, bidx, tidx)
 
 
 # ============================================ 5b-1b: real FA-path fused kernel =
-@cute.jit
-def do_oproj_stub_v2(ctrl: cute.Tensor, head_ready: cute.Tensor,
-                     oproj_exec: cute.Tensor, ready_count_owner: cute.Tensor,
-                     ar_probe: cute.Tensor, partial_check: cute.Tensor,
-                     slot_id: cutlass.Int32, H_local: cutlass.Constexpr,
-                     num_super_groups: cutlass.Constexpr, tp_size: cutlass.Constexpr):
-    """5b-1b O_proj STUB: order-check via head_ready (real FA writes O_scratch, no
-    markers). When this runs, head_ready[row_tile] must equal H_local (publish only
-    happens at H_local) — validates the FA->O_proj happens-before with real FA."""
-    row_tile = slot_id // num_super_groups
-    nsg = slot_id % num_super_groups
-    hr = cute.arch.atomic_add(head_ready.iterator + row_tile.to(cutlass.Uint32),
-                              cutlass.Uint32(0), sem="acquire", scope="gpu")
-    if hr != cutlass.Uint32(H_local):
-        cute.arch.atomic_add(ctrl.iterator + C_ORDER_ERR, cutlass.Uint32(1),
-                             sem="relaxed", scope="gpu")
-    cute.arch.atomic_add(oproj_exec.iterator + slot_id.to(cutlass.Uint32),
-                         cutlass.Uint32(1), sem="relaxed", scope="gpu")
-    partial_check[slot_id.to(cutlass.Uint32)] = (
-        row_tile * cutlass.Int32(1000) + nsg + cutlass.Int32(1)).to(cutlass.Uint32)
-    cute.arch.fence_acq_rel_gpu()
-    old = cute.arch.atomic_add(ready_count_owner.iterator + slot_id.to(cutlass.Uint32),
-                               cutlass.Uint32(1), sem="acq_rel", scope="gpu")
-    if (old + cutlass.Uint32(1)) == cutlass.Uint32(tp_size):
-        cute.arch.atomic_exch(ar_probe.iterator + slot_id.to(cutlass.Uint32),
-                              cutlass.Uint32(1), sem="release", scope="gpu")
-    cute.arch.atomic_add(ctrl.iterator + C_OP_DONE, cutlass.Uint32(1),
-                         sem="release", scope="gpu")
 
 
 class FusedFaOprojAr:
@@ -431,7 +436,7 @@ class FusedFaOprojAr:
     """
 
     def __init__(self, num_fa, num_row_tiles, H_local, D, num_super_groups,
-                 total_oproj, num_ctas, hidden, tp_size=1, kv_stages=2,
+                 total_oproj, num_ctas, hidden, tp_size=1, rank=0, kv_stages=2,
                  N_TILE=128, super_group_n_tiles=4, K_CHUNK=64, oproj_stages=4,
                  softmax_scale=None, acc_dtype=cutlass.Float32):
         self.num_fa = num_fa
@@ -444,6 +449,13 @@ class FusedFaOprojAr:
         self.total_oproj = total_oproj
         self.num_ctas = num_ctas
         self.tp_size = tp_size
+        self.rank = rank
+        # ---- AR owner-local control sizing (设计稿: 确定性 owner 映射) ----
+        # owner_rank = ar_slot_id % tp_size ; owner_idx = ar_slot_id // tp_size
+        self.owner_slots_alloc = (total_oproj + tp_size - 1) // tp_size
+        self.owner_words_alloc = (self.owner_slots_alloc + 63) // 64
+        self.local_owned_ar_tasks = max(total_oproj - rank, 0)
+        self.local_owned_ar_tasks = (self.local_owned_ar_tasks + tp_size - 1) // tp_size
         self.kv_stages = kv_stages
         # ---- O_proj params (设计稿 O_proj/AR Mode) ----
         self.hidden = hidden
@@ -471,8 +483,8 @@ class FusedFaOprojAr:
         return cute.tile_to_shape(atom, (rows, cols, stages), order=(0, 1, 2))
 
     @cute.jit
-    def __call__(self, ctrl, head_ready, oproj_queue, ready_count_owner, ar_probe,
-                 ar_done_flag, fa_exec, oproj_exec, ar_exec, partial_check,
+    def __call__(self, ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
+                 ar_done_bits, fa_exec, oproj_exec, ar_exec, partial_check,
                  mQ, mK, mV, mOscr, mWo, mCsym, mCuQ, mCuK, mFaB, mFaMb,
                  stream: cuda.CUstream):
         dt = mQ.element_type
@@ -551,8 +563,8 @@ class FusedFaOprojAr:
             mbar_ab: cute.struct.MemRange[cutlass.Int64, self.oproj_stages * 2]
             overlay: cute.struct.Align[cute.struct.MemRange[dt, overlay_n], self.align]
 
-        self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_probe,
-                    ar_done_flag, fa_exec, oproj_exec, ar_exec, partial_check,
+        self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
+                    ar_done_bits, fa_exec, oproj_exec, ar_exec, partial_check,
                     tma_k, tK, tma_v, tV, mOscr, mOscr2d, mWo, mCsym, mQ, mCuQ, mCuK,
                     mFaB, mFaMb, tma_a, tA, tma_wo, tWo,
                     mma_qk, mma_pv, mma_op, sQ_l, sK_l, sV_l, sA_l, sWo_l, Smem).launch(
@@ -562,7 +574,7 @@ class FusedFaOprojAr:
     @cute.kernel
     def kernel(self, ctrl: cute.Tensor, head_ready: cute.Tensor,
                oproj_queue: cute.Tensor, ready_count_owner: cute.Tensor,
-               ar_probe: cute.Tensor, ar_done_flag: cute.Tensor, fa_exec: cute.Tensor,
+               ar_ready_bits: cute.Tensor, ar_done_bits: cute.Tensor, fa_exec: cute.Tensor,
                oproj_exec: cute.Tensor, ar_exec: cute.Tensor, partial_check: cute.Tensor,
                tma_k: cute.CopyAtom, mK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor,
                mOscr: cute.Tensor, mOscr2d: cute.Tensor, mWo: cute.Tensor, mCsym: cute.Tensor,
@@ -595,6 +607,10 @@ class FusedFaOprojAr:
         N_TILE = cutlass.const_expr(self.N_TILE)
         hidden = cutlass.const_expr(self.hidden)
         num_out_n_tiles = cutlass.const_expr(self.num_out_n_tiles)
+        # AR owner constexprs
+        rank = cutlass.const_expr(self.rank)
+        owner_words_alloc = cutlass.const_expr(self.owner_words_alloc)
+        local_owned_ar = cutlass.const_expr(self.local_owned_ar_tasks)
 
         al = cutlass.utils.SmemAllocator()
         st = al.allocate(Smem)
@@ -688,7 +704,9 @@ class FusedFaOprojAr:
         looping = True
         while looping:
             if tidx == 0:
-                mode, arg = schedule_pick(ctrl, oproj_queue, ar_probe, cls, num_fa, total_oproj)
+                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, cls, num_fa,
+                                          total_oproj, owner_words_alloc, tp_size, rank,
+                                          local_owned_ar)
                 sma[0] = mode
                 sma[1] = arg
             cute.arch.sync_threads()
@@ -920,17 +938,13 @@ class FusedFaOprojAr:
                         cute.arch.atomic_add(oproj_exec.iterator + arg.to(cutlass.Uint32),
                                              cutlass.Uint32(1), sem="relaxed", scope="gpu")
                         cute.arch.fence_acq_rel_gpu()            # partial store before ready
-                        old = cute.arch.atomic_add(
-                            ready_count_owner.iterator + arg.to(cutlass.Uint32),
-                            cutlass.Uint32(1), sem="acq_rel", scope="gpu")
-                        if (old + cutlass.Uint32(1)) == cutlass.Uint32(tp_size):
-                            cute.arch.atomic_exch(ar_probe.iterator + arg.to(cutlass.Uint32),
-                                                  cutlass.Uint32(1), sem="release", scope="gpu")
+                        # push-to-owner ready (arg == ar_slot_id); last arriver sets bit
+                        publish_ar_ready(ready_count_owner, ar_ready_bits, arg, tp_size)
                         cute.arch.atomic_add(ctrl.iterator + C_OP_DONE, cutlass.Uint32(1),
                                              sem="release", scope="gpu")
                 if mode == MODE_AR:
                     if tidx == 0:
-                        do_ar(ctrl, ar_done_flag, ar_exec, arg)
+                        do_ar(ctrl, ar_done_bits, ar_exec, arg, tp_size)
                 cute.arch.sync_threads()
 
         gsync(ctrl, C_GS_EXIT, num_ctas, bidx, tidx)

@@ -65,9 +65,12 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     ctrl = _u32(NUM_CTRL, dev)
     head_ready = _u32(R, dev)
     oproj_queue = _u32(total_oproj, dev)
-    ready_count_owner = _u32(total_oproj, dev)
-    ar_probe = _u32(total_oproj, dev)
-    ar_done_flag = _u32(total_oproj, dev)
+    tp_size = 1
+    owner_slots = (total_oproj + tp_size - 1) // tp_size
+    owner_words = (owner_slots + 63) // 64
+    ready_count_owner = _u32(owner_slots, dev)
+    ar_ready_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
+    ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
     fa_exec = _u32(num_fa, dev)
     oproj_exec = _u32(total_oproj, dev)
     ar_exec = _u32(total_oproj, dev)
@@ -77,12 +80,13 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     fa_b = _i32(meta.batch_idx, dev)
     fa_mb = _i32(meta.m_block, dev)
 
-    u32s = [ctrl, head_ready, oproj_queue, ready_count_owner, ar_probe, ar_done_flag,
-            fa_exec, oproj_exec, ar_exec, partial_check]
-    c_u32 = [from_dlpack(t, assumed_align=4) for t in u32s]
-    c_data = [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
-    c_meta = [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
-    cts = c_u32 + c_data + c_meta
+    cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue,
+                                                     ready_count_owner)]
+    cts += [from_dlpack(t, assumed_align=8) for t in (ar_ready_bits, ar_done_bits)]
+    cts += [from_dlpack(t, assumed_align=4) for t in (fa_exec, oproj_exec, ar_exec,
+                                                      partial_check)]
+    cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
+    cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
 
     ker = FusedFaOprojAr(num_fa=num_fa, num_row_tiles=R, H_local=H_local, D=D,
                          num_super_groups=num_super_groups, total_oproj=total_oproj,

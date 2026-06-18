@@ -42,22 +42,26 @@ def run_skeleton(seqlens, M_TILE, H_local, hidden, N_TILE, super_group_n_tiles,
         num_row_tiles, hidden, N_TILE, super_group_n_tiles)
 
     # ---- workspace (all per-kernel control state zeroed) ----
+    tp_size = 1
+    owner_slots = (total_oproj + tp_size - 1) // tp_size
+    owner_words = (owner_slots + 63) // 64
     ctrl = _u32(NUM_CTRL, dev)
     head_ready = _u32(num_row_tiles, dev)
     oproj_queue = _u32(total_oproj, dev)
-    ready_count_owner = _u32(total_oproj, dev)
-    ar_probe = _u32(total_oproj, dev)
-    ar_done_flag = _u32(total_oproj, dev)
+    ready_count_owner = _u32(owner_slots, dev)
+    ar_ready_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
+    ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
     head_marker = _u32(num_fa, dev)
     fa_exec = _u32(num_fa, dev)
     oproj_exec = _u32(total_oproj, dev)
     ar_exec = _u32(total_oproj, dev)
     partial_check = _u32(total_oproj, dev)
 
-    tensors = [ctrl, head_ready, oproj_queue, ready_count_owner, ar_probe,
-               ar_done_flag, head_marker, fa_exec, oproj_exec, ar_exec,
-               partial_check]
-    cts = [from_dlpack(t, assumed_align=4) for t in tensors]
+    cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue,
+                                                     ready_count_owner)]
+    cts += [from_dlpack(t, assumed_align=8) for t in (ar_ready_bits, ar_done_bits)]
+    cts += [from_dlpack(t, assumed_align=4) for t in (head_marker, fa_exec, oproj_exec,
+                                                      ar_exec, partial_check)]
 
     kernel = FusedFaOprojArSkeleton(
         num_fa=num_fa, num_row_tiles=num_row_tiles, H_local=H_local,
@@ -77,7 +81,9 @@ def run_skeleton(seqlens, M_TILE, H_local, hidden, N_TILE, super_group_n_tiles,
         fa_exec=fa_exec.cpu(), oproj_exec=oproj_exec.cpu(), ar_exec=ar_exec.cpu(),
         order_err=int(ctrl[8].item()),
         fa_done=int(ctrl[1].item()), oproj_done=int(ctrl[5].item()),
-        ar_done=int(ctrl[6].item()), ar_done_flag=ar_done_flag.cpu(),
+        ar_done=int(ctrl[6].item()),
+        ar_done_popcount=int(sum(bin(x & 0xFFFFFFFFFFFFFFFF).count("1")
+                                 for x in ar_done_bits.cpu().tolist())),
         partial_check=partial_check.cpu(),
     )
 
@@ -96,8 +102,9 @@ def _assert_shape(r):
     assert r["fa_done"] == r["num_fa"], (r["fa_done"], r["num_fa"])
     assert r["oproj_done"] == r["total_oproj"], (r["oproj_done"], r["total_oproj"])
     assert r["ar_done"] == r["total_oproj"], (r["ar_done"], r["total_oproj"])
-    # AR terminal protection: every slot marked done exactly once
-    assert bool((r["ar_done_flag"] == 1).all())
+    # AR terminal protection: exactly total_oproj owner-local done bits set (tp=1)
+    assert r["ar_done_popcount"] == r["total_oproj"], \
+        (r["ar_done_popcount"], r["total_oproj"])
     # partials were all written (nonzero checksum)
     assert bool((r["partial_check"] != 0).all())
 
