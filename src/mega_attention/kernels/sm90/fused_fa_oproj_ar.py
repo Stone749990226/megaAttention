@@ -431,7 +431,8 @@ class FusedFaOprojAr:
     """
 
     def __init__(self, num_fa, num_row_tiles, H_local, D, num_super_groups,
-                 total_oproj, num_ctas, tp_size=1, kv_stages=2,
+                 total_oproj, num_ctas, hidden, tp_size=1, kv_stages=2,
+                 N_TILE=128, super_group_n_tiles=4, K_CHUNK=64, oproj_stages=4,
                  softmax_scale=None, acc_dtype=cutlass.Float32):
         self.num_fa = num_fa
         self.num_row_tiles = num_row_tiles
@@ -444,6 +445,15 @@ class FusedFaOprojAr:
         self.num_ctas = num_ctas
         self.tp_size = tp_size
         self.kv_stages = kv_stages
+        # ---- O_proj params (设计稿 O_proj/AR Mode) ----
+        self.hidden = hidden
+        self.N_TILE = N_TILE
+        self.super_group_n_tiles = super_group_n_tiles
+        self.K_local = H_local * D
+        self.K_CHUNK = K_CHUNK
+        self.n_kchunks = self.K_local // K_CHUNK
+        self.oproj_stages = oproj_stages
+        self.num_out_n_tiles = (hidden + N_TILE - 1) // N_TILE
         self.scale = softmax_scale if softmax_scale is not None else D ** -0.5
         self.scale_log2 = self.scale * LOG2E
         self.acc_dtype = acc_dtype
@@ -463,12 +473,16 @@ class FusedFaOprojAr:
     @cute.jit
     def __call__(self, ctrl, head_ready, oproj_queue, ready_count_owner, ar_probe,
                  ar_done_flag, fa_exec, oproj_exec, ar_exec, partial_check,
-                 mQ, mK, mV, mOscr, mCuQ, mCuK, mFaB, mFaMb, stream: cuda.CUstream):
+                 mQ, mK, mV, mOscr, mWo, mCsym, mCuQ, mCuK, mFaB, mFaMb,
+                 stream: cuda.CUstream):
         dt = mQ.element_type
         self.dt = dt
         sQ_l = self._smem(dt, self.M, self.D, 1)
         sK_l = self._smem(dt, self.N, self.D, self.kv_stages)
         sV_l = self._smem(dt, self.N, self.D, self.kv_stages)
+        # O_proj tensor smem: A[M,K_CHUNK], Wo[K_CHUNK,N_TILE], oproj_stages each
+        sA_l = self._smem(dt, self.M, self.K_CHUNK, self.oproj_stages)
+        sWo_l = self._smem(dt, self.K_CHUNK, self.N_TILE, self.oproj_stages)
 
         op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
         # packed-varlen K/V: view head LAST [tot,D,H]; atom box covers (token,D);
@@ -480,6 +494,19 @@ class FusedFaOprojAr:
         tma_v, tV = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op, mV_v, cute.select(sV_l, mode=[0, 1]), (self.N, self.D), num_multicast=1)
 
+        # O_proj A = O_scratch[ft] = rows [ft*128, +128) of a [R*128, K_local] view.
+        # O_scratch [R,128,H,D] is row-major contiguous so flattened K = h*D+d and the
+        # row-major [R*128, K_local] view is exact; M-tile index == ft (128-aligned).
+        R = cutlass.const_expr(self.num_row_tiles)
+        K_local = cutlass.const_expr(self.K_local)
+        mOscr2d = cute.make_tensor(
+            mOscr.iterator,
+            cute.make_layout((R * self.M, K_local, 1), stride=(K_local, 1, 1)))
+        tma_a, tA = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            op, mOscr2d, cute.slice_(sA_l, (None, None, 0)), (self.M, self.K_CHUNK), num_multicast=1)
+        tma_wo, tWo = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            op, mWo, cute.slice_(sWo_l, (None, None, 0)), (self.K_CHUNK, self.N_TILE), num_multicast=1)
+
         mma_qk = sm90_utils.make_trivial_tiled_mma(
             dt, dt, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.K,
             self.acc_dtype, atom_layout_mnk=self.mma_atom_layout_mnk, tiler_mn=(64, self.N))
@@ -487,20 +514,48 @@ class FusedFaOprojAr:
             dt, dt, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.MN,
             self.acc_dtype, atom_layout_mnk=self.mma_atom_layout_mnk, tiler_mn=(64, self.D),
             a_source=warpgroup.OperandSource.RMEM)
+        # O_proj GEMM: A K-major (smem), B = transpose_view(sWo) MN-major. C = A @ W_o.
+        mma_op = sm90_utils.make_trivial_tiled_mma(
+            dt, dt, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.MN,
+            self.acc_dtype, atom_layout_mnk=self.mma_atom_layout_mnk,
+            tiler_mn=(64, self.N_TILE))
+
+        # ---- tensor SMEM overlay: FA (sQ/sK/sV) and O_proj (sA/sWo) share ONE byte
+        # range (设计稿 §1505: union, NOT sum; a CTA is in one mode at a time, drained
+        # before switch). mbarriers stay separate. Offsets carved at aligned cosizes. ----
+        eltb = cutlass.const_expr(dt.width // 8)
+        ae = cutlass.const_expr(self.align // eltb)                 # align in elements
+
+        def _au(x):                                                 # align-up (elems)
+            return ((x + ae - 1) // ae) * ae
+        cq, ck, cv = (cutlass.const_expr(cute.cosize(sQ_l)),
+                      cutlass.const_expr(cute.cosize(sK_l)),
+                      cutlass.const_expr(cute.cosize(sV_l)))
+        ca, cwo = (cutlass.const_expr(cute.cosize(sA_l)),
+                   cutlass.const_expr(cute.cosize(sWo_l)))
+        off_sK = cutlass.const_expr(_au(cq))
+        off_sV = cutlass.const_expr(_au(off_sK + ck))
+        fa_total = cutlass.const_expr(_au(off_sV + cv))
+        off_sWo = cutlass.const_expr(_au(ca))
+        op_total = cutlass.const_expr(_au(off_sWo + cwo))
+        overlay_n = cutlass.const_expr(max(fa_total, op_total))
+        self._off_sK = off_sK
+        self._off_sV = off_sV
+        self._off_sWo = off_sWo
 
         @cute.struct
         class Smem:
             bc: cute.struct.MemRange[cutlass.Int32, 4]
             mbar_k: cute.struct.MemRange[cutlass.Int64, self.kv_stages * 2]
             mbar_v: cute.struct.MemRange[cutlass.Int64, self.kv_stages * 2]
-            sQ: cute.struct.Align[cute.struct.MemRange[dt, cute.cosize(sQ_l)], self.align]
-            sK: cute.struct.Align[cute.struct.MemRange[dt, cute.cosize(sK_l)], self.align]
-            sV: cute.struct.Align[cute.struct.MemRange[dt, cute.cosize(sV_l)], self.align]
+            mbar_ab: cute.struct.MemRange[cutlass.Int64, self.oproj_stages * 2]
+            overlay: cute.struct.Align[cute.struct.MemRange[dt, overlay_n], self.align]
 
         self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_probe,
                     ar_done_flag, fa_exec, oproj_exec, ar_exec, partial_check,
-                    tma_k, tK, tma_v, tV, mOscr, mQ, mCuQ, mCuK, mFaB, mFaMb,
-                    mma_qk, mma_pv, sQ_l, sK_l, sV_l, Smem).launch(
+                    tma_k, tK, tma_v, tV, mOscr, mOscr2d, mWo, mCsym, mQ, mCuQ, mCuK,
+                    mFaB, mFaMb, tma_a, tA, tma_wo, tWo,
+                    mma_qk, mma_pv, mma_op, sQ_l, sK_l, sV_l, sA_l, sWo_l, Smem).launch(
             grid=[self.num_ctas, 1, 1], block=[self.threads, 1, 1],
             cluster=(1, 1, 1), stream=stream)
 
@@ -510,10 +565,14 @@ class FusedFaOprojAr:
                ar_probe: cute.Tensor, ar_done_flag: cute.Tensor, fa_exec: cute.Tensor,
                oproj_exec: cute.Tensor, ar_exec: cute.Tensor, partial_check: cute.Tensor,
                tma_k: cute.CopyAtom, mK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor,
-               mOscr: cute.Tensor, mQ: cute.Tensor, mCuQ: cute.Tensor, mCuK: cute.Tensor,
-               mFaB: cute.Tensor, mFaMb: cute.Tensor, mma_qk: cute.TiledMma,
-               mma_pv: cute.TiledMma, sQ_l: cute.ComposedLayout, sK_l: cute.ComposedLayout,
-               sV_l: cute.ComposedLayout, Smem: cutlass.Constexpr):
+               mOscr: cute.Tensor, mOscr2d: cute.Tensor, mWo: cute.Tensor, mCsym: cute.Tensor,
+               mQ: cute.Tensor, mCuQ: cute.Tensor, mCuK: cute.Tensor,
+               mFaB: cute.Tensor, mFaMb: cute.Tensor,
+               tma_a: cute.CopyAtom, tA: cute.Tensor, tma_wo: cute.CopyAtom, tWo: cute.Tensor,
+               mma_qk: cute.TiledMma, mma_pv: cute.TiledMma, mma_op: cute.TiledMma,
+               sQ_l: cute.ComposedLayout, sK_l: cute.ComposedLayout,
+               sV_l: cute.ComposedLayout, sA_l: cute.ComposedLayout,
+               sWo_l: cute.ComposedLayout, Smem: cutlass.Constexpr):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -530,20 +589,35 @@ class FusedFaOprojAr:
         Dc = cutlass.const_expr(self.D)
         nthr = cutlass.const_expr(self.threads)
         MD = cutlass.const_expr(self.M * self.D)
+        # O_proj constexprs
+        n_kchunks = cutlass.const_expr(self.n_kchunks)
+        sgnt = cutlass.const_expr(self.super_group_n_tiles)
+        N_TILE = cutlass.const_expr(self.N_TILE)
+        hidden = cutlass.const_expr(self.hidden)
+        num_out_n_tiles = cutlass.const_expr(self.num_out_n_tiles)
 
         al = cutlass.utils.SmemAllocator()
         st = al.allocate(Smem)
         sma_ptr = st.bc.data_ptr()
         sma = cute.make_tensor(sma_ptr, cute.make_layout(4))
-        sQ = st.sQ.get_tensor(sQ_l.outer, swizzle=sQ_l.inner)
-        sK = st.sK.get_tensor(sK_l.outer, swizzle=sK_l.inner)
-        sV = st.sV.get_tensor(sV_l.outer, swizzle=sV_l.inner)
+        # tensor overlay: FA (sQ/sK/sV) and O_proj (sA/sWo) carve the SAME byte range.
+        # swizzle must live on the POINTER (recast_ptr), not the layout, for WGMMA.
+        ov = st.overlay.data_ptr()
+        sQ = cute.make_tensor(cute.recast_ptr(ov, sQ_l.inner, self.dt), sQ_l.outer)
+        sK = cute.make_tensor(cute.recast_ptr(ov + cutlass.const_expr(self._off_sK), sK_l.inner, self.dt), sK_l.outer)
+        sV = cute.make_tensor(cute.recast_ptr(ov + cutlass.const_expr(self._off_sV), sV_l.inner, self.dt), sV_l.outer)
+        sA = cute.make_tensor(cute.recast_ptr(ov, sA_l.inner, self.dt), sA_l.outer)
+        sWo = cute.make_tensor(cute.recast_ptr(ov + cutlass.const_expr(self._off_sWo), sWo_l.inner, self.dt), sWo_l.outer)
         tx_k = cute.size_in_bytes(self.dt, cute.slice_(sK_l, (None, None, 0)))
         tx_v = cute.size_in_bytes(self.dt, cute.slice_(sV_l, (None, None, 0)))
+        tx_ab = (cute.size_in_bytes(self.dt, cute.slice_(sA_l, (None, None, 0)))
+                 + cute.size_in_bytes(self.dt, cute.slice_(sWo_l, (None, None, 0))))
 
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_v)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_a)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_wo)
 
         # pipelines + LONG-LIVED states (created ONCE, threaded across dispatch loop)
         pl_k = pipeline.PipelineTmaAsync.create(
@@ -556,10 +630,17 @@ class FusedFaOprojAr:
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_warps),
             tx_count=tx_v)
+        pl_ab = pipeline.PipelineTmaAsync.create(
+            barrier_storage=st.mbar_ab.data_ptr(), num_stages=self.oproj_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_warps),
+            tx_count=tx_ab)
         fa_k_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stages)
         fa_v_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stages)
         fa_k_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_stages)
         fa_v_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_stages)
+        op_ab_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.oproj_stages)
+        op_ab_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.oproj_stages)
 
         # consumer fragments / accumulators (persist; refilled per task)
         lane = tidx - self.num_dma_threads
@@ -584,6 +665,18 @@ class FusedFaOprojAr:
         tOrP_v = qlu.reshape_acc_to_frgA(acc_S)
         tOrP = cute.make_rmem_tensor_like(tOrP_v, self.dt)
         nkb_pv = cutlass.const_expr(cute.size(tOrP, mode=[2]))
+
+        # O_proj consumer fragments (separate MMA; A K-major, Wo MN-major)
+        thr_op = mma_op.get_slice(lane)
+        tCrA = mma_op.make_fragment_A(thr_op.partition_A(sA))
+        sWot = qlu.transpose_view(sWo)
+        tCrWo = mma_op.make_fragment_B(thr_op.partition_B(sWot))
+        idC = cute.make_identity_tensor((self.M, N_TILE))
+        acc_C = cute.make_rmem_tensor(thr_op.partition_C(idC).shape[:3], self.acc_dtype)
+        coord_C = qlu.reshape_acc_to_mn(thr_op.partition_C(idC))
+        acc_C_mn = qlu.reshape_acc_to_mn(acc_C)
+        ncols_C = cutlass.const_expr(cute.size(acc_C_mn, mode=[1]))
+        nkb_op = cutlass.const_expr(cute.size(tCrA, mode=[2]))
 
         gsync(ctrl, C_GS_INIT, num_ctas, bidx, tidx)
 
@@ -749,10 +842,92 @@ class FusedFaOprojAr:
                                              sem="release", scope="gpu")
 
                 if mode == MODE_OPROJ:
+                    # ---- decode O_proj slot (every thread) ----
+                    ft = arg // cutlass.Int32(num_super_groups)
+                    nsg = arg % cutlass.Int32(num_super_groups)
+                    base_out = nsg * cutlass.Int32(sgnt)
+                    rem_sg = cutlass.Int32(num_out_n_tiles) - base_out
+                    valid_n_tiles = rem_sg
+                    if rem_sg > cutlass.Int32(sgnt):
+                        valid_n_tiles = cutlass.Int32(sgnt)
+                    b = mFaB[ft]
+                    mb = mFaMb[ft]
+                    q_start = mCuQ[b]
+                    q_len = mCuQ[b + cutlass.Int32(1)] - q_start
+                    valid_m = q_len - mb * cutlass.Int32(128)
+                    if valid_m > cutlass.Int32(128):
+                        valid_m = cutlass.Int32(128)
+
+                    # gmem tiles from the TMA tensors (tA/tWo carry basis strides that
+                    # match the atom's gbasis); index M-tile ft + k-chunk at copy time.
+                    gA = cute.local_tile(tA, (self.M, self.K_CHUNK), (None, None, None))
+                    gWo = cute.local_tile(tWo, (self.K_CHUNK, N_TILE), (None, None))
+                    tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+                        tma_a, 0, cute.make_layout(1),
+                        cute.group_modes(sA, 0, 2), cute.group_modes(gA, 0, 2))
+                    tWosWo, tWogWo = cute.nvgpu.cpasync.tma_partition(
+                        tma_wo, 0, cute.make_layout(1),
+                        cute.group_modes(sWo, 0, 2), cute.group_modes(gWo, 0, 2))
+
+                    if wg_idx == 0:
+                        if warp_idx == 0:
+                            for sg in cutlass.range(valid_n_tiles, unroll=1):
+                                out_n = base_out + sg
+                                for kc in cutlass.range_constexpr(n_kchunks):
+                                    pl_ab.producer_acquire(op_ab_prod)
+                                    bar = pl_ab.producer_get_barrier(op_ab_prod)
+                                    cute.copy(tma_a, tAgA[(None, ft, kc, 0)],
+                                              tAsA[(None, op_ab_prod.index)], tma_bar_ptr=bar)
+                                    cute.copy(tma_wo, tWogWo[(None, kc, out_n)],
+                                              tWosWo[(None, op_ab_prod.index)], tma_bar_ptr=bar)
+                                    pl_ab.producer_commit(op_ab_prod)
+                                    op_ab_prod.advance()
+
+                    if wg_idx >= 1:
+                        for sg in cutlass.range(valid_n_tiles, unroll=1):
+                            out_n = base_out + sg
+                            remn = cutlass.Int32(hidden) - out_n * cutlass.Int32(N_TILE)
+                            valid_n = remn
+                            if remn > cutlass.Int32(N_TILE):
+                                valid_n = cutlass.Int32(N_TILE)
+                            acc_C.fill(0.0)
+                            mma_op.set(warpgroup.Field.ACCUMULATE, True)
+                            cute.nvgpu.warpgroup.fence()
+                            for kc in cutlass.range_constexpr(n_kchunks):
+                                pl_ab.consumer_wait(op_ab_cons)
+                                for kb in cutlass.range_constexpr(nkb_op):
+                                    cute.gemm(mma_op, acc_C,
+                                              tCrA[(None, None, kb, op_ab_cons.index)],
+                                              tCrWo[(None, None, kb, op_ab_cons.index)], acc_C)
+                                cute.nvgpu.warpgroup.commit_group()
+                                cute.nvgpu.warpgroup.wait_group(0)
+                                pl_ab.consumer_release(op_ab_cons)
+                                op_ab_cons.advance()
+                            # predicated store acc_C -> C_sym[ft, :, out_n, :] (no collective)
+                            gC = mCsym[ft, None, out_n, None]
+                            tCgC = thr_op.partition_C(gC)
+                            gC_mn = qlu.reshape_acc_to_mn(tCgC)
+                            for r in cutlass.range_constexpr(nrows):
+                                crow = coord_C[r, None]
+                                for c in cutlass.range_constexpr(ncols_C):
+                                    m = crow[c][0]
+                                    n = crow[c][1]
+                                    if (m < valid_m) and (n < valid_n):
+                                        gC_mn[r, c] = acc_C_mn[r, c].to(self.dt)
+
+                    cute.arch.sync_threads()
                     if tidx == 0:
-                        do_oproj_stub_v2(ctrl, head_ready, oproj_exec, ready_count_owner,
-                                         ar_probe, partial_check, arg, H_local,
-                                         num_super_groups, tp_size)
+                        cute.arch.atomic_add(oproj_exec.iterator + arg.to(cutlass.Uint32),
+                                             cutlass.Uint32(1), sem="relaxed", scope="gpu")
+                        cute.arch.fence_acq_rel_gpu()            # partial store before ready
+                        old = cute.arch.atomic_add(
+                            ready_count_owner.iterator + arg.to(cutlass.Uint32),
+                            cutlass.Uint32(1), sem="acq_rel", scope="gpu")
+                        if (old + cutlass.Uint32(1)) == cutlass.Uint32(tp_size):
+                            cute.arch.atomic_exch(ar_probe.iterator + arg.to(cutlass.Uint32),
+                                                  cutlass.Uint32(1), sem="release", scope="gpu")
+                        cute.arch.atomic_add(ctrl.iterator + C_OP_DONE, cutlass.Uint32(1),
+                                             sem="release", scope="gpu")
                 if mode == MODE_AR:
                     if tidx == 0:
                         do_ar(ctrl, ar_done_flag, ar_exec, arg)

@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-5b-1b: single-rank fused persistent kernel with REAL FA (O_proj/AR still stubs).
+P1: fused persistent kernel with REAL FA + REAL O_proj (single rank, AR identity).
 
-Validates the FA path end-to-end inside the dispatch loop:
-  * O_scratch (written by real FA across all CTAs/tasks) matches o_scratch_reference,
-  * scheduler still exactly-once (fa/oproj/ar exec all == 1) + ordered (order_err==0,
-    via head_ready check in the O_proj stub) + terminates.
+Validates the FA -> O_proj path end-to-end inside the dispatch loop:
+  * C_sym partial (written by real O_proj across all CTAs/tasks) matches the fp32
+    oproj_reference (concat_h(FA_out) @ W_o), per (row_tile, out_n_tile) tile with
+    valid_m / valid_n predication,
+  * scheduler still exactly-once (fa/oproj/ar exec all == 1) + terminates.
 
-    python -m pytest tests/fused/test_fused_fa_path.py
+O_scratch is produced by real FA; C_sym is produced by real O_proj reading that
+O_scratch. AR stays identity (tp_size=1), so this isolates the O_proj numerics.
+
+    python tests/fused/test_fused_oproj_path.py
 """
 import cuda.bindings.driver as cuda
 import numpy as np
@@ -18,11 +22,13 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL
-from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts
-from mega_attention.reference.fused import fa_reference, o_scratch_reference
+from mega_attention.metadata.row_desc import (
+    build_row_desc, oproj_task_counts, cdiv)
+from mega_attention.reference.fused import fa_reference, oproj_reference
 
 DT = torch.bfloat16
 DEV = "cuda:0"
+SENT = -7.0          # bf16-exact sentinel: O_proj must write ONLY valid elements
 
 
 def _u32(n, dev):
@@ -39,21 +45,22 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     dev = torch.device(DEV)
     meta = build_row_desc(seqlens)
     R = meta.num_row_tiles
+    K_local = H_local * D
     num_fa = R * H_local
-    _, num_super_groups, total_oproj = oproj_task_counts(R, hidden, N_TILE, super_group_n_tiles)
+    num_out_n_tiles, num_super_groups, total_oproj = oproj_task_counts(
+        R, hidden, N_TILE, super_group_n_tiles)
     tot = int(sum(seqlens))
+    hidden_pad = num_out_n_tiles * N_TILE
 
     Q = (torch.randn(tot, H_local, D, device=dev, dtype=DT) * 0.2)
     K = (torch.randn(tot, H_local, D, device=dev, dtype=DT) * 0.2)
     V = (torch.randn(tot, H_local, D, device=dev, dtype=DT) * 0.2)
+    W_o = (torch.randn(K_local, hidden, device=dev, dtype=DT) * (K_local ** -0.5))
+    W_o_pad = torch.zeros(K_local, hidden_pad, device=dev, dtype=DT)
+    W_o_pad[:, :hidden] = W_o
+
     Oscr = torch.zeros(R, 128, H_local, D, device=dev, dtype=DT)
-    # O_proj is now real: provide W_o / C_sym buffers (this test only checks O_scratch
-    # + scheduler, but the fused kernel runs the full FA -> O_proj path).
-    num_out_n_tiles = (hidden + N_TILE - 1) // N_TILE
-    hidden_pad = num_out_n_tiles * N_TILE
-    W_o = torch.zeros(H_local * D, hidden_pad, device=dev, dtype=DT)
-    W_o[:, :hidden] = torch.randn(H_local * D, hidden, device=dev, dtype=DT) * ((H_local * D) ** -0.5)
-    C_sym = torch.zeros(R, 128, num_out_n_tiles, N_TILE, device=dev, dtype=DT)
+    C_sym = torch.full((R, 128, num_out_n_tiles, N_TILE), SENT, device=dev, dtype=DT)
 
     ctrl = _u32(NUM_CTRL, dev)
     head_ready = _u32(R, dev)
@@ -73,7 +80,7 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     u32s = [ctrl, head_ready, oproj_queue, ready_count_owner, ar_probe, ar_done_flag,
             fa_exec, oproj_exec, ar_exec, partial_check]
     c_u32 = [from_dlpack(t, assumed_align=4) for t in u32s]
-    c_data = [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o, C_sym)]
+    c_data = [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
     c_meta = [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
     cts = c_u32 + c_data + c_meta
 
@@ -88,32 +95,43 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     torch.cuda.synchronize()
 
     O_ref = fa_reference(Q, K, V, meta)                  # [tot, H, D] fp32
-    Oscr_ref = o_scratch_reference(O_ref, meta)          # [R, 128, H, D] fp32
-    got = Oscr.float()
-    err = (got - Oscr_ref).abs().max().item()
-    tail = 0.0
+    Y_ref = oproj_reference(O_ref, W_o, meta)            # [tot, hidden] fp32
+    C = C_sym.cpu()
+
+    # gather each (row_tile, out_n_tile) valid block and compare to Y_ref
+    err = 0.0
+    leak = 0.0
     for t in range(R):
         vm = meta.valid_m(t)
-        if vm < 128:
-            tail = max(tail, got[t, vm:].abs().max().item())
+        qstart = meta.q_tile_start(t)
+        for o in range(num_out_n_tiles):
+            vn = min(N_TILE, hidden - o * N_TILE)
+            got = C[t, :vm, o, :vn].float()
+            exp = Y_ref[qstart:qstart + vm, o * N_TILE: o * N_TILE + vn].cpu()
+            err = max(err, (got - exp).abs().max().item())
+            # tail rows/cols of a written tile must remain sentinel (not overwritten)
+            if vm < 128:
+                leak = max(leak, (C[t, vm:, o, :] != SENT).float().max().item())
+            if vn < N_TILE:
+                leak = max(leak, (C[t, :, o, vn:] != SENT).float().max().item())
 
     return dict(
-        err=err, tail=tail, R=R, num_fa=num_fa, total_oproj=total_oproj,
+        err=err, leak=leak, R=R, num_fa=num_fa, total_oproj=total_oproj,
         fa_exec=fa_exec.cpu(), oproj_exec=oproj_exec.cpu(), ar_exec=ar_exec.cpu(),
         order_err=int(ctrl[8].item()), fa_done=int(ctrl[1].item()),
         op_done=int(ctrl[5].item()), ar_done=int(ctrl[6].item()),
     )
 
 
-def _check(name, r, tol=2e-2):
+def _check(name, r, tol=3e-2):
     ok = True
     msgs = []
     if not (r["err"] < tol):
-        ok = False; msgs.append(f"O_scratch err={r['err']:.4g}")
-    if r["tail"] != 0.0:
-        ok = False; msgs.append(f"tail={r['tail']:.4g}")
+        ok = False; msgs.append(f"C_sym err={r['err']:.4g}")
+    if r["leak"] != 0.0:
+        ok = False; msgs.append("wrote masked tail (sentinel overwritten)")
     if not bool((r["fa_exec"] == 1).all()):
-        ok = False; msgs.append(f"fa_exec min={int(r['fa_exec'].min())} max={int(r['fa_exec'].max())}")
+        ok = False; msgs.append("fa_exec != 1")
     if not bool((r["oproj_exec"] == 1).all()):
         ok = False; msgs.append("oproj_exec != 1")
     if not bool((r["ar_exec"] == 1).all()):
@@ -123,20 +141,16 @@ def _check(name, r, tol=2e-2):
     if r["fa_done"] != r["num_fa"] or r["op_done"] != r["total_oproj"] or r["ar_done"] != r["total_oproj"]:
         ok = False; msgs.append(f"done fa={r['fa_done']}/{r['num_fa']} op={r['op_done']}/{r['total_oproj']} ar={r['ar_done']}/{r['total_oproj']}")
     print(f"{'PASS' if ok else 'FAIL'} {name}: err={r['err']:.4g} R={r['R']} "
-          f"fa={r['num_fa']} op={r['total_oproj']}" + ("" if ok else "  ||  " + "; ".join(msgs)),
-          flush=True)
+          f"op={r['total_oproj']}" + ("" if ok else "  ||  " + "; ".join(msgs)), flush=True)
     return ok
 
 
 def main():
     cases = [
         ("uniform_128",   [128],          4, 512),
-        ("varlen_200",    [200],          4, 512),
-        # 单序列 [300]: 末 tile valid_m=44 (300%128, 非 8 的倍数) -> finalize 的 warp
-        # collective shuffle 若放在 valid_m 发散分支内会死锁。显式回归该 bug。
-        ("vm44_300",      [300],          4, 512),
+        ("vm44_300",      [300],          4, 512),   # valid_m=44 tail (P0 regression too)
         ("multi_seq",     [200, 64, 300], 4, 768),
-        ("multiseq_h8",   [128, 384, 64], 8, 512),
+        ("ragged_hidden", [200, 130],     4, 640),   # 640 -> 5 out_n_tiles, ragged super_group
     ]
     failed = 0
     for name, seqlens, H, hidden in cases:
