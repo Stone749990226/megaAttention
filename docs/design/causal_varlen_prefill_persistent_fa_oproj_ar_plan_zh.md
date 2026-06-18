@@ -1,7 +1,17 @@
 # Causal Varlen Prefill FlashAttention + O_proj + NVLS AllReduce 设计稿
 
 将Attention和O_proj和NVLS ALlReduce融合成为一个算子
-flash-attention的官方实现在/myworkspace/flash-attention
+
+FlashAttention-4 官方实现作为外部参考固定在仓库 submodule：
+
+```text
+third_party/flash-attention
+```
+
+该外部仓库用于参考 CuTe DSL、SM90 persistent attention pipeline、varlen block info、
+causal mask、online softmax、TMA/WGMMA/mbarrier 协作等实现细节。它不能覆盖本文的
+第一版范围和 invariant；如果 FA4 通用路径与本文冲突，以本文设计为准，先讨论再修改。
+
 ## 目标范围
 
 本文只讨论第一版设计：

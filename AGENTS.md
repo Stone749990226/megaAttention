@@ -43,6 +43,37 @@ docs/design/causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md
 
 不要只凭文件名、历史记忆、通用 FlashAttention 经验或其他项目经验做判断。
 
+## 外部实现参考
+
+FlashAttention-4 官方实现作为外部参考固定在：
+
+```text
+third_party/flash-attention
+```
+
+开发 FA tile、CuTe DSL pipeline、persistent scheduler、varlen block info、causal mask、
+online softmax、TMA/WGMMA/mbarrier 协作时，可以参考该仓库，重点看
+`flash_attn/cute/` 下的 SM90 forward 路径和公共 pipeline/helper 代码。
+
+但 FlashAttention-4 只能作为实现参考，不能覆盖本项目核心设计文档。本项目第一版仍严格
+限制为 Hopper SM90、causal、varlen full prompt prefill、`q_len == k_len`，以及
+FA + O_proj + NVLS AllReduce fused persistent kernel。
+
+不得因为 FA4 支持或包含以下路径，就把它们引入第一版：
+
+- decode。
+- append prefill。
+- chunked prefill。
+- `seqlen_q != seqlen_k` 的通用尾部对齐路径。
+- paged KV。
+- SplitKV。
+- partial O/LSE combine。
+- 非 causal attention。
+- Blackwell 专用路径。
+
+如果 FA4 的实现做法与本项目设计文档存在冲突，必须先用中文说明冲突点、影响和可选方案，
+等用户敲定后再继续。不要直接按 FA4 改写本项目 invariant。
+
 ## 第一版范围
 
 第一版只做：
