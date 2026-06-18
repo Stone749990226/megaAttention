@@ -74,6 +74,34 @@ FA + O_proj + NVLS AllReduce fused persistent kernel。
 如果 FA4 的实现做法与本项目设计文档存在冲突，必须先用中文说明冲突点、影响和可选方案，
 等用户敲定后再继续。不要直接按 FA4 改写本项目 invariant。
 
+DeepGEMM 官方实现也作为外部参考固定在：
+
+```text
+third_party/DeepGEMM
+```
+
+其中 MegaMoE 是 DeepGEMM 中的 SM100 MoE 通算融合实现。它可以作为 symmetric memory、
+GPU-side barrier、dispatch/combine、workspace 管理和通信/GEMM/epilogue 在同一个 kernel
+中协同推进的参考。涉及 MegaMoE 前，必须先读本项目整理的说明文档：
+
+```text
+docs/design/deepgemm_megamoe_reference.md
+```
+
+然后再按说明文档中的路径去 `third_party/DeepGEMM` 查源码。
+
+但 MegaMoE 只能作为通算融合机制参考，不能覆盖本项目核心设计文档。不得因为 MegaMoE 使用
+SM100、UMMA/TMEM、FP8 x FP4、MoE dispatch/combine 或阶段级 NVLink barrier，就把这些机制
+直接引入本项目第一版 Hopper SM90 causal varlen prefill FA + O_proj + NVLS AR fused kernel。
+如果 MegaMoE 的做法与本项目设计文档中的 NVLS ready/count/owner 协议、persistent scheduler、
+row tile layout 或 Hopper SM90 约束冲突，必须先用中文说明冲突点、影响和可选方案，等用户敲定后再继续。
+
+外部参考的统一索引见：
+
+```text
+docs/design/external_references.md
+```
+
 ## 第一版范围
 
 第一版只做：

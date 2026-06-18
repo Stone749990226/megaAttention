@@ -7,6 +7,10 @@
 - `flash_attn/cute/flash_fwd_sm90.py`
 - `flash_attn/cute/softmax.py`
 
+相关 launch shape 参考见：
+
+- `docs/design/fa4_hopper_launch_shape_reference.md`
+
 ## 一句话模型
 
 ```text

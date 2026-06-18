@@ -113,9 +113,9 @@ tests/
 
 benchmarks/       # benchmark driver
 scripts/          # profiling、对比、smoke 脚本
-docs/             # 设计、状态、profiling 文档
+docs/             # 设计、状态、外部参考阅读笔记、profiling 文档
 scratch/          # 临时执行方案和实验记录
-third_party/      # 外部实现参考；flash-attention 为固定 submodule，不是运行时依赖
+third_party/      # 外部实现参考；flash-attention / DeepGEMM 为固定 submodule，不是运行时依赖
 ```
 
 ## 安装
