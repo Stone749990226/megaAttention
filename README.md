@@ -67,15 +67,28 @@ fused（单 persistent kernel）vs 非融合 best-of-breed 基线
 
 | shape | fused | FA+GEMM+NVLS 基线 | ratio |
 | --- | --- | --- | --- |
-| seqlens=[2048,2048] H_local=8 hidden=2048 | 0.191 ms | 0.228 ms | **1.20×** |
-| seqlens=[4096,4096] H_local=8 hidden=4096 | 0.515 ms | 0.725 ms | **1.41×** |
-| seqlens=[1024]×4 H_local=16 hidden=2048 | 0.242 ms | 0.256 ms | **1.06×** |
-| seqlens=[8192]（单序列）H_local=8 hidden=2048 | 0.619 ms | 0.801 ms | **1.30×** |
+| [2048,2048] H8 hid2048 (4K) | 0.191 ms | 0.228 ms | **1.20×** |
+| [1024]×4 H16 hid2048 (4K) | 0.242 ms | 0.256 ms | 1.06× |
+| [4096,4096] H8 hid4096 (8K) | 0.515 ms | 0.725 ms | **1.41×** |
+| [8192] H8 hid2048 (8K, 单序列) | 0.619 ms | 0.801 ms | **1.30×** |
+| [2048]×8 H8 hid2048 (16K) | 0.576 ms | 0.654 ms | 1.13× |
+| [8192,8192] H8 hid2048 (16K) | 1.068 ms | 1.303 ms | **1.22×** |
+| [8192,8192] H8 hid4096 (16K) | 1.252 ms | 1.662 ms | **1.33×** |
+| [8192,8192] H16 hid7168 (16K, DeepSeek) | 3.075 ms | 3.199 ms | 1.04× |
+| [16384] H8 hid2048 (16K, 单序列) | 1.962 ms | 2.199 ms | 1.12× |
+| [16384] H16 hid4096 (16K, 单序列) | 4.234 ms | 4.023 ms | 0.95× |
+| [16384,16384] H8 hid2048 (32K) | 3.711 ms | 3.850 ms | 1.04× |
+| [32768] H8 hid2048 (32K, 单序列) | 7.392 ms | 6.904 ms | 0.93× |
 
-fused 在所有测试 shape 上都快于「FlashAttention + GEMM + NVLS AllReduce」基线（**1.06–1.41×**）。
-收益主要来自省掉三次独立 kernel launch（尤其独立的 NVLS all_reduce 发射）+ 数据留在片上/在途。
-当前 fused 的 do_ar 还是 correctness-first 的单遍 multimem reduce（无 comm/compute overlap）；
-后续把 standalone `oproj_ar.py` 的 comm warp group overlap（已达 ~1.4× over un-fused AR）接进来可进一步拉大优势。
+规律：
+- **多序列 varlen prefill（目标场景）**：fused 普遍快 **1.1–1.4×**；hidden 越大（O_proj/AR 占比越高）优势越大。
+- **长单序列（16K–32K，FA O(L²) compute-bound）**：fused 0.93–1.12×（边际/略负）——长序列下 FA 主导，
+  官方 flash-attn 的 FA 比 fused 的 per-tile FA 更优化，融合省下的 launch / 独立 AR 占比变小。
+- **hidden=7168（1.04×）**：当前 do_ar 是 correctness-first 的单遍 multimem reduce（无 comm/compute
+  overlap），超大 hidden 下成为瓶颈。
+
+两个吃亏区间精确对应已知优化缺口：**FA per-tile 效率** 与 **AR comm/compute overlap**
+（standalone `oproj_ar.py` 的 comm warp group 方案已达 ~1.4× over un-fused AR，尚未接入 fused）。
 
 > 备注：用 PyTorch SDPA 的 FLASH 后端（也是 FlashAttention-2）替换官方包时 ratio 更高（如
 > [2048,2048] 为 1.43×），因为官方 flash-attn 比 SDPA 后端更快、基线更强；表中取官方包的权威数。
