@@ -149,13 +149,18 @@ metadata/reference 级别测试可以在 CPU 环境执行，但任何 Hopper ker
 性能结论都必须基于实际 Hopper 环境验证。没有实际运行对应测试时，不要声称 Hopper kernel
 已经通过。
 
+如果 PyTorch 基于 CUDA 13 构建而机器驱动只到 CUDA 12.8（报 "driver too old"），先设置 forward-compat：
+`export LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:$LD_LIBRARY_PATH`，再跑 GPU 测试。
+
 常用测试：
 
 ```bash
 pytest tests/metadata
 pytest tests/kernels
 pytest tests/fused/test_scheduler_skeleton.py
-pytest tests/fused/test_fused_fa_path.py
+# 下面两个是 standalone 脚本（没有 test_ 函数），用 pytest 跑会 collected 0 items：
+python tests/fused/test_fa_packed.py
+python tests/fused/test_fused_fa_path.py   # 已知：multi_seq 用例在 fused scheduler 里死锁，单序列用例通过
 torchrun --nproc_per_node=8 benchmarks/bench_oproj_ar.py --iters 30 --warmup 10
 ```
 

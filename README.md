@@ -42,7 +42,7 @@ docs/design/causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md
 | O_proj tile microkernel | 已验证/开发中 |
 | standalone O_proj + NVLS AR | 已验证 |
 | persistent scheduler skeleton | 已验证 |
-| real FA in fused scheduler | 已验证 |
+| real FA in fused scheduler | 单序列已验证；multi_seq 死锁（见测试分级"已知问题"）|
 | real O_proj in fused kernel | 待完成 |
 | real NVLS AR in fused kernel | 待完成/迁移 |
 
@@ -77,6 +77,24 @@ pip install -e ".[dev]"
 
 核心依赖包括 PyTorch、CuTe DSL、CUDA Python bindings 和 quack kernels。完整 fused / NVLS 路径还需要 Hopper GPU、NCCL NVLS、`torch.distributed._symmetric_memory` 和支持 multicast 的 symmetric memory 环境。
 
+实测可用版本：`nvidia-cutlass-dsl 4.5.0`、`quack-kernels 0.4.1`（`pyproject.toml` 的版本下限以此为准）。
+
+### CUDA 驱动 / forward-compat 注意
+
+如果 PyTorch 是基于 CUDA 13 构建（如 `torch 2.x+cu130`），而机器的 NVIDIA 内核驱动只支持到 CUDA 12.8（如 driver 570.x），直接运行任何 GPU 测试都会报：
+
+```text
+RuntimeError: The NVIDIA driver on your system is too old (found version 12080)
+```
+
+此时若机器已装 CUDA forward-compat 包（H200 等数据中心卡支持），用 compat 目录下的 userspace 驱动即可：
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:$LD_LIBRARY_PATH
+```
+
+设置后 `torch.cuda.is_available()` 应为 `True` 且识别为 `NVIDIA H200 (9, 0)`。本文下面所有 Hopper / 多卡命令都假设已设置该变量。
+
 ## 测试分级
 
 CPU / 普通本机可跑：
@@ -90,8 +108,21 @@ Hopper 单卡可跑：
 ```bash
 pytest tests/kernels
 pytest tests/fused/test_scheduler_skeleton.py
-pytest tests/fused/test_fused_fa_path.py
 ```
+
+`tests/fused/test_fused_fa_path.py` 和 `tests/fused/test_fa_packed.py` 目前是 standalone 脚本
+（只有 `main()`，没有 `test_` 函数），用 `pytest` 跑会 `collected 0 items`、什么都不验证。要跑它们用脚本方式：
+
+```bash
+python tests/fused/test_fa_packed.py        # FA payload 全 PASS（含 multi_seq）
+python tests/fused/test_fused_fa_path.py     # 见下方已知问题：multi_seq 会死锁
+```
+
+**已知问题（当前卡点）**：`test_fused_fa_path.py` 的单序列用例（`uniform_128` R=1、`varlen_200` R=2）
+通过；但 `multi_seq [200,64,300]`（R=6，row tile 跨多个序列）在 fused persistent scheduler 里**死锁**
+——kernel 正常编译、正常 launch，但 `torch.cuda.synchronize()` 永不返回、GPU 持续 100%。对照实验确认
+FA payload 本身（`test_fa_packed.py` 同一输入 R=6）可正常通过，所以问题定位在 scheduler 在多 row-tile /
+多序列下的 ready/同步路径。real FA 接入 fused kernel 仅在单序列下验证通过。
 
 多卡 Hopper + NVSwitch/NVLS 环境：
 

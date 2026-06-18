@@ -11,9 +11,9 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "torch",
-    "nvidia-cutlass-dsl>=4.5.2",
+    "nvidia-cutlass-dsl>=4.5.0",
     "cuda-python",
-    "quack-kernels>=0.5.0",
+    "quack-kernels>=0.4.1",
 ]
 
 [project.optional-dependencies]
