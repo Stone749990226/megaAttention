@@ -39,12 +39,25 @@ docs/design/causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md
 | --- | --- |
 | row tile metadata / `row_desc` | 已实现 |
 | 动态 varlen FA tile | 已验证 |
-| O_proj tile microkernel | 已验证/开发中 |
-| standalone O_proj + NVLS AR | 已验证 |
+| O_proj tile microkernel | 已验证 |
+| standalone O_proj + NVLS AR | 已验证（8×H200） |
 | persistent scheduler skeleton | 已验证 |
-| real FA in fused scheduler | 单序列已验证；multi_seq 死锁（见测试分级"已知问题"）|
-| real O_proj in fused kernel | 待完成 |
-| real NVLS AR in fused kernel | 待完成/迁移 |
+| real FA in fused scheduler | 已验证（含 multi_seq；原 finalize warp 发散死锁已修复） |
+| real O_proj in fused kernel | 已验证（单卡 tp_size=1，C_sym partial 对 `oproj_reference`） |
+| AR owner 调度协议 in fused kernel | 已验证（单卡 tp_size=1：确定性 owner 映射 + owner-local u64 bitset + exactly-once/terminate） |
+| real NVLS AR（多卡 multimem reduce/store） | 待完成（P3：对称 `C_sym_mc` + 跨 rank owner 寻址 + 8 卡端到端 + 性能） |
+
+当前 fused kernel 已在同一个 persistent 调度器内跑通 **real FA + real O_proj + AR owner 调度协议**（单卡）。
+AR 在 `tp_size=1` 下数值为恒等（C_sym partial 即 final）；真实 `multimem.ld_reduce/st` 与对称内存多卡路径留待 P3。
+
+### 分阶段验证状态（单卡 H200）
+
+| 阶段 | commit | 验证 |
+| --- | --- | --- |
+| P0 修 multi_seq 死锁 | `7f711d1` | `test_fused_fa_path` / `test_fa_packed` / `test_fa_varlen` 全过（含 `valid_m%8≠0` 回归） |
+| P1 real O_proj 接入 | `1cd547b` | `test_fused_oproj_path` 4 用例（C_sym 对 `oproj_reference`，err~0.0018） |
+| P2 AR owner 协议 | `9b028c9` | `test_scheduler_skeleton` 5 passed；fused 两路径全过；exactly-once / 正常终止 |
+| P3 多卡 NVLS | — | 待完成 |
 
 ## 目录结构
 
@@ -110,19 +123,20 @@ pytest tests/kernels
 pytest tests/fused/test_scheduler_skeleton.py
 ```
 
-`tests/fused/test_fused_fa_path.py` 和 `tests/fused/test_fa_packed.py` 目前是 standalone 脚本
-（只有 `main()`，没有 `test_` 函数），用 `pytest` 跑会 `collected 0 items`、什么都不验证。要跑它们用脚本方式：
+`tests/fused/test_fused_fa_path.py`、`tests/fused/test_fused_oproj_path.py` 和
+`tests/fused/test_fa_packed.py` 目前是 standalone 脚本（只有 `main()`，没有 `test_` 函数），
+用 `pytest` 跑会 `collected 0 items`。要跑它们用脚本方式：
 
 ```bash
-python tests/fused/test_fa_packed.py        # FA payload 全 PASS（含 multi_seq）
-python tests/fused/test_fused_fa_path.py     # 见下方已知问题：multi_seq 会死锁
+python tests/fused/test_fa_packed.py          # FA payload 全 PASS（含 multi_seq）
+python tests/fused/test_fused_fa_path.py       # fused FA 路径全 PASS（含 multi_seq / vm44_300）
+python tests/fused/test_fused_oproj_path.py    # fused FA+O_proj+AR 协议，C_sym 对 oproj_reference
 ```
 
-**已知问题（当前卡点）**：`test_fused_fa_path.py` 的单序列用例（`uniform_128` R=1、`varlen_200` R=2）
-通过；但 `multi_seq [200,64,300]`（R=6，row tile 跨多个序列）在 fused persistent scheduler 里**死锁**
-——kernel 正常编译、正常 launch，但 `torch.cuda.synchronize()` 永不返回、GPU 持续 100%。对照实验确认
-FA payload 本身（`test_fa_packed.py` 同一输入 R=6）可正常通过，所以问题定位在 scheduler 在多 row-tile /
-多序列下的 ready/同步路径。real FA 接入 fused kernel 仅在单序列下验证通过。
+**已解决**：早期 `multi_seq [200,64,300]` 在 fused scheduler 死锁的问题已在 P0 定位并修复
+（根因是 FA finalize 把 warp-collective `warp_reduction_sum` 放在按 `valid_m` 发散的分支里，
+`valid_m%8≠0` 时 warp 内发散调用 shuffle 死锁；修复为无条件调用，见 `test_fa_varlen` 的
+`vm_split_m44` 与 `test_fused_fa_path` 的 `vm44_300` 回归用例）。
 
 多卡 Hopper + NVSwitch/NVLS 环境：
 

@@ -125,12 +125,18 @@ def try_pop_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor):
 @cute.jit
 def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
                  owner_words_alloc: cutlass.Constexpr, tp_size: cutlass.Constexpr,
-                 rank: cutlass.Constexpr):
+                 rank: cutlass.Constexpr, local_owned_ar: cutlass.Constexpr):
     """Scan this rank's owner-local ar_ready_bits (uint64 bitset) from a word cursor,
     ffs-via-popc the lowest set bit, atomicAnd-clear it (CAS-free single-owner claim).
 
     Returns (found, ar_slot_id). owner_idx = word*64 + bit_index;
     ar_slot_id = owner_idx*tp_size + rank (设计稿 确定性 owner 反解)。
+
+    Tail guard: owner_slots_alloc = ceil(total_oproj/tp_size) rounds up, so owner_idx
+    in [local_owned_ar, owner_slots_alloc) are invalid tail slots (设计稿 §1772 "尾部
+    无效槽位不参与调度"). In correct operation publish_ar_ready never sets those bits,
+    but we still clear-and-skip any that appear so a stray bit can't wedge the scan or
+    over-count ar_done.
     """
     found = cutlass.Int32(0)
     arg = cutlass.Int32(-1)
@@ -146,13 +152,15 @@ def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
         if word != cutlass.Int64(0):
             lowest = word & (cutlass.Int64(0) - word)         # isolate lowest set bit
             bit_index = cute.arch.popc(lowest - cutlass.Int64(1))   # trailing-zero count
+            owner_idx = w.to(cutlass.Int32) * cutlass.Int32(64) + bit_index.to(cutlass.Int32)
             old = cute.arch.atomic_and(ar_ready_bits.iterator + w, ~lowest,
                                        sem="acq_rel", scope="gpu")
             if (old & lowest) != cutlass.Int64(0):            # we cleared it -> won
-                found = cutlass.Int32(1)
-                found_w = w
-                owner_idx = w.to(cutlass.Int32) * cutlass.Int32(64) + bit_index.to(cutlass.Int32)
-                arg = owner_idx * cutlass.Int32(tp_size) + cutlass.Int32(rank)
+                if owner_idx < cutlass.Int32(local_owned_ar):  # valid (non-tail) slot
+                    found = cutlass.Int32(1)
+                    found_w = w
+                    arg = owner_idx * cutlass.Int32(tp_size) + cutlass.Int32(rank)
+                # else: tail-invalid -> cleared above, skip (no claim, no count)
         i = i + cutlass.Uint32(1)
     if found != 0:
         cute.arch.atomic_exch(ctrl.iterator + C_AR_CURSOR, found_w,
@@ -324,7 +332,8 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
                 if src == MODE_OPROJ:
                     f, a = try_pop_oproj(ctrl, oproj_queue)
                 if src == MODE_AR:
-                    f, a = try_claim_ar(ctrl, ar_ready_bits, owner_words_alloc, tp_size, rank)
+                    f, a = try_claim_ar(ctrl, ar_ready_bits, owner_words_alloc, tp_size,
+                                        rank, local_owned_ar)
                 if f != 0:
                     found = cutlass.Int32(1)
                     mode = src
