@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.distributed._symmetric_memory as symm_mem
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
@@ -22,6 +23,13 @@ from cutlass.cute.runtime import from_dlpack
 
 from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL
 from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts
+
+try:
+    from flash_attn import flash_attn_varlen_func
+    _HAS_FA = True
+except Exception:
+    flash_attn_varlen_func = None
+    _HAS_FA = False
 
 DT = torch.bfloat16
 
@@ -128,24 +136,35 @@ def main():
     def run_fused():
         compiled(*cts, st)
 
-    # ---- non-fused baseline: per-batch SDPA + matmul O_proj + all_reduce ----
-    def run_baseline():
-        O = torch.empty(tot, H_local, D, device=dev, dtype=DT)
-        for b in range(meta.num_batch):
-            s = int(meta.cu_seqlens_q[b]); e = int(meta.cu_seqlens_q[b + 1])
-            q = Q[s:e].transpose(0, 1).unsqueeze(0)
-            k = K[s:e].transpose(0, 1).unsqueeze(0)
-            v = V[s:e].transpose(0, 1).unsqueeze(0)
-            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            O[s:e] = o.squeeze(0).transpose(0, 1)
-        Y = O.reshape(tot, K_local) @ W_o
-        dist.all_reduce(Y, op=dist.ReduceOp.SUM)
-        return Y
+    # ---- best-of-breed non-fused baseline: FlashAttention + GEMM + NVLS AllReduce ----
+    # FA: flash_attn_varlen_func (official pkg) if available, else SDPA forced to the
+    #     FlashAttention backend. O_proj: cuBLAS matmul. AR: NVLS multimem_all_reduce_
+    #     (real NVLS over a symmetric buffer, not NCCL).
+    Y_sym = symm_mem.empty(tot, hidden, device=dev, dtype=DT)
+    symm_mem.rendezvous(Y_sym, gname)
+    cu = cu_q.to(torch.int32); max_s = max(seqlens)
 
+    def run_baseline():
+        if _HAS_FA:
+            O = flash_attn_varlen_func(Q, K, V, cu, cu, max_s, max_s, causal=True)  # [tot,H,D]
+        else:
+            O = torch.empty(tot, H_local, D, device=dev, dtype=DT)
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                for b in range(meta.num_batch):
+                    s = int(meta.cu_seqlens_q[b]); e = int(meta.cu_seqlens_q[b + 1])
+                    o = F.scaled_dot_product_attention(
+                        Q[s:e].transpose(0, 1).unsqueeze(0), K[s:e].transpose(0, 1).unsqueeze(0),
+                        V[s:e].transpose(0, 1).unsqueeze(0), is_causal=True)
+                    O[s:e] = o.squeeze(0).transpose(0, 1)
+        torch.matmul(O.reshape(tot, K_local), W_o, out=Y_sym)
+        torch.ops.symm_mem.multimem_all_reduce_(Y_sym, "sum", gname)
+        return Y_sym
+
+    fa_name = "flash_attn_varlen" if _HAS_FA else "SDPA-FLASH"
     t_fused = bench(run_fused, args.iters, args.warmup, setup=reset_fused)
     t_base = bench(run_baseline, args.iters, args.warmup)
     if rank == 0:
-        print(f"[bench] fused={t_fused:.4f} ms  baseline(SDPA+matmul+AR)={t_base:.4f} ms  "
+        print(f"[bench] fused={t_fused:.4f} ms  baseline({fa_name}+GEMM+NVLS-AR)={t_base:.4f} ms  "
               f"ratio={t_base / t_fused:.3f}x (>1 = fused faster)", flush=True)
     dist.barrier(); dist.destroy_process_group()
 

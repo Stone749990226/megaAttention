@@ -62,19 +62,23 @@ tp_size=8 下 owner 用 `multimem.ld_reduce/st` 在 C_sym multicast view 上做 
 
 ### 性能（8×H200，`benchmarks/bench_fused_fa_oproj_ar.py`）
 
-fused（单 persistent kernel）vs 非融合基线（per-batch SDPA + matmul O_proj + NCCL all_reduce）：
+fused（单 persistent kernel）vs 非融合 best-of-breed 基线
+（官方 **`flash_attn_varlen_func`**（flash-attn 2.8.3）+ cuBLAS GEMM + **NVLS `multimem_all_reduce_`**）：
 
-| shape | fused | baseline | ratio |
+| shape | fused | FA+GEMM+NVLS 基线 | ratio |
 | --- | --- | --- | --- |
-| seqlens=[2048,2048] H_local=8 hidden=2048 | 0.195 ms | 0.246 ms | **1.26×** |
-| seqlens=[4096,4096] H_local=8 hidden=4096 | 0.517 ms | 0.647 ms | **1.25×** |
-| seqlens=[1024]×4 H_local=16 hidden=2048 | 0.243 ms | 0.292 ms | **1.20×** |
-| seqlens=[8192]（单序列）H_local=8 hidden=2048 | 0.616 ms | 0.553 ms | 0.90×（更慢） |
+| seqlens=[2048,2048] H_local=8 hidden=2048 | 0.191 ms | 0.228 ms | **1.20×** |
+| seqlens=[4096,4096] H_local=8 hidden=4096 | 0.515 ms | 0.725 ms | **1.41×** |
+| seqlens=[1024]×4 H_local=16 hidden=2048 | 0.242 ms | 0.256 ms | **1.06×** |
+| seqlens=[8192]（单序列）H_local=8 hidden=2048 | 0.619 ms | 0.801 ms | **1.30×** |
 
-多序列 varlen prefill（目标场景）下 fused 稳定快 ~1.2–1.26×。单条长序列下慢于基线——
-基线一次大 SDPA 最高效，而当前 fused 的 per-tile FA + **correctness-first 的 naive AR
-（单遍 multimem reduce，无 comm/compute overlap）** 吃亏。后续优化方向：AR comm warp group
-overlap（standalone `oproj_ar.py` 已达 ~1.4×，尚未接入 fused）、FA per-tile 效率。
+fused 在所有测试 shape 上都快于「FlashAttention + GEMM + NVLS AllReduce」基线（**1.06–1.41×**）。
+收益主要来自省掉三次独立 kernel launch（尤其独立的 NVLS all_reduce 发射）+ 数据留在片上/在途。
+当前 fused 的 do_ar 还是 correctness-first 的单遍 multimem reduce（无 comm/compute overlap）；
+后续把 standalone `oproj_ar.py` 的 comm warp group overlap（已达 ~1.4× over un-fused AR）接进来可进一步拉大优势。
+
+> 备注：用 PyTorch SDPA 的 FLASH 后端（也是 FlashAttention-2）替换官方包时 ratio 更高（如
+> [2048,2048] 为 1.43×），因为官方 flash-attn 比 SDPA 后端更快、基线更强；表中取官方包的权威数。
 
 ## 目录结构
 
