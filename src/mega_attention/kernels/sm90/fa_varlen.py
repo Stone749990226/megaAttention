@@ -302,8 +302,11 @@ class FaWsAttnDyn:
 
             # finalize: quad-reduce row_sum, divide; mask invalid rows
             for r in cutlass.range_constexpr(nrows):
+                # warp_reduction_sum is a warp-collective shuffle (full-warp mask):
+                # call it UNCONDITIONALLY (uniform across the warp). Guarding it behind
+                # valid_m diverges the warp when valid_m % 8 != 0 -> shuffle deadlock.
+                s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
                 if coord_mn[r, 0][0] < valid_m:
-                    s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
                     inv = cutlass.Float32(1.0) / s
                     acc_O_mn[r, None].store(acc_O_mn[r, None].load() * inv)
                 else:
@@ -587,8 +590,11 @@ class FaWsAttnPacked:
 
             # finalize: quad-reduce row_sum, divide; mask rows past the sequence
             for r in cutlass.range_constexpr(nrows):
+                # warp_reduction_sum is a warp-collective shuffle (full-warp mask):
+                # call it UNCONDITIONALLY (uniform across the warp). Guarding it behind
+                # q_len diverges the warp when valid_m % 8 != 0 -> shuffle deadlock.
+                s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
                 if (mask_q_off + coord_mn[r, 0][0]) < q_len:
-                    s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
                     inv = cutlass.Float32(1.0) / s
                     acc_O_mn[r, None].store(acc_O_mn[r, None].load() * inv)
                 else:

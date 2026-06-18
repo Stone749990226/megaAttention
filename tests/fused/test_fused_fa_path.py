@@ -124,6 +124,9 @@ def main():
     cases = [
         ("uniform_128",   [128],          4, 512),
         ("varlen_200",    [200],          4, 512),
+        # 单序列 [300]: 末 tile valid_m=44 (300%128, 非 8 的倍数) -> finalize 的 warp
+        # collective shuffle 若放在 valid_m 发散分支内会死锁。显式回归该 bug。
+        ("vm44_300",      [300],          4, 512),
         ("multi_seq",     [200, 64, 300], 4, 768),
         ("multiseq_h8",   [128, 384, 64], 8, 512),
     ]

@@ -722,8 +722,13 @@ class FusedFaOprojAr:
                         gO = cute.local_tile(gOscr, (self.M, self.D), (None, None))
                         tCgO = thr_pv.partition_C(gO[(None, None, 0, 0)])
                         for r in cutlass.range_constexpr(nrows):
+                            # warp_reduction_sum is a warp-collective shuffle: call it
+                            # UNCONDITIONALLY for every row (uniform across the warp).
+                            # Guarding it behind the valid_m predicate diverges the warp
+                            # whenever valid_m splits a warp's 8-row sub-block (valid_m % 8
+                            # != 0 at the boundary) -> the shuffle deadlocks -> CTA hangs.
+                            s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
                             if (mask_q_off + coord_mn[r, 0][0]) < q_len:
-                                s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
                                 inv = cutlass.Float32(1.0) / s
                                 acc_O_mn[r, None].store(acc_O_mn[r, None].load() * inv)
                             else:

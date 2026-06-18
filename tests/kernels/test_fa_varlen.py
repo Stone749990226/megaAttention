@@ -62,6 +62,9 @@ def run():
         ("varlen_tail_m72",   200, 128, 72,  200),
         ("wg2_masked_m40",    40,  0,   40,  40),
         ("klen_tail_nblk3",   320, 256, 64,  320),
+        # valid_m=44 (44%8 != 0) -> boundary splits a warp's 8-row sub-block: finalize
+        # warp-collective shuffle must be called uniformly or the warp deadlocks.
+        ("vm_split_m44",      300, 256, 44,  300),
     ]
     failed = 0
     for name, L, q_start, valid_m, k_len in cases:
