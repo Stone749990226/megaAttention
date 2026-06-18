@@ -851,7 +851,7 @@ O_proj task:
     任务: slot_id -> (fa_row_tile_id, n_super_group)
 
 AR owner task:
-    来源: ar_owner_probe_bits
+    来源: ar_ready_bits
     任务: ar_slot_id -> (fa_row_tile_id, n_super_group)
 ```
 
@@ -914,25 +914,38 @@ O_proj CTA 完成某个 ar_tile 的本 rank partial 后:
     如果使用 TMA S2G store，则 cp_async_bulk_wait_group(0, read=False)
     cute.arch.fence_proxy("alias")
     system-scope release fence
-    old = atomicAdd_acq_rel_system(owner.ready_count_owner[ar_slot_id], 1)
+
+    owner_rank = ar_slot_id % tp_size
+    owner_idx  = ar_slot_id / tp_size
+
+    old = atomicAdd_acq_rel_system(owner_rank.ready_count_owner[owner_idx], 1)
 
     if old + 1 == tp_size:
-        atomicOr_release_system(owner.ar_owner_probe_bits[word_id], bit)
+        word_id = owner_idx / 64
+        bit     = 1 << (owner_idx % 64)
+        atomicOr_release_system(owner_rank.ar_ready_bits[word_id], bit)
 ```
 
-`ar_owner_probe_bits` 表示某个 `ar_slot_id` 已经由最后一个完成 partial 的 rank 确认 ready，可以由 owner rank 执行 NVLS reduce/store。它不是“某个 rank 刚完成 partial”的通知位，因此 owner 不需要对未 ready 的 tile 做 retry。CTA claim 到 AR owner task 后：
+这里 `word_id = owner_idx / 64`，`bit = 1 << (owner_idx % 64)`。`ar_ready_bits`
+只表示某个 `ar_slot_id` 已经由最后一个完成 partial 的 rank 确认 ready，可以由
+owner rank 执行 NVLS reduce/store。调度器只从 `ar_ready_bits` 领取已经 ready 的
+AR task。CTA claim 到 AR owner task 后：
 
 ```text
-ar_slot_id = fa_row_tile_id * num_super_groups + n_super_group
+word = acquire_load_system(ar_ready_bits[word_id])
+bit_index = ffs(word)
+bit = 1 << bit_index
 
-old_probe = atomicAnd_acq_rel(ar_owner_probe_bits[word_id], ~bit)
+old_ready = atomicAnd_acq_rel_system(ar_ready_bits[word_id], ~bit)
 
-if old_probe & bit == 0:
+if old_ready & bit == 0:
     没有成功 claim，直接返回调度循环
 
 old_done = atomicOr_acq_rel(ar_done_bits[word_id], bit)
 
 if old_done & bit == 0:
+    owner_idx  = word_id * 64 + bit_index
+    ar_slot_id = owner_idx * tp_size + my_rank
     执行 multimem.ld_reduce + multimem.st
     等待 final store 完成
     atomicAdd(ar_done_count, 1)
@@ -965,11 +978,11 @@ oproj_done_count:
     + alias proxy fence
     + system-scope release fence
     + ready_count_owner 更新完成
-    + 如果是 last-arriver，则 ar_owner_probe_bits 投递完成
+    + 如果是 last-arriver，则 ar_ready_bits 投递完成
     之后递增
 
 ar_done_count:
-    ar_owner_probe_bits claim 成功
+    ar_ready_bits claim 成功
     + ar_done_bits 首次置位成功
     + multimem.ld_reduce / multimem.st 完成
     之后递增
@@ -1733,17 +1746,45 @@ O_proj compute 和 NVLS AllReduce 分成两个阶段：
 
 ### 跨 rank ready 方式
 
-第一版采用 push-to-owner ready count，而不是每个 rank 去通知所有 rank，也不是反复对 flag 做 `multimem.ld_reduce` 轮询。
+第一版采用 push-to-owner ready count。
 
-对某个 AR tile：
+AR 的调度单位是 O_proj 的一个 super group：
 
 ```text
 ar_tile    = (fa_row_tile_id, n_super_group)
 ar_slot_id = fa_row_tile_id * num_super_groups + n_super_group
-owner      = hash(fa_row_tile_id, n_super_group) % tp_size
 ```
 
-一个 `ar_tile` 覆盖该 super group 内的所有 `out_n_tile`。因此 super group 放大后，push-to-owner ready atomic 和 owner reduce task 数量同步下降，但 owner 对单个 `ar_tile` 的 reduce/store 工作量也会变大。
+一个 `ar_tile` 覆盖该 super group 内的所有 `out_n_tile`。因此 ready count、
+ready bit、done bit 和 AR reduce/store 都以 `ar_slot_id` 为粒度，而不是以单个
+`out_n_tile` 为粒度。
+
+owner rank 和 owner-local 槽位使用确定性映射，不使用 hash 表：
+
+```text
+owner_rank = ar_slot_id % tp_size
+owner_idx  = ar_slot_id / tp_size
+
+ar_slot_id = owner_idx * tp_size + owner_rank
+```
+
+每个 rank 只分配自己 owner 的控制状态。第一版可以按 `ceil(total_oproj_tasks / tp_size)`
+统一分配 owner-local 槽位，尾部无效槽位不参与调度：
+
+```text
+local_owned_ar_tasks = ceil_div(max(total_oproj_tasks - my_rank, 0), tp_size)
+owner_slots_alloc    = ceil_div(total_oproj_tasks, tp_size)
+owner_words_alloc    = ceil_div(owner_slots_alloc, 64)
+
+ready_count_owner[owner_slots_alloc]  # uint32
+ar_ready_bits[owner_words_alloc]      # uint64 bitset
+ar_done_bits[owner_words_alloc]       # uint64 bitset
+ar_scan_cursor                        # uint32 word cursor
+```
+
+这里的 `owner_rank.ready_count_owner` 和 `owner_rank.ar_ready_bits` 表示通过 symmetric/control
+workspace 的 rank 映射得到的目标 rank 控制地址。跨 rank 写入使用 system-scope 原子语义；
+owner rank 本地 claim 远端发布的 ready bit 时也使用 system-scope acquire/acq_rel 语义。
 
 每个 rank 只写自己的 partial：
 
@@ -1755,55 +1796,60 @@ O_proj CTA:
     如果使用 TMA S2G store，则 cp_async_bulk_wait_group(0, read=False)
     cute.arch.fence_proxy("alias")
     system-scope release fence
-    old = atomicAdd_acq_rel_system(owner.ready_count_owner[ar_slot_id], 1)
+
+    owner_rank = ar_slot_id % tp_size
+    owner_idx  = ar_slot_id / tp_size
+
+    old = atomicAdd_acq_rel_system(owner_rank.ready_count_owner[owner_idx], 1)
 
     if old + 1 == tp_size:
-        atomicOr_release_system(owner.ar_owner_probe_bits[word_id], bit)
+        word_id = owner_idx / 64
+        bit     = 1 << (owner_idx % 64)
+        atomicOr_release_system(owner_rank.ar_ready_bits[word_id], bit)
 ```
 
 也就是说，ready count 的粒度是 `ar_slot_id = (fa_row_tile_id, n_super_group)`，不是单个 `out_n_tile`。一个 rank 对同一个 `ar_slot_id` 只加一次 ready count；只有这个 super group 内所有 `valid_n_tiles` 都已经写入 symmetric partial buffer 后，才能参与 ready count。
 
-`ar_owner_probe_bits` 只由最后一个完成 partial 的 rank 设置。`old + 1 < tp_size` 的 rank 只递增 ready count，不投递 owner task；`old + 1 == tp_size` 的 rank 负责把该 `ar_slot_id` 放入 owner rank 的 AR work source。这样 owner 不会看到未 ready 的 AR task，也不需要重试队列。
+`ar_ready_bits` 只由最后一个完成 partial 的 rank 设置。`old + 1 < tp_size` 的 rank
+只递增 ready count，不投递 owner task；`old + 1 == tp_size` 的 rank 负责把该
+`ar_slot_id` 发布到 owner rank 的 AR work source。`ar_ready_bits` 中的 bit 只表示
+“已经 ready，可以直接 reduce/store”。未 ready 的 `ar_slot_id` 不进入 AR work source。
 
-这里的 ready count 存在 owner rank 的本地 symmetric/control buffer 中。第一版不把 ready count 压缩成 owner-local 稠密数组，而是在每个 rank 上都按全局 `ar_slot_id` 全量分配：
-
-```text
-ar_slot_id = fa_row_tile_id * num_super_groups + n_super_group
-
-ready_count_owner[total_oproj_tasks]
-ready_count_owner[ar_slot_id]
-```
-
-其中只有满足：
+例如 `tp_size = 8`：
 
 ```text
-owner(ar_slot_id) == this_rank
+global ar_slot_id:
+
+  0   1   2   3   4   5   6   7   8   9  10  11 ...
+  |   |   |   |   |   |   |   |   |   |   |   |
+  v   v   v   v   v   v   v   v   v   v   v   v
+ R0  R1  R2  R3  R4  R5  R6  R7  R0  R1  R2  R3 ...
+
+owner-local slot:
+
+ R0: idx 0 -> ar 0,   idx 1 -> ar 8,   idx 2 -> ar 16 ...
+ R1: idx 0 -> ar 1,   idx 1 -> ar 9,   idx 2 -> ar 17 ...
+ R2: idx 0 -> ar 2,   idx 1 -> ar 10,  idx 2 -> ar 18 ...
 ```
 
-的槽位会被远端 rank 写入，并由本 rank owner reduce task 读取；其它槽位虽然分配了空间，但不会作为有效 ready count 使用。这样每个 rank 发起 push-to-owner atomic 时，只需要用全局 `ar_slot_id` 作为下标，不需要额外的 `ar_slot_id -> owner_local_index` 压缩映射。第一版用这点 workspace 开销换协议简单性和可验证性。
-
-例如 `tp_size = 4`，`ar_tile = T` 的 owner 是 rank2：
+以 `ar_slot_id = 10` 为例：
 
 ```text
-rank0: write C_partial0[T] ----\
-rank1: write C_partial1[T] -----\
-rank2: write C_partial2[T] ------> rank2.ready_count_owner[ar_slot_id(T)]
-rank3: write C_partial3[T] -----/
+owner_rank = 10 % 8 = R2
+owner_idx  = 10 / 8 = 1
 
-rank2 本地看到:
-    ready_count_owner[ar_slot_id(T)] == 4
-        => 所有 rank 的 partial 都已经发布
+R0 partial done ----\
+R1 partial done -----\
+R2 partial done ------> R2.ready_count_owner[1]
+R3 partial done -----/
+R4 partial done ----/
+R5 partial done ---/
+R6 partial done --/
+R7 partial done -/
+
+R2.ready_count_owner[1]: 0 -> 1 -> ... -> 8
+last-arriver: set R2.ar_ready_bits[idx=1]
 ```
-
-不推荐使用“每个 rank 通知所有 rank”的方式：
-
-```text
-rank0 -> ready_count_on_rank0/1/2/3
-rank1 -> ready_count_on_rank0/1/2/3
-...
-```
-
-这种方式每个 AR tile 需要 `tp_size * tp_size` 次远端 atomic。push-to-owner 只需要 `tp_size` 次 atomic，owner 读取本地 `ready_count` 也更便宜。
 
 注意，ready count 不是 relaxed 计数器。它表示 partial 已经可以被跨 rank 的 multicast view 读取，
 因此 producer 必须在 partial store 完成后执行 alias proxy fence，再用 system-scope acq_rel
@@ -1816,63 +1862,86 @@ release : 发布自己这个 rank 的 partial。
 acquire : 获取之前其它 rank 通过 ready_count 发布的 partial。
 ```
 
-最后一个 rank 随后用 `atomicOr_release_system(owner.ar_owner_probe_bits, bit)` 发布 AR owner task。owner rank acquire claim 到该 bit 后，就能安全执行 `multimem.ld_reduce`。
+最后一个 rank 随后用 `atomicOr_release_system(owner_rank.ar_ready_bits, bit)` 发布 AR
+owner task。owner rank acquire claim 到该 bit 后，就能安全执行 `multimem.ld_reduce`。
 
 ### 非阻塞 AR owner reduce task
 
-每个 O_proj task 完成 local partial 后，都会递增 owner rank 上的 `ready_count_owner[ar_slot_id]`。只有最后一个让 ready count 达到 `tp_size` 的 rank，才把该 tile 加入 owner rank 的 AR owner work source。第一版可以复用 slot id 表示，不需要完整 descriptor：
+每个 O_proj task 完成 local partial 后，都会递增 owner rank 上的
+`ready_count_owner[owner_idx]`。只有最后一个让 ready count 达到 `tp_size` 的 rank，
+才把该 tile 加入 owner rank 的 AR owner work source。
 
 ```text
-ar_slot_id = fa_row_tile_id * num_super_groups + n_super_group
-
-ar_owner_probe_bits[num_oproj_words]  # owner rank 本地 uint64_t bitset
-ar_done_bits[num_oproj_words]         # owner rank 本地 uint64_t bitset
+ready_count_owner[owner_slots_alloc]
+ar_ready_bits[owner_words_alloc]
+ar_done_bits[owner_words_alloc]
+ar_scan_cursor
 ```
 
-O_proj CTA 写完本 rank partial 后：
+`ar_ready_bits` 里的 bit 出现时，该 owner-local slot 已经 ready。claim 顺序是先清
+ready work bit，再抢 done bit：
 
 ```text
-old = atomicAdd_acq_rel_system(owner.ready_count_owner[ar_slot_id], 1)
+try_claim_ar_owner_task():
+    start = atomic_load_relaxed(ar_scan_cursor)
 
-if old + 1 == tp_size:
-    atomicOr_release_system(owner.ar_owner_probe_bits[word_id], bit)
+    for probe in 0 .. max_probe_words - 1:
+        word_id = (start + probe) % owner_words_alloc
+        word = acquire_load_system(ar_ready_bits[word_id])
+
+        if word == 0:
+            continue
+
+        bit_index = ffs(word)
+        bit = 1 << bit_index
+        old_ready = atomicAnd_acq_rel_system(ar_ready_bits[word_id], ~bit)
+
+        if old_ready & bit == 0:
+            continue
+
+        owner_idx = word_id * 64 + bit_index
+        if owner_idx >= local_owned_ar_tasks:
+            continue
+
+        old_done = atomicOr_acq_rel(ar_done_bits[word_id], bit)
+        if old_done & bit:
+            continue
+
+        ar_slot_id = owner_idx * tp_size + my_rank
+        atomic_store_relaxed(ar_scan_cursor, (word_id + 1) % owner_words_alloc)
+        return FOUND(ar_slot_id)
+
+    atomic_store_relaxed(ar_scan_cursor, (start + max_probe_words) % owner_words_alloc)
+    return EMPTY
 ```
 
-AR owner task 不再 probe 未 ready 状态。`ar_owner_probe_bits` 里的 bit 出现时，该 `ar_slot_id` 已经 ready。claim 顺序是先清 ready work bit，再抢 done bit：
+`ar_scan_cursor` 只是 owner rank 内多个 CTA 共享的扫描 hint，不参与 correctness。
+多个 CTA 可以 relaxed 读写它；ready/done 的 exactly-once 语义由 `ar_ready_bits` claim 和
+`ar_done_bits` 终态保护保证。
 
-```text
-old_probe = atomicAnd_acq_rel(ar_owner_probe_bits[word_id], ~bit)
+`max_probe_words` 是调度器每次尝试 AR work source 时扫描的上限。active 阶段可以取一个较小值，
+避免 CTA 在 AR bitset 上长时间空扫；当 `oproj_done_count == total_oproj_tasks` 后进入
+drain 阶段，可以允许 full scan，直到 `ar_done_count == local_owned_ar_tasks`。
 
-if old_probe & bit == 0:
-    没有成功 claim，直接返回调度循环
-
-解码 ar_tile = (fa_row_tile_id, n_super_group)
-
-old_done = atomicOr_acq_rel(ar_done_bits[word_id], bit)
-
-if old_done & bit == 0:
-    执行 multimem.ld_reduce + multimem.st
-    等待 final store 完成
-    atomicAdd(ar_done_count, 1)
-else:
-    该 ar_slot_id 已经完成，直接返回调度循环
-```
-
-`ar_done_bits` 是终态保护。正常情况下 last-arriver 只会投递一次 `probe_bit`，但保留 done bit 可以防御重复投递、调试阶段协议 bug、或者后续优化引入的重复 claim；它保证同一个 `ar_slot_id` 只执行一次 reduce/store，`ar_done_count` 也只递增一次。
+`ar_done_bits` 是终态保护。正常情况下 last-arriver 只会投递一次 ready bit，但保留 done bit
+可以防御重复投递、调试阶段协议 bug、或者后续优化引入的重复 claim；它保证同一个
+`ar_slot_id` 只执行一次 reduce/store，`ar_done_count` 也只递增一次。
 
 时间线示例：
 
 ```text
-tp_size = 4, owner = rank2
+tp_size = 8, ar_slot_id = 10, owner_rank = R2, owner_idx = 1
 
 time ->
-rank2: partial done, ready_count 0->1, not last, no probe
-rank0: partial done, ready_count 1->2, not last, no probe
-rank1: partial done, ready_count 2->3, not last, no probe
-rank3: partial done, ready_count 3->4, last, set owner.probe_bit
+rank2: partial done, ready_count 0->1, not last, no ready bit
+rank0: partial done, ready_count 1->2, not last, no ready bit
+...
+rank7: partial done, ready_count 7->8, last, set R2.ar_ready_bits[idx=1]
 
 owner rank2:
-    claim probe_bit
+    scan ar_ready_bits from ar_scan_cursor
+    claim ready bit idx=1
+    decode ar_slot_id = 1 * 8 + 2 = 10
     set ar_done_bits
     multimem.ld_reduce + multimem.st
     ar_done_count++
@@ -1941,10 +2010,12 @@ n < valid_n(out_n_tile)
 
 无效 `m/n` 元素不要求清零，也不参与最终输出。
 
- owner rank 对整个 `ar_tile` 执行 reduce/store，而不是把同一个 tile 再按 M 维切给所有 rank。owner 按 tile 轮转，长期负载均衡：
+owner rank 对整个 `ar_tile` 执行 reduce/store。同一个 `ar_slot_id` 只有一个 owner；
+owner 使用 `ar_slot_id % tp_size` 在 rank 间轮转：
 
 ```text
-owner = hash(fa_row_tile_id, n_super_group) % tp_size
+owner_rank = ar_slot_id % tp_size
+owner_idx  = ar_slot_id / tp_size
 ```
 
 对 owner rank：
@@ -1973,20 +2044,12 @@ elem e:       p0     +    p1     +    p2     +    p3
                     multimem.st multicast final Y[e]
 ```
 
-后续优化可以考虑 M-shard reduce：
-
-```text
-rank0 reduce rows 0..15
-rank1 reduce rows 16..31
-...
-```
-
-但这会要求每个 reducer rank 都知道该 tile 已 ready，通常会引入 `tp_size * tp_size` ready 通知或额外 coordinator 协议。第一版先采用单 owner reduce 整个 tile，降低同步复杂度。
-
 第一版文档层面要求：
 
 ```text
-同一个 ar_tile 的所有 rank partial 写完并通过 owner ready_count 发布后，owner 才能进行 multimem reduce/store。
+同一个 ar_tile 的所有 rank partial 写完并通过 owner ready_count 发布后，
+last-arriver 设置 owner rank 的 ar_ready_bits。
+owner rank claim ar_ready_bits 成功后，才能进行 multimem reduce/store。
 ```
 
 ## Workspace 生命周期与全局同步
@@ -2085,12 +2148,13 @@ num_fa_row_tiles = 512
 num_out_n_tiles  = 32
 num_super_groups = 8
 total_oproj_tasks = 4096
-num_oproj_words = 64
+owner_slots_alloc = ceil_div(total_oproj_tasks, tp_size) = 512   # tp_size=8
+owner_words_alloc = ceil_div(owner_slots_alloc, 64) = 8
 
 head_ready_count[num_fa_row_tiles]       ~= 2 KB   # int32
 oproj_queue[total_oproj_tasks]           ~= 16 KB  # uint32
-ready_count_owner[total_oproj_tasks]     ~= 16 KB  # int32
-ar_owner_probe_bits/ar_done_bits          ~= 1 KB   # uint64 bitsets
+ready_count_owner[owner_slots_alloc]     ~= 2 KB   # uint32, owner-local
+ar_ready_bits/ar_done_bits                ~= 128 B  # uint64 bitsets, owner-local
 其它 counter/barrier                     ~= KB 级
 ```
 
@@ -2115,9 +2179,10 @@ workspace 分成两类状态：
     oproj_consume_head
     oproj_done_count
 
-    ar_owner_probe_bits[num_oproj_words]
-    ar_done_bits[num_oproj_words]
-    ready_count_owner[total_oproj_tasks]    # 全量稀疏索引，只使用本 rank owner 的 ar_slot_id
+    ar_ready_bits[owner_words_alloc]        # owner-local ready bitset，只含已 ready task
+    ar_done_bits[owner_words_alloc]         # owner-local terminal protection
+    ready_count_owner[owner_slots_alloc]    # owner-local ready count
+    ar_scan_cursor
     ar_done_count
 ```
 
@@ -2152,15 +2217,21 @@ barrier 状态使用 phase/sign 协议复用，不依赖每次清零。每次 ke
 
 `nvl_barrier(exit)` 保证所有 rank 都完成本地 owner AR 工作后，任何 rank 才能退出 kernel。由于 owner 按 tile 分散，某个 rank 自己的 owner AR 完成，并不表示其它 rank 不会继续读取它的 symmetric partial buffer；exit barrier 防止本 rank 先退出后，下一层复用 workspace 时与其它 rank 的未完成读写冲突。
 
-`local_owned_ar_tasks` 是本 rank 作为 owner 的 AR tile 数量。它只作为 `ar_done_count` 的完成目标，不作为 `ready_count_owner` 的数组长度：
+`local_owned_ar_tasks` 是本 rank 作为 owner 的有效 AR tile 数量。它作为
+`ar_done_count` 的完成目标，也用于过滤 owner-local 尾部无效槽位：
 
 ```text
 local_owned_ar_tasks =
-    count((fa_row_tile_id, n_super_group)
-          where owner(fa_row_tile_id, n_super_group) == my_rank)
+    ceil_div(max(total_oproj_tasks - my_rank, 0), tp_size)
+
+owner_slots_alloc = ceil_div(total_oproj_tasks, tp_size)
+owner_words_alloc = ceil_div(owner_slots_alloc, 64)
 ```
 
-`ready_count_owner` 仍按 `total_oproj_tasks` 全量分配。这样 owner reduce、远端 ready atomic、AR bitset 都共享同一个全局 `ar_slot_id`，避免第一版实现中引入压缩索引表和额外一致性风险。
+`ready_count_owner`、`ar_ready_bits` 和 `ar_done_bits` 都按 owner-local 槽位分配。
+远端 ready atomic 用 `owner_rank = ar_slot_id % tp_size` 定位目标 rank，用
+`owner_idx = ar_slot_id / tp_size` 定位目标 rank 上的槽位。owner rank claim ready bit 后，
+用 `ar_slot_id = owner_idx * tp_size + my_rank` 反解全局 AR task。
 
 每个 rank 都执行完整的本地 FA 和 O_proj partial，因此 `fa_done_count` 和 `oproj_done_count` 都以 `total_*` 为完成目标；每个 rank 只 owner 一部分 AR tile，因此 `ar_done_count` 以 `local_owned_ar_tasks` 为完成目标。
 
