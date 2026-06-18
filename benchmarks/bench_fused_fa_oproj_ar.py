@@ -161,11 +161,29 @@ def main():
         return Y_sym
 
     fa_name = "flash_attn_varlen" if _HAS_FA else "SDPA-FLASH"
+
+    # ---- correctness cross-check: fused C_sym vs baseline (FA+GEMM+NVLS), both paths
+    #      independent; agreement within bf16 tol confirms the fused result is correct ----
+    reset_fused(); run_fused(); torch.cuda.synchronize(); dist.barrier()
+    Cf = C_sym.float().cpu()
+    Yb = run_baseline().float().cpu(); torch.cuda.synchronize(); dist.barrier()
+    err_abs, ref_max = 0.0, 0.0
+    for t in range(R):
+        vm = meta.valid_m(t); qs = meta.q_tile_start(t)
+        for o in range(num_out):
+            vn = min(N_TILE, hidden - o * N_TILE)
+            gf = Cf[t, :vm, o, :vn]; gb = Yb[qs:qs + vm, o * N_TILE:o * N_TILE + vn]
+            err_abs = max(err_abs, (gf - gb).abs().max().item())
+            ref_max = max(ref_max, gb.abs().max().item())
+    err_rel = err_abs / max(ref_max, 1e-6)
+
     t_fused = bench(run_fused, args.iters, args.warmup, setup=reset_fused)
     t_base = bench(run_baseline, args.iters, args.warmup)
     if rank == 0:
+        ok = "OK" if err_rel < 0.05 else "MISMATCH"
         print(f"[bench] fused={t_fused:.4f} ms  baseline({fa_name}+GEMM+NVLS-AR)={t_base:.4f} ms  "
-              f"ratio={t_base / t_fused:.3f}x (>1 = fused faster)", flush=True)
+              f"ratio={t_base / t_fused:.3f}x  err_abs={err_abs:.3g} err_rel={err_rel:.3g} "
+              f"[{ok} vs baseline]", flush=True)
     dist.barrier(); dist.destroy_process_group()
 
 

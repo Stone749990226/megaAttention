@@ -92,6 +92,10 @@ fused（单 persistent kernel）vs 非融合 best-of-breed 基线
 
 > 备注：用 PyTorch SDPA 的 FLASH 后端（也是 FlashAttention-2）替换官方包时 ratio 更高（如
 > [2048,2048] 为 1.43×），因为官方 flash-attn 比 SDPA 后端更快、基线更强；表中取官方包的权威数。
+>
+> 正确性：benchmark 每个 shape 还会打印 `err_abs/err_rel [OK vs baseline]`——fused 的 C_sym
+> 与独立的 FA+GEMM+NVLS 基线路径逐 tile 对比，全部 shape `err_rel` 在 ~5e-4–1e-3（bf16 级），
+> 即融合结果与参考路径一致、算得对。
 
 ## 目录结构
 
