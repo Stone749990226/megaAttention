@@ -45,10 +45,11 @@ docs/design/causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md
 | real FA in fused scheduler | 已验证（含 multi_seq；原 finalize warp 发散死锁已修复） |
 | real O_proj in fused kernel | 已验证（单卡 tp_size=1，C_sym partial 对 `oproj_reference`） |
 | AR owner 调度协议 in fused kernel | 已验证（单卡 tp_size=1：确定性 owner 映射 + owner-local u64 bitset + exactly-once/terminate） |
-| real NVLS AR（多卡 multimem reduce/store） | 待完成（P3：对称 `C_sym_mc` + 跨 rank owner 寻址 + 8 卡端到端 + 性能） |
+| real NVLS AR（多卡 multimem reduce/store） | 已验证（8×H200：symmetric C_sym multicast reduce + 跨 rank owner 寻址 + nvl_barrier，整链对 full_chain_reference err~5e-3） |
 
-当前 fused kernel 已在同一个 persistent 调度器内跑通 **real FA + real O_proj + AR owner 调度协议**（单卡）。
-AR 在 `tp_size=1` 下数值为恒等（C_sym partial 即 final）；真实 `multimem.ld_reduce/st` 与对称内存多卡路径留待 P3。
+当前 fused kernel 已在同一个 persistent 调度器内跑通 **real FA + real O_proj + real NVLS AllReduce**：
+单卡 `tp_size=1` 与 8×H200 `tp_size=8` 两条路径都验证通过。tp_size=1 下 AR 退化为恒等；
+tp_size=8 下 owner 用 `multimem.ld_reduce/st` 在 C_sym multicast view 上做 in-place AllReduce。
 
 ### 分阶段验证状态（单卡 H200）
 
@@ -57,7 +58,7 @@ AR 在 `tp_size=1` 下数值为恒等（C_sym partial 即 final）；真实 `mul
 | P0 修 multi_seq 死锁 | `7f711d1` | `test_fused_fa_path` / `test_fa_packed` / `test_fa_varlen` 全过（含 `valid_m%8≠0` 回归） |
 | P1 real O_proj 接入 | `1cd547b` | `test_fused_oproj_path` 4 用例（C_sym 对 `oproj_reference`，err~0.0018） |
 | P2 AR owner 协议 | `9b028c9` | `test_scheduler_skeleton` 5 passed；fused 两路径全过；exactly-once / 正常终止 |
-| P3 多卡 NVLS | — | 待完成 |
+| P3 多卡 NVLS | 本次 | `test_fused_full_chain`（8×H200，torchrun）：整链 C_sym 对 `full_chain_reference` err~5e-3，AR per-rank owner 计数正确；单卡两路径回归不退化 |
 
 ## 目录结构
 

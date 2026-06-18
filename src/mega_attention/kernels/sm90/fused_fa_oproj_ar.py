@@ -34,6 +34,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
+import cutlass.utils.distributed as cda
 from cutlass.cute.nvgpu import warpgroup
 from quack import layout_utils as qlu
 
@@ -82,6 +83,25 @@ def gsync(ctrl: cute.Tensor, idx: cutlass.Constexpr,
                                        sem="acquire", scope="gpu")
             if ((cur ^ old) & cutlass.Uint32(FINISH_TAG)) != 0:
                 spinning = False
+    cute.arch.sync_threads()
+
+
+@cute.jit
+def nvl_barrier(sig_local: cute.Tensor, sig_mc: cute.Tensor, slot: cutlass.Constexpr,
+                tp_size: cutlass.Constexpr, bidx, tidx):
+    """Device-side cross-rank NVLink barrier (monotonic add1 + spin), CTA0 only.
+
+    multimem_red_add1 on the multicast signal bumps EVERY rank's slot by 1; this rank
+    spins on its LOCAL slot until it reaches tp_size. Sandwich with local grid_sync
+    (caller) so all CTAs are quiesced before/after. 验证: scratch/_probe_nvlbarrier.py.
+    monotonic add1 needs a fresh slot per barrier (init/exit) within a launch.
+    """
+    cute.arch.sync_threads()
+    if bidx == 0:
+        if tidx == 0:
+            cda.multimem_red_add1(sig_mc.iterator + slot, order="release", scope="sys")
+            cda.spin_lock_ld_lt_relaxed_wait(sig_local.iterator + slot,
+                                             expected_val=cutlass.Int32(tp_size), scope="sys")
     cute.arch.sync_threads()
 
 
@@ -230,6 +250,31 @@ def publish_ar_ready(ready_count_owner: cute.Tensor, ar_ready_bits: cute.Tensor,
         bit = cutlass.Int64(1) << (owner_idx % cutlass.Int32(64)).to(cutlass.Int64)
         cute.arch.atomic_or(ar_ready_bits.iterator + word, bit,
                             sem="release", scope="gpu")
+
+
+@cute.jit
+def publish_ar_ready_xrank(rc_local: cute.Tensor, rb_local: cute.Tensor,
+                           ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr,
+                           rc_ptrs: cutlass.Constexpr, rb_ptrs: cutlass.Constexpr):
+    """Cross-rank push-to-owner: bump owner_rank's ready_count[owner_idx] (sys-scope
+    peer atomic via buffer_ptrs[owner_rank]); last arriver sets owner_rank's
+    ar_ready_bits. owner_rank=ar_slot_id%tp_size selected by a constexpr-ptr if-ladder
+    (验证: scratch/_probe_peerwrite.py). rc_ptrs/rb_ptrs are per-rank symmetric VAs.
+    """
+    owner_rank = ar_slot_id % cutlass.Int32(tp_size)
+    owner_idx = ar_slot_id // cutlass.Int32(tp_size)
+    word = (owner_idx // cutlass.Int32(64)).to(cutlass.Uint32)
+    bit = cutlass.Int64(1) << (owner_idx % cutlass.Int32(64)).to(cutlass.Int64)
+    for r in cutlass.range_constexpr(tp_size):
+        if owner_rank == cutlass.Int32(r):
+            rc_peer = cute.make_ptr(rc_local.element_type, rc_ptrs[r],
+                                    cute.AddressSpace.gmem, assumed_align=4)
+            old = cute.arch.atomic_add(rc_peer + owner_idx.to(cutlass.Uint32),
+                                       cutlass.Uint32(1), sem="acq_rel", scope="sys")
+            if (old + cutlass.Uint32(1)) == cutlass.Uint32(tp_size):
+                rb_peer = cute.make_ptr(rb_local.element_type, rb_ptrs[r],
+                                        cute.AddressSpace.gmem, assumed_align=8)
+                cute.arch.atomic_or(rb_peer + word, bit, sem="release", scope="sys")
 
 
 @cute.jit
@@ -447,7 +492,16 @@ class FusedFaOprojAr:
     def __init__(self, num_fa, num_row_tiles, H_local, D, num_super_groups,
                  total_oproj, num_ctas, hidden, tp_size=1, rank=0, kv_stages=2,
                  N_TILE=128, super_group_n_tiles=4, K_CHUNK=64, oproj_stages=4,
+                 csym_mc_ptr=0, nvl_mc_ptr=0, nvl_local_ptr=0, rc_ptrs=(), rb_ptrs=(),
                  softmax_scale=None, acc_dtype=cutlass.Float32):
+        # multi-rank (tp>1) NVLS constants: baked into the kernel as closure ints
+        # (must NOT be cute.compile args -> 64-bit ptr would be truncated). For tp==1
+        # they are unused (single-rank path). 设计稿 §1883/§2287.
+        self.csym_mc_ptr = csym_mc_ptr          # C_sym multicast VA (multimem reduce)
+        self.nvl_mc_ptr = nvl_mc_ptr            # nvl_barrier signal multicast VA
+        self.nvl_local_ptr = nvl_local_ptr      # this rank's nvl signal VA (spin read)
+        self.rc_ptrs = tuple(rc_ptrs)           # per-rank ready_count_owner peer VAs
+        self.rb_ptrs = tuple(rb_ptrs)           # per-rank ar_ready_bits peer VAs
         self.num_fa = num_fa
         self.num_row_tiles = num_row_tiles
         self.H_local = H_local
@@ -572,9 +626,21 @@ class FusedFaOprojAr:
             mbar_ab: cute.struct.MemRange[cutlass.Int64, self.oproj_stages * 2]
             overlay: cute.struct.Align[cute.struct.MemRange[dt, overlay_n], self.align]
 
+        # multi-rank NVLS views from baked-constant VAs (tp==1: null, unused).
+        csym_mc = cute.make_tensor(
+            cute.make_ptr(mCsym.element_type, self.csym_mc_ptr, cute.AddressSpace.gmem,
+                          assumed_align=16), mCsym.layout)
+        nvl_mc = cute.make_tensor(
+            cute.make_ptr(ctrl.element_type, self.nvl_mc_ptr, cute.AddressSpace.gmem,
+                          assumed_align=4), cute.make_layout(4))
+        nvl_local = cute.make_tensor(
+            cute.make_ptr(ctrl.element_type, self.nvl_local_ptr, cute.AddressSpace.gmem,
+                          assumed_align=4), cute.make_layout(4))
+
         self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
                     ar_done_bits, fa_exec, oproj_exec, ar_exec, partial_check,
-                    tma_k, tK, tma_v, tV, mOscr, mOscr2d, mWo, mCsym, mQ, mCuQ, mCuK,
+                    tma_k, tK, tma_v, tV, mOscr, mOscr2d, mWo, mCsym, csym_mc,
+                    nvl_mc, nvl_local, mQ, mCuQ, mCuK,
                     mFaB, mFaMb, tma_a, tA, tma_wo, tWo,
                     mma_qk, mma_pv, mma_op, sQ_l, sK_l, sV_l, sA_l, sWo_l, Smem).launch(
             grid=[self.num_ctas, 1, 1], block=[self.threads, 1, 1],
@@ -587,6 +653,7 @@ class FusedFaOprojAr:
                oproj_exec: cute.Tensor, ar_exec: cute.Tensor, partial_check: cute.Tensor,
                tma_k: cute.CopyAtom, mK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor,
                mOscr: cute.Tensor, mOscr2d: cute.Tensor, mWo: cute.Tensor, mCsym: cute.Tensor,
+               csym_mc: cute.Tensor, nvl_mc: cute.Tensor, nvl_local: cute.Tensor,
                mQ: cute.Tensor, mCuQ: cute.Tensor, mCuK: cute.Tensor,
                mFaB: cute.Tensor, mFaMb: cute.Tensor,
                tma_a: cute.CopyAtom, tA: cute.Tensor, tma_wo: cute.CopyAtom, tWo: cute.Tensor,
@@ -704,6 +771,8 @@ class FusedFaOprojAr:
         nkb_op = cutlass.const_expr(cute.size(tCrA, mode=[2]))
 
         gsync(ctrl, C_GS_INIT, num_ctas, bidx, tidx)
+        if cutlass.const_expr(tp_size > 1):
+            nvl_barrier(nvl_local, nvl_mc, 0, tp_size, bidx, tidx)   # init: all ranks ready
 
         if wg_idx == 0:
             cute.arch.setmaxregister_decrease(40)
@@ -948,12 +1017,55 @@ class FusedFaOprojAr:
                                              cutlass.Uint32(1), sem="relaxed", scope="gpu")
                         cute.arch.fence_acq_rel_gpu()            # partial store before ready
                         # push-to-owner ready (arg == ar_slot_id); last arriver sets bit
-                        publish_ar_ready(ready_count_owner, ar_ready_bits, arg, tp_size)
+                        if cutlass.const_expr(tp_size == 1):
+                            publish_ar_ready(ready_count_owner, ar_ready_bits, arg, tp_size)
+                        else:
+                            publish_ar_ready_xrank(ready_count_owner, ar_ready_bits, arg,
+                                                   tp_size, self.rc_ptrs, self.rb_ptrs)
                         cute.arch.atomic_add(ctrl.iterator + C_OP_DONE, cutlass.Uint32(1),
                                              sem="release", scope="gpu")
                 if mode == MODE_AR:
-                    if tidx == 0:
-                        do_ar(ctrl, ar_done_bits, ar_exec, arg, tp_size)
+                    if cutlass.const_expr(tp_size == 1):
+                        if tidx == 0:
+                            do_ar(ctrl, ar_done_bits, ar_exec, arg, tp_size)
+                    else:
+                        # owner: NVLS reduce the whole ar_tile in C_sym via multimem,
+                        # thread-parallel over 8-bf16 chunks (n contiguous). 设计稿 §1883.
+                        ft_ar = arg // cutlass.Int32(num_super_groups)
+                        nsg_ar = arg % cutlass.Int32(num_super_groups)
+                        base_ar = nsg_ar * cutlass.Int32(sgnt)
+                        rem_ar = cutlass.Int32(num_out_n_tiles) - base_ar
+                        vnt_ar = rem_ar
+                        if rem_ar > cutlass.Int32(sgnt):
+                            vnt_ar = cutlass.Int32(sgnt)
+                        npr = cutlass.const_expr(N_TILE // 8)        # 8-bf16 chunks per row
+                        total = vnt_ar * cutlass.Int32(128) * cutlass.Int32(npr)
+                        c = cutlass.Int32(tidx)
+                        while c < total:
+                            nc = c % cutlass.Int32(npr)
+                            rem = c // cutlass.Int32(npr)
+                            m = rem % cutlass.Int32(128)
+                            sg = rem // cutlass.Int32(128)
+                            out_n = base_ar + sg
+                            off = (((ft_ar * cutlass.Int32(128) + m) * cutlass.Int32(num_out_n_tiles)
+                                    + out_n) * cutlass.Int32(N_TILE) + nc * cutlass.Int32(8))
+                            x, y, z, w = cda.multimem_ld_reduce_8xbf16(csym_mc.iterator + off)
+                            cda.multimem_st_4xb32(csym_mc.iterator + off, x, y, z, w)
+                            c = c + cutlass.Int32(nthr)
+                        cute.arch.sync_threads()
+                        if tidx == 0:
+                            owner_idx = arg // cutlass.Int32(tp_size)
+                            word = (owner_idx // cutlass.Int32(64)).to(cutlass.Uint32)
+                            bit = cutlass.Int64(1) << (owner_idx % cutlass.Int32(64)).to(cutlass.Int64)
+                            cute.arch.atomic_add(ar_exec.iterator + arg.to(cutlass.Uint32),
+                                                 cutlass.Uint32(1), sem="relaxed", scope="gpu")
+                            old_done = cute.arch.atomic_or(ar_done_bits.iterator + word, bit,
+                                                           sem="acq_rel", scope="gpu")
+                            if (old_done & bit) == cutlass.Int64(0):
+                                cute.arch.atomic_add(ctrl.iterator + C_AR_DONE, cutlass.Uint32(1),
+                                                     sem="release", scope="gpu")
                 cute.arch.sync_threads()
 
         gsync(ctrl, C_GS_EXIT, num_ctas, bidx, tidx)
+        if cutlass.const_expr(tp_size > 1):
+            nvl_barrier(nvl_local, nvl_mc, 1, tp_size, bidx, tidx)   # exit: all ranks done
