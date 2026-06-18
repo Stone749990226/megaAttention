@@ -60,6 +60,22 @@ tp_size=8 下 owner 用 `multimem.ld_reduce/st` 在 C_sym multicast view 上做 
 | P2 AR owner 协议 | `9b028c9` | `test_scheduler_skeleton` 5 passed；fused 两路径全过；exactly-once / 正常终止 |
 | P3 多卡 NVLS | 本次 | `test_fused_full_chain`（8×H200，torchrun）：整链 C_sym 对 `full_chain_reference` err~5e-3，AR per-rank owner 计数正确；单卡两路径回归不退化 |
 
+### 性能（8×H200，`benchmarks/bench_fused_fa_oproj_ar.py`）
+
+fused（单 persistent kernel）vs 非融合基线（per-batch SDPA + matmul O_proj + NCCL all_reduce）：
+
+| shape | fused | baseline | ratio |
+| --- | --- | --- | --- |
+| seqlens=[2048,2048] H_local=8 hidden=2048 | 0.195 ms | 0.246 ms | **1.26×** |
+| seqlens=[4096,4096] H_local=8 hidden=4096 | 0.517 ms | 0.647 ms | **1.25×** |
+| seqlens=[1024]×4 H_local=16 hidden=2048 | 0.243 ms | 0.292 ms | **1.20×** |
+| seqlens=[8192]（单序列）H_local=8 hidden=2048 | 0.616 ms | 0.553 ms | 0.90×（更慢） |
+
+多序列 varlen prefill（目标场景）下 fused 稳定快 ~1.2–1.26×。单条长序列下慢于基线——
+基线一次大 SDPA 最高效，而当前 fused 的 per-tile FA + **correctness-first 的 naive AR
+（单遍 multimem reduce，无 comm/compute overlap）** 吃亏。后续优化方向：AR comm warp group
+overlap（standalone `oproj_ar.py` 已达 ~1.4×，尚未接入 fused）、FA per-tile 效率。
+
 ## 目录结构
 
 ```text

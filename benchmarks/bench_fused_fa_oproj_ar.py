@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""P3c benchmark: fused FA+O_proj+NVLS-AR (one persistent kernel) vs a non-fused
+baseline (per-batch SDPA + matmul O_proj + NCCL all_reduce), 8xH200.
+
+    torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py [--iters N --warmup W]
+
+Honest first-version numbers: the fused do_ar is a correctness-first single-pass
+multimem reduce (no comm/compute overlap), so this mainly establishes the baseline
+and locates the bottleneck for later optimization.
+"""
+import argparse
+import os
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+import torch.distributed._symmetric_memory as symm_mem
+import cutlass
+import cutlass.cute as cute
+import cuda.bindings.driver as cuda
+from cutlass.cute.runtime import from_dlpack
+
+from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL
+from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts
+
+DT = torch.bfloat16
+
+
+def bench(body, iters, warmup, setup=None):
+    """Time `body` (GPU) per iter; `setup` (untimed) runs before each iter."""
+    for _ in range(warmup):
+        if setup: setup()
+        body()
+    torch.cuda.synchronize(); dist.barrier()
+    total = 0.0
+    ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    for _ in range(iters):
+        if setup: setup()
+        ev0.record(); body(); ev1.record(); torch.cuda.synchronize()
+        total += ev0.elapsed_time(ev1)
+    return total / iters     # ms/iter
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--seqlens", type=str, default="2048,2048")
+    ap.add_argument("--hidden", type=int, default=2048)
+    ap.add_argument("--h_local", type=int, default=8)
+    args = ap.parse_args()
+
+    lr = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(lr)
+    dev = torch.device(f"cuda:{lr}")
+    dist.init_process_group("nccl")
+    rank, ws = dist.get_rank(), dist.get_world_size()
+    gname = dist.group.WORLD.group_name
+    symm_mem.enable_symm_mem_for_group(gname)
+
+    seqlens = [int(x) for x in args.seqlens.split(",")]
+    H_local, D, hidden = args.h_local, 128, args.hidden
+    N_TILE, sg = 128, 4
+    meta = build_row_desc(seqlens)
+    R = meta.num_row_tiles
+    K_local = H_local * D
+    num_fa = R * H_local
+    num_out, num_super_groups, total_oproj = oproj_task_counts(R, hidden, N_TILE, sg)
+    tot = int(sum(seqlens)); hidden_pad = num_out * N_TILE
+    owner_slots = (total_oproj + ws - 1) // ws
+    owner_words = (owner_slots + 63) // 64
+    if rank == 0:
+        print(f"[bench] seqlens={seqlens} tot={tot} H_local={H_local} hidden={hidden} "
+              f"R={R} num_fa={num_fa} total_oproj={total_oproj} ws={ws}", flush=True)
+
+    g = torch.Generator(device=dev).manual_seed(1234 + rank)
+    Q = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
+    K = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
+    V = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
+    W_o = torch.randn(K_local, hidden, device=dev, dtype=DT, generator=g) * (K_local ** -0.5)
+    W_o_pad = torch.zeros(K_local, hidden_pad, device=dev, dtype=DT); W_o_pad[:, :hidden] = W_o
+    Oscr = torch.zeros(R, 128, H_local, D, device=dev, dtype=DT)
+
+    def _u32(n): return torch.zeros(n, dtype=torch.uint32, device=dev)
+    def _i32(a): return torch.tensor(np.asarray(a), dtype=torch.int32, device=dev)
+
+    C_sym = symm_mem.empty(R, 128, num_out, N_TILE, device=dev, dtype=DT); C_sym.zero_()
+    hC = symm_mem.rendezvous(C_sym, gname)
+    rco = symm_mem.empty(owner_slots, device=dev, dtype=torch.uint32); rco.zero_()
+    hRC = symm_mem.rendezvous(rco, gname)
+    rbits = symm_mem.empty(owner_words, device=dev, dtype=torch.int64); rbits.zero_()
+    hRB = symm_mem.rendezvous(rbits, gname)
+    nvl = symm_mem.empty(8, device=dev, dtype=torch.uint32); nvl.zero_()
+    hN = symm_mem.rendezvous(nvl, gname)
+    ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
+    ctrl = _u32(NUM_CTRL); head_ready = _u32(R); oproj_queue = _u32(total_oproj)
+    fa_exec = _u32(num_fa); oproj_exec = _u32(total_oproj); ar_exec = _u32(total_oproj)
+    partial_check = _u32(total_oproj)
+    cu_q, cu_k = _i32(meta.cu_seqlens_q), _i32(meta.cu_seqlens_k)
+    fa_b, fa_mb = _i32(meta.batch_idx), _i32(meta.m_block)
+
+    cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue, rco)]
+    cts += [from_dlpack(t, assumed_align=8) for t in (rbits, ar_done_bits)]
+    cts += [from_dlpack(t, assumed_align=4) for t in (fa_exec, oproj_exec, ar_exec, partial_check)]
+    cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
+    cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
+
+    ker = FusedFaOprojAr(
+        num_fa=num_fa, num_row_tiles=R, H_local=H_local, D=D,
+        num_super_groups=num_super_groups, total_oproj=total_oproj, num_ctas=132,
+        hidden=hidden, tp_size=ws, rank=rank, N_TILE=N_TILE, super_group_n_tiles=sg,
+        csym_mc_ptr=hC.multicast_ptr, nvl_mc_ptr=hN.multicast_ptr,
+        nvl_local_ptr=hN.buffer_ptrs[rank],
+        rc_ptrs=[hRC.buffer_ptrs[r] for r in range(ws)],
+        rb_ptrs=[hRB.buffer_ptrs[r] for r in range(ws)])
+    ts = torch.cuda.current_stream(); st = cuda.CUstream(ts.cuda_stream)
+    dist.barrier()
+    compiled = cute.compile(ker, *cts, st)
+
+    def reset_fused():
+        # per-iter control state must be re-zeroed (counters/queue/bitsets/nvl signal);
+        # sync + cross-rank barrier so the monotonic nvl_barrier sees clean slots.
+        for t in (ctrl, head_ready, oproj_queue, rco, fa_exec, oproj_exec, ar_exec,
+                  partial_check):
+            t.zero_()
+        rbits.zero_(); ar_done_bits.zero_(); nvl.zero_()
+        torch.cuda.synchronize(); dist.barrier()
+
+    def run_fused():
+        compiled(*cts, st)
+
+    # ---- non-fused baseline: per-batch SDPA + matmul O_proj + all_reduce ----
+    def run_baseline():
+        O = torch.empty(tot, H_local, D, device=dev, dtype=DT)
+        for b in range(meta.num_batch):
+            s = int(meta.cu_seqlens_q[b]); e = int(meta.cu_seqlens_q[b + 1])
+            q = Q[s:e].transpose(0, 1).unsqueeze(0)
+            k = K[s:e].transpose(0, 1).unsqueeze(0)
+            v = V[s:e].transpose(0, 1).unsqueeze(0)
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            O[s:e] = o.squeeze(0).transpose(0, 1)
+        Y = O.reshape(tot, K_local) @ W_o
+        dist.all_reduce(Y, op=dist.ReduceOp.SUM)
+        return Y
+
+    t_fused = bench(run_fused, args.iters, args.warmup, setup=reset_fused)
+    t_base = bench(run_baseline, args.iters, args.warmup)
+    if rank == 0:
+        print(f"[bench] fused={t_fused:.4f} ms  baseline(SDPA+matmul+AR)={t_base:.4f} ms  "
+              f"ratio={t_base / t_fused:.3f}x (>1 = fused faster)", flush=True)
+    dist.barrier(); dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
