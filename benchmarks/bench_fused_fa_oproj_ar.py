@@ -49,25 +49,16 @@ def bench(body, iters, warmup, setup=None):
     return total / iters     # ms/iter
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--iters", type=int, default=30)
-    ap.add_argument("--warmup", type=int, default=10)
-    ap.add_argument("--seqlens", type=str, default="2048,2048")
-    ap.add_argument("--hidden", type=int, default=2048)
-    ap.add_argument("--h_local", type=int, default=8)
-    args = ap.parse_args()
+def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
+              ws, rank, dev, iters, warmup):
+    """Build buffers, compile fused kernel, time fused and baseline, return dict.
 
-    lr = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(lr)
-    dev = torch.device(f"cuda:{lr}")
-    dist.init_process_group("nccl")
-    rank, ws = dist.get_rank(), dist.get_world_size()
+    Returns: {"fused_ms": float, "base_ms": float, "ratio": float}
+    ratio = base_ms / fused_ms  (>1 means fused is faster).
+    """
     gname = dist.group.WORLD.group_name
-    symm_mem.enable_symm_mem_for_group(gname)
 
-    seqlens = [int(x) for x in args.seqlens.split(",")]
-    H_local, D, hidden = args.h_local, 128, args.hidden
-    N_TILE, sg = 128, 4
+    D, N_TILE = 128, 128
     meta = build_row_desc(seqlens)
     R = meta.num_row_tiles
     K_local = H_local * D
@@ -76,9 +67,6 @@ def main():
     tot = int(sum(seqlens)); hidden_pad = num_out * N_TILE
     owner_slots = (total_oproj + ws - 1) // ws
     owner_words = (owner_slots + 63) // 64
-    if rank == 0:
-        print(f"[bench] seqlens={seqlens} tot={tot} H_local={H_local} hidden={hidden} "
-              f"R={R} num_fa={num_fa} total_oproj={total_oproj} ws={ws}", flush=True)
 
     g = torch.Generator(device=dev).manual_seed(1234 + rank)
     Q = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
@@ -119,7 +107,8 @@ def main():
         csym_mc_ptr=hC.multicast_ptr, nvl_mc_ptr=hN.multicast_ptr,
         nvl_local_ptr=hN.buffer_ptrs[rank],
         rc_ptrs=[hRC.buffer_ptrs[r] for r in range(ws)],
-        rb_ptrs=[hRB.buffer_ptrs[r] for r in range(ws)])
+        rb_ptrs=[hRB.buffer_ptrs[r] for r in range(ws)],
+        w_fa=w_fa, w_oproj=w_oproj, w_ar=w_ar)
     ts = torch.cuda.current_stream(); st = cuda.CUstream(ts.cuda_stream)
     dist.barrier()
     compiled = cute.compile(ker, *cts, st)
@@ -160,8 +149,6 @@ def main():
         torch.ops.symm_mem.multimem_all_reduce_(Y_sym, "sum", gname)
         return Y_sym
 
-    fa_name = "flash_attn_varlen" if _HAS_FA else "SDPA-FLASH"
-
     # ---- correctness cross-check: fused C_sym vs baseline (FA+GEMM+NVLS), both paths
     #      independent; agreement within bf16 tol confirms the fused result is correct ----
     reset_fused(); run_fused(); torch.cuda.synchronize(); dist.barrier()
@@ -177,13 +164,68 @@ def main():
             ref_max = max(ref_max, gb.abs().max().item())
     err_rel = err_abs / max(ref_max, 1e-6)
 
-    t_fused = bench(run_fused, args.iters, args.warmup, setup=reset_fused)
-    t_base = bench(run_baseline, args.iters, args.warmup)
+    t_fused = bench(run_fused, iters, warmup, setup=reset_fused)
+    t_base = bench(run_baseline, iters, warmup)
+
     if rank == 0:
+        fa_name = "flash_attn_varlen" if _HAS_FA else "SDPA-FLASH"
         ok = "OK" if err_rel < 0.05 else "MISMATCH"
         print(f"[bench] fused={t_fused:.4f} ms  baseline({fa_name}+GEMM+NVLS-AR)={t_base:.4f} ms  "
               f"ratio={t_base / t_fused:.3f}x  err_abs={err_abs:.3g} err_rel={err_rel:.3g} "
               f"[{ok} vs baseline]", flush=True)
+
+    return dict(fused_ms=t_fused, base_ms=t_base, ratio=t_base / t_fused)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--seqlens", type=str, default="2048,2048")
+    ap.add_argument("--hidden", type=int, default=2048)
+    ap.add_argument("--h_local", type=int, default=8)
+    ap.add_argument("--w_fa", type=int, default=4)
+    ap.add_argument("--w_oproj", type=int, default=1)
+    ap.add_argument("--w_ar", type=int, default=1)
+    ap.add_argument("--sg", type=int, default=4)
+    ap.add_argument("--auto", action="store_true",
+                    help="用 choose_launch_config 自动选 (w_fa,w_oproj,w_ar,sg)")
+    args = ap.parse_args()
+
+    lr = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(lr)
+    dev = torch.device(f"cuda:{lr}")
+    dist.init_process_group("nccl")
+    rank, ws = dist.get_rank(), dist.get_world_size()
+    gname = dist.group.WORLD.group_name
+    symm_mem.enable_symm_mem_for_group(gname)
+
+    seqlens = [int(x) for x in args.seqlens.split(",")]
+    H_local, hidden = args.h_local, args.hidden
+
+    meta = build_row_desc(seqlens)
+    if args.auto:
+        from mega_attention.metadata.launch_heuristic import choose_launch_config
+        cfg = choose_launch_config(meta, hidden, tp_size=ws)
+        w_fa, w_oproj, w_ar, sg = cfg.w_fa, cfg.w_oproj, cfg.w_ar, cfg.sg
+    else:
+        w_fa, w_oproj, w_ar, sg = args.w_fa, args.w_oproj, args.w_ar, args.sg
+
+    if rank == 0:
+        R = meta.num_row_tiles
+        N_TILE = 128
+        num_out, num_super_groups, total_oproj = oproj_task_counts(R, hidden, N_TILE, sg)
+        tot = int(sum(seqlens))
+        num_fa = R * H_local
+        print(f"[bench] seqlens={seqlens} tot={tot} H_local={H_local} hidden={hidden} "
+              f"R={R} num_fa={num_fa} total_oproj={total_oproj} ws={ws}", flush=True)
+
+    res = bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
+                    ws, rank, dev, args.iters, args.warmup)
+    if rank == 0:
+        print(f"[fused] w=({w_fa},{w_oproj},{w_ar}) sg={sg} "
+              f"fused={res['fused_ms']:.3f}ms base={res['base_ms']:.3f}ms "
+              f"ratio={res['ratio']:.2f}x", flush=True)
+
     dist.barrier(); dist.destroy_process_group()
 
 
