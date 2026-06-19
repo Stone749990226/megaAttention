@@ -83,7 +83,7 @@ fused（单 persistent kernel）vs 非融合 best-of-breed 基线
 启发式为 2 桶（r<2 → (w_fa,w_oproj,w_ar)=(2,1,1)；r≥2 → (8,1,1)；sg 恒为 4）。r = FA_MACs/O_proj_MACs，单切点 r=2.0（8×H200 Task4 sweep 标定）。
 
 说明：
-- `ratio` 列为历史默认配置结果；`auto ratio` 列为 `--auto` 启发式自动选配的实测结果。
+- `ratio` 列为历史默认配置结果；`auto ratio` 列为 `--auto` 启发式自动选配的实测结果。两列来自不同测量批次（`ratio` 为早期环境），逐行直接相减会把环境漂移误记成启发式增减——例如 [1024]×4 当前环境任何配置最高仅 0.98×（见 `benchmarks/sweep_results.md`），历史 1.06× 复现不出，故该行 0.95× 是环境差异而非启发式回退。
 - **DeepSeek（hid7168，0.99×）**：大 hidden 下 AR comm/compute overlap 是主要瓶颈，launch 旋钮对该场景无帮助，heuristic 不改善。
 - **32K 单序列（0.92×）**：FA O(L²) compute-bound，官方 flash-attn per-tile 效率更高；不是 launch heuristic 可解的问题，需要 FA per-tile pipeline 独立优化。
 
