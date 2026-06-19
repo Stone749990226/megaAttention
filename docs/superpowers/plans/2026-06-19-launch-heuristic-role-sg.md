@@ -482,48 +482,104 @@ git commit -m "bench(fused): 8×H200 launch-config sweep 脚本 + 标定结果"
 
 ---
 
-## Task 5: 填标定表 + 12 组回归
+## Task 5: 填标定表（2 桶）+ 12 组回归
+
+**已据 Task 4 sweep + 用户确认定案：2 桶数据驱动，tp=1 不作目标（该算子为 TP>1 设计）。**
+两个桶的稳健最优 sg 都是 4（sg2/sg8 的零星胜出非桶内稳健解），故 sg 恒为 4。
+
+标定表（来自 `benchmarks/sweep_results.md` 桶内平均 ratio 最优）：
+
+```text
+tp > 1 (主目标):
+    r < 2.0   -> (w_fa, w_oproj, w_ar, sg) = (2, 1, 1, 4)
+    r >= 2.0  ->                            (8, 1, 1, 4)
+tp == 1 (非目标, 保持函数可用; w_ar=0 镜像):
+    r < 2.0   -> (2, 1, 0, 4)
+    r >= 2.0  -> (8, 1, 0, 4)
+```
+
+依据（桶内平均 ratio，tp=8）：r<2 桶 (2,1,1,4)=1.148 优于 (4,1,1,4)=1.128；
+r≥2 桶 (8,1,1,4)=1.21(中)/1.04(高) 优于 (4,1,1,4)=1.19/—。
 
 **Files:**
-- Modify: `src/mega_attention/metadata/launch_heuristic.py`（`_R_LO/_R_HI` 与两张表）
+- Modify: `src/mega_attention/metadata/launch_heuristic.py`（改为单切点 `_R_LO=2.0`，两桶表）
 - Modify: `tests/metadata/test_launch_heuristic.py`（按标定值收紧断言）
 - Modify: `README.md`（更新 benchmark 表，加 auto 列）
 
 **Interfaces:** 无新接口；只更新常量与文档。
 
-- [ ] **Step 1: 据 sweep 结果定桶**
+- [ ] **Step 1: 改 `choose_launch_config` 为 2 桶标定表**
 
-读 `benchmarks/sweep_results.md`，把每 shape 的 `(r, best_config)` 按 r 排序，确定 `_R_LO/_R_HI` 两个切点，使每桶内多数 shape 的最优配置一致；把该众数配置写进 `choose_launch_config` 对应桶（tp=1 与 tp>1 两张表分别用 `bench_one` 的 ws=1 与 ws=8 结果——sweep 默认 ws=8，tp=1 表用 `--nproc_per_node=1` 复跑一遍 sweep 得到）。
+把 Task 1 的 `_R_HI` 删除、`_R_LO = 2.0`，并把两个 `if/elif/else` 三桶替换为单切点两桶（用上面的标定值）：
 
-- [ ] **Step 2: 更新 launch_heuristic 常量**
+```python
+_R_LO = 2.0   # 单切点: r<2 平衡/O_proj 偏; r>=2 FA 偏 (Task4 8×H200 标定)
 
-把 `_R_LO/_R_HI` 与桶内 `(wf,wo[,wa],sg)` 改为标定值（替换 Task 1 的初始猜测）。
 
-- [ ] **Step 3: 收紧单测并跑**
+def choose_launch_config(meta, hidden: int, tp_size: int,
+                         N_TILE: int = 128, num_sms: int = 132) -> LaunchConfig:
+    """按 r 2 桶查表返回 (w_fa,w_oproj,w_ar,sg). tp==1 时 w_ar=0 (非目标场景)."""
+    r = estimate_work_ratio(meta, hidden, N_TILE)
+    num_out = cdiv(hidden, N_TILE)
+    wa = 1 if tp_size > 1 else 0
+    if r < _R_LO:
+        wf, wo, sg = 2, 1, 4
+    else:
+        wf, wo, sg = 8, 1, 4
+    sg = max(1, min(sg, num_out))
+    return LaunchConfig(w_fa=wf, w_oproj=wo, w_ar=wa, sg=sg)
+```
 
-在 `tests/metadata/test_launch_heuristic.py` 增加针对标定值的断言（例如某已知 r 落入预期桶、返回预期 sg），然后：
+- [ ] **Step 2: 收紧单测**
+
+在 `tests/metadata/test_launch_heuristic.py` 把 `test_choose_fa_heavy_biases_fa_and_coarsens_sg` 之外，新增针对标定桶的显式断言（替换/补充）：
+
+```python
+def test_choose_calibrated_buckets_tp8():
+    # r<2 桶 (平衡): 4096,4096 hid4096 -> (2,1,1,4)
+    bal = choose_launch_config(build_row_desc([4096, 4096]), hidden=4096, tp_size=8)
+    assert (bal.w_fa, bal.w_oproj, bal.w_ar, bal.sg) == (2, 1, 1, 4)
+    # r>=2 桶 (FA 偏): 16384 hid2048 (r≈8) -> (8,1,1,4)
+    fa = choose_launch_config(build_row_desc([16384]), hidden=2048, tp_size=8)
+    assert (fa.w_fa, fa.w_oproj, fa.w_ar, fa.sg) == (8, 1, 1, 4)
+
+
+def test_choose_tp1_mirrors_with_war_zero():
+    cfg = choose_launch_config(build_row_desc([16384]), hidden=2048, tp_size=1)
+    assert (cfg.w_fa, cfg.w_oproj, cfg.w_ar, cfg.sg) == (8, 1, 0, 4)
+```
+
+然后运行：
 
 Run: `pytest tests/metadata/test_launch_heuristic.py -q`
-Expected: PASS
+Expected: PASS（原有 + 2 个新测试全过；`test_choose_fa_heavy_biases_fa_and_coarsens_sg` 仍成立：8/1≥2/1 且 sg 4≥4）
 
-- [ ] **Step 4: 12 组 --auto 回归**
+- [ ] **Step 3: 12 组 --auto 回归**
 
 ```bash
 export LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:$LD_LIBRARY_PATH
-# 对 12 个 shape 逐个跑 --auto，记录 ratio，对比 README 历史基线
-torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto \
-  --seqlens 8192,8192 --hidden 7168 --h_local 16 --iters 30 --warmup 10
-# ... 其余 11 个 shape 同样 --auto ...
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 2048,2048 --hidden 2048 --h_local 8 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 1024,1024,1024,1024 --hidden 2048 --h_local 16 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 4096,4096 --hidden 4096 --h_local 8 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 8192 --hidden 2048 --h_local 8 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 2048,2048,2048,2048,2048,2048,2048,2048 --hidden 2048 --h_local 8 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 8192,8192 --hidden 2048 --h_local 8 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 8192,8192 --hidden 4096 --h_local 8 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 8192,8192 --hidden 7168 --h_local 16 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 16384 --hidden 2048 --h_local 8 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 16384 --hidden 4096 --h_local 16 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 16384,16384 --hidden 2048 --h_local 8 --iters 30 --warmup 10
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --auto --seqlens 32768 --hidden 2048 --h_local 8 --iters 30 --warmup 10
 ```
-Expected: A 类 shape（DeepSeek、多序列、中等）ratio 较旧值提升；B 类长单序列不回退（误差范围内）。
+Expected（对照 `sweep_results.md` 对应桶配置列）：A 类提升（如 4096,4096→~1.40×、8192,8192 hid2048→~1.26×）；B 类长单序列不回退（32768→~0.92× 同旧）。把 12 个 `[fused] ... ratio=...` 收集成表。
 
-- [ ] **Step 5: 更新 README 并提交**
+- [ ] **Step 4: 更新 README 并提交**
 
-在 [README.md](README.md) benchmark 表加一列 "auto ratio"，记录 `--auto` 结果。
+在 [README.md](README.md) benchmark 表加一列 "auto ratio"（`--auto` 实测），并在表下加一句说明启发式为 2 桶（r<2→(2,1,1) / r≥2→(8,1,1)，sg=4），以及 DeepSeek/32K 两类 launch 启发式不改善的说明。
 
 ```bash
 git add src/mega_attention/metadata/launch_heuristic.py tests/metadata/test_launch_heuristic.py README.md
-git commit -m "feat(metadata): 标定粗桶表 + 12组 --auto 回归（A 类提升，B 类不回退）"
+git commit -m "feat(metadata): 2 桶标定表（r<2→(2,1,1) / r≥2→(8,1,1), sg=4）+ 12组 --auto 回归"
 ```
 
 ---
