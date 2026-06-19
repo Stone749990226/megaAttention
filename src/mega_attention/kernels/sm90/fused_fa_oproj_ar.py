@@ -336,10 +336,10 @@ def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor, ar_exec: cute.Tensor,
 # ===================================================== schedule (leader) ====
 @cute.jit
 def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
-                  cls, num_fa: cutlass.Constexpr, total_oproj: cutlass.Constexpr,
+                  role, num_fa: cutlass.Constexpr, total_oproj: cutlass.Constexpr,
                   owner_words_alloc: cutlass.Constexpr, tp_size: cutlass.Constexpr,
                   rank: cutlass.Constexpr, local_owned_ar: cutlass.Constexpr):
-    """Leader-only: return (mode, arg). DONE iff all three targets met."""
+    """Leader-only: return (mode, arg). role 0=prefer FA, 1=OPROJ, 2=AR."""
     mode = cutlass.Int32(MODE_IDLE)
     arg = cutlass.Int32(-1)
 
@@ -354,11 +354,11 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
     if all_done:
         mode = cutlass.Int32(MODE_DONE)
     else:
-        # preference order s0,s1,s2 by cls = cta_id % 6 (codes 1=FA,2=OPROJ,3=AR)
+        # preference order by role (0=FA,1=OPROJ,2=AR); all fall through.
         s0 = cutlass.Int32(MODE_FA); s1 = cutlass.Int32(MODE_OPROJ); s2 = cutlass.Int32(MODE_AR)
-        if cls == 4:
+        if role == 1:
             s0 = cutlass.Int32(MODE_OPROJ); s1 = cutlass.Int32(MODE_AR); s2 = cutlass.Int32(MODE_FA)
-        if cls == 5:
+        if role == 2:
             s0 = cutlass.Int32(MODE_AR); s1 = cutlass.Int32(MODE_FA); s2 = cutlass.Int32(MODE_OPROJ)
 
         found = cutlass.Int32(0)
@@ -428,7 +428,12 @@ class FusedFaOprojArSkeleton:
                partial_check: cute.Tensor):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        cls = bidx % 6
+        k6 = bidx % cutlass.Int32(6)
+        role = cutlass.Int32(0)
+        if k6 >= cutlass.Int32(4):
+            role = cutlass.Int32(1)
+        if k6 >= cutlass.Int32(5):
+            role = cutlass.Int32(2)
 
         num_fa = cutlass.const_expr(self.num_fa)
         total_oproj = cutlass.const_expr(self.total_oproj)
@@ -450,7 +455,7 @@ class FusedFaOprojArSkeleton:
         looping = True
         while looping:
             if tidx == 0:
-                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, cls,
+                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, role,
                                           num_fa, total_oproj, owner_words_alloc,
                                           tp_size, rank, local_owned_ar)
                 sma[0] = mode
@@ -493,7 +498,8 @@ class FusedFaOprojAr:
                  total_oproj, num_ctas, hidden, tp_size=1, rank=0, kv_stages=2,
                  N_TILE=128, super_group_n_tiles=4, K_CHUNK=64, oproj_stages=4,
                  csym_mc_ptr=0, nvl_mc_ptr=0, nvl_local_ptr=0, rc_ptrs=(), rb_ptrs=(),
-                 softmax_scale=None, acc_dtype=cutlass.Float32):
+                 softmax_scale=None, acc_dtype=cutlass.Float32,
+                 w_fa=4, w_oproj=1, w_ar=1):
         # multi-rank (tp>1) NVLS constants: baked into the kernel as closure ints
         # (must NOT be cute.compile args -> 64-bit ptr would be truncated). For tp==1
         # they are unused (single-rank path). 设计稿 §1883/§2287.
@@ -513,6 +519,10 @@ class FusedFaOprojAr:
         self.num_ctas = num_ctas
         self.tp_size = tp_size
         self.rank = rank
+        # ---- role weights (weight-driven CTA role preference) ----
+        self.w_fa = w_fa
+        self.w_oproj = w_oproj
+        self.w_ar = w_ar if tp_size > 1 else 0
         # ---- AR owner-local control sizing (设计稿: 确定性 owner 映射) ----
         # owner_rank = ar_slot_id % tp_size ; owner_idx = ar_slot_id // tp_size
         self.owner_slots_alloc = (total_oproj + tp_size - 1) // tp_size
@@ -665,7 +675,15 @@ class FusedFaOprojAr:
         bidx, _, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         wg_idx = cute.arch.make_warp_uniform(tidx // 128)
-        cls = bidx % 6
+        w_fa = cutlass.const_expr(self.w_fa)
+        w_fo = cutlass.const_expr(self.w_fa + self.w_oproj)
+        w_m = cutlass.const_expr(self.w_fa + self.w_oproj + self.w_ar)
+        k = bidx % cutlass.Int32(w_m)
+        role = cutlass.Int32(0)
+        if k >= cutlass.Int32(w_fa):
+            role = cutlass.Int32(1)
+        if k >= cutlass.Int32(w_fo):
+            role = cutlass.Int32(2)
 
         num_fa = cutlass.const_expr(self.num_fa)
         total_oproj = cutlass.const_expr(self.total_oproj)
@@ -782,7 +800,7 @@ class FusedFaOprojAr:
         looping = True
         while looping:
             if tidx == 0:
-                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, cls, num_fa,
+                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, role, num_fa,
                                           total_oproj, owner_words_alloc, tp_size, rank,
                                           local_owned_ar)
                 sma[0] = mode

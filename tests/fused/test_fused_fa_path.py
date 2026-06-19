@@ -34,7 +34,7 @@ def _i32(a, dev):
 
 
 def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tiles=4,
-             num_ctas=8, seed=0):
+             num_ctas=8, seed=0, w_fa=4, w_oproj=1, w_ar=1):
     torch.manual_seed(seed)
     dev = torch.device(DEV)
     meta = build_row_desc(seqlens)
@@ -84,7 +84,8 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     ker = FusedFaOprojAr(num_fa=num_fa, num_row_tiles=R, H_local=H_local, D=D,
                          num_super_groups=num_super_groups, total_oproj=total_oproj,
                          num_ctas=num_ctas, hidden=hidden, tp_size=1, N_TILE=N_TILE,
-                         super_group_n_tiles=super_group_n_tiles)
+                         super_group_n_tiles=super_group_n_tiles,
+                         w_fa=w_fa, w_oproj=w_oproj, w_ar=w_ar)
     ts = torch.cuda.Stream(); st = cuda.CUstream(ts.cuda_stream)
     compiled = cute.compile(ker, *cts, st)
     with torch.cuda.stream(ts):
