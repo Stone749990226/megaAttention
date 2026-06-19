@@ -49,3 +49,17 @@ def test_choose_tp_gt1_allows_ar_weight():
     meta = build_row_desc([4096])
     cfg = choose_launch_config(meta, hidden=4096, tp_size=8)
     assert cfg.w_ar >= 1
+
+
+def test_choose_calibrated_buckets_tp8():
+    # r<2 桶 (平衡): 4096,4096 hid4096 -> (2,1,1,4)
+    bal = choose_launch_config(build_row_desc([4096, 4096]), hidden=4096, tp_size=8)
+    assert (bal.w_fa, bal.w_oproj, bal.w_ar, bal.sg) == (2, 1, 1, 4)
+    # r>=2 桶 (FA 偏): 16384 hid2048 (r≈8) -> (8,1,1,4)
+    fa = choose_launch_config(build_row_desc([16384]), hidden=2048, tp_size=8)
+    assert (fa.w_fa, fa.w_oproj, fa.w_ar, fa.sg) == (8, 1, 1, 4)
+
+
+def test_choose_tp1_mirrors_with_war_zero():
+    cfg = choose_launch_config(build_row_desc([16384]), hidden=2048, tp_size=1)
+    assert (cfg.w_fa, cfg.w_oproj, cfg.w_ar, cfg.sg) == (8, 1, 0, 4)
