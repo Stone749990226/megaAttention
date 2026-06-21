@@ -13,22 +13,28 @@ cannot accidentally match anything else.
 Launch order of the fused kernel is fixed:  prime(1) + warmup(W) + prof(1).
 So ncu can pin the steady-state prof launch with `--launch-skip $((1+W)) --launch-count 1`.
 
-Multi-GPU profiling (single node, all ranks under one ncu via torchrun) per the
-official NsightCompute multi-process guidance for mandatory-concurrent (NCCL /
-NVSHMEM-style) kernels -- our kernel does cross-rank multimem AllReduce + nvl
-spin-lock barriers, so the profiler MUST keep ranks in lockstep or it deadlocks:
+This kernel does cross-rank multimem AllReduce + nvl spin-lock barriers, i.e. it
+is a "mandatory concurrent kernel" (NsightComputeCli.md 4.3.2): under default
+multi-pass collection the profiler deadlocks unless ranks stay in lockstep.
 
-  ncu --communicator shmem --communicator-shmem-num-peers 8 --lockstep-kernel-launch \
-      -k regex:FusedFaOprojAr --launch-skip 5 --launch-count 1 \
-      --section SpeedOfLight -f -o report \
-      torchrun --nnodes=1 --nproc_per_node=8 scripts/prof_fused_driver.py
+Multi-GPU (8-rank) profiling -- ONLY viable path on this kernel:
+  8 independent per-rank ncu instances (one python3 per rank, dist env set by
+  hand -- NOT torchrun), kept in sync by:
+      --communicator tcp --communicator-tcp-num-peers 8 --lockstep-kernel-launch
+      --replay-mode application --app-replay-buffer memory
+  application replay re-runs the WHOLE app per pass, so the collective completes
+  on every pass and no rank is left spinning while another is paused.
 
-shmem communicator supports kernel/range replay only (NOT application replay),
-which is fine -- kernel replay re-runs just the kernel (no whole-app relaunch).
+  NOTE: the shmem communicator (--communicator shmem) is a DEAD END here. shmem
+  supports kernel/range replay ONLY, and kernel replay must save/restore the CUDA
+  context every pass -- the symmetric-memory + NVLS multicast mappings cannot be
+  saved/restored (fails with ContextSaveFailed). Do NOT use shmem for this kernel.
 
-Single GPU (nproc_per_node=1): tp_size==1, the nvl_barrier / multimem AR paths
-are skipped (AR degenerates to identity); profiles the FA + O_proj compute with
-ordinary kernel replay, `--set full` in one go.
+Single GPU (nproc_per_node=1 / WORLD_SIZE=1): tp_size==1, the nvl_barrier /
+multimem AR paths are skipped (AR degenerates to identity); profiles the FA +
+O_proj compute with ordinary kernel replay, `--set full` in one go:
+  ncu -k regex:FusedFaOprojAr --launch-skip 1 --launch-count 1 --set full \
+      -f -o report python3 scripts/prof_fused_driver.py --warmup 0
 """
 import argparse
 import os

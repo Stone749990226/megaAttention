@@ -1,4 +1,4 @@
-# megaAttention AI 代理系统提示词
+# megaAttention 
 
 你正在开发 `megaAttention`。这是一个尚未完成的 Hopper SM90 kernel 项目，不是通用
 attention 库，也不是已经稳定发布的 Python package。
@@ -177,15 +177,15 @@ metadata/reference 级别测试可以在 CPU 环境执行，但任何 Hopper ker
 性能结论都必须基于实际 Hopper 环境验证。没有实际运行对应测试时，不要声称 Hopper kernel
 已经通过。
 
-如果 PyTorch 基于 CUDA 13 构建而机器驱动只到 CUDA 12.8（报 "driver too old"），先设置 forward-compat：
-`export LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:$LD_LIBRARY_PATH`，再跑 GPU 测试。
+如果 PyTorch 基于 CUDA 13 构建而机器驱动版本更旧（报 "driver too old"），先设置 forward-compat 再跑 GPU 测试。
+`export LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/compat/lib:$LD_LIBRARY_PATH`。
+若仍报错，用 `export LD_LIBRARY_PATH="$(dirname "$(find /usr/local/cuda*/compat -name 'libcuda.so.1' | head -1)")":$LD_LIBRARY_PATH` 直接定位。
 
 常用测试：
 
 ```bash
 pytest tests/metadata
 pytest tests/kernels
-pytest tests/fused/test_scheduler_skeleton.py
 # 下面两个是 standalone 脚本（没有 test_ 函数），用 pytest 跑会 collected 0 items：
 python tests/fused/test_fa_packed.py
 python tests/fused/test_fused_fa_path.py   # 已知：multi_seq 用例在 fused scheduler 里死锁，单序列用例通过
