@@ -63,35 +63,33 @@ tp_size=8 下 owner 用 `multimem.ld_reduce/st` 在 C_sym multicast view 上做 
 ### 性能（8×H200，`benchmarks/bench_fused_fa_oproj_ar.py`）
 
 fused（单 persistent kernel）vs 非融合 best-of-breed 基线
-（官方 **`flash_attn_varlen_func`**（flash-attn 2.8.3）+ cuBLAS GEMM + **NVLS `multimem_all_reduce_`**）：
+（官方 **`flash_attn_varlen_func`**（flash-attn 2.7.4）+ cuBLAS GEMM + **NVLS `multimem_all_reduce_`**），
+固定配置 `w=(w_fa,w_oproj,w_ar)=(4,1,1)`、`sg=4`（50 iters / 20 warmup）：
 
-| shape | fused | FA+GEMM+NVLS 基线 | ratio | auto ratio | err_rel |
-| --- | --- | --- | --- | --- | --- |
-| [2048,2048] H8 hid2048 (4K) | 0.191 ms | 0.228 ms | **1.20×** | 1.16× | 4.6e-4 |
-| [1024]×4 H16 hid2048 (4K) | 0.242 ms | 0.256 ms | 1.06× | 0.95× | 9.3e-4 |
-| [4096,4096] H8 hid4096 (8K) | 0.515 ms | 0.725 ms | **1.41×** | **1.42×** | 8.1e-4 |
-| [8192] H8 hid2048 (8K, 单序列) | 0.619 ms | 0.801 ms | **1.30×** | **1.31×** | 1.7e-3 |
-| [2048]×8 H8 hid2048 (16K) | 0.576 ms | 0.654 ms | 1.13× | 1.19× | 8.3e-4 |
-| [8192,8192] H8 hid2048 (16K) | 1.068 ms | 1.303 ms | **1.22×** | **1.29×** | 4.1e-4 |
-| [8192,8192] H8 hid4096 (16K) | 1.252 ms | 1.662 ms | **1.33×** | **1.29×** | 8.9e-4 |
-| [8192,8192] H16 hid7168 (16K, DeepSeek) | 3.075 ms | 3.199 ms | 1.04× | 0.99× | 1.6e-3 |
-| [16384] H8 hid2048 (16K, 单序列) | 1.962 ms | 2.199 ms | 1.12× | 1.17× | 4.1e-4 |
-| [16384] H16 hid4096 (16K, 单序列) | 4.234 ms | 4.023 ms | 0.95× | 0.97× | 2.1e-3 |
-| [16384,16384] H8 hid2048 (32K) | 3.711 ms | 3.850 ms | 1.04× | 1.07× | 9.0e-4 |
-| [32768] H8 hid2048 (32K, 单序列) | 7.392 ms | 6.904 ms | 0.93× | 0.92× | 4.5e-4 |
-
-启发式为 2 桶（r<2 → (w_fa,w_oproj,w_ar)=(2,1,1)；r≥2 → (8,1,1)；sg 恒为 4）。r = FA_MACs/O_proj_MACs，单切点 r=2.0（8×H200 Task4 sweep 标定）。
+| shape | fused | FA+GEMM+NVLS 基线 | ratio | err_rel |
+| --- | --- | --- | --- | --- |
+| [2048,2048] H8 hid2048 (4K) | 0.194 ms | 0.229 ms | 1.19× | 4.6e-4 |
+| [1024]×4 H16 hid2048 (4K) | 0.252 ms | 0.243 ms | 0.97× | 9.3e-4 |
+| [4096,4096] H8 hid4096 (8K) | 0.510 ms | 0.692 ms | **1.36×** | 8.1e-4 |
+| [8192] H8 hid2048 (8K, 单序列) | 0.605 ms | 0.757 ms | **1.25×** | 1.7e-3 |
+| [2048]×8 H8 hid2048 (16K) | 0.538 ms | 0.678 ms | **1.26×** | 8.3e-4 |
+| [8192,8192] H8 hid2048 (16K) | 1.030 ms | 1.286 ms | **1.25×** | 4.1e-4 |
+| [8192,8192] H8 hid4096 (16K) | 1.218 ms | 1.683 ms | **1.38×** | 8.9e-4 |
+| [8192,8192] H16 hid7168 (16K, DeepSeek) | 3.244 ms | 3.157 ms | 0.97× | 1.6e-3 |
+| [16384] H8 hid2048 (16K, 单序列) | 1.941 ms | 2.152 ms | 1.11× | 4.1e-4 |
+| [16384] H16 hid4096 (16K, 单序列) | 4.301 ms | 4.093 ms | 0.95× | 2.1e-3 |
+| [16384,16384] H8 hid2048 (32K) | 3.799 ms | 3.887 ms | 1.02× | 9.0e-4 |
+| [32768] H8 hid2048 (32K, 单序列) | 7.362 ms | 6.864 ms | 0.93× | 4.5e-4 |
 
 说明：
-- `ratio` 列为历史默认配置结果；`auto ratio` 列为 `--auto` 启发式自动选配的实测结果。两列来自不同测量批次（`ratio` 为早期环境），逐行直接相减会把环境漂移误记成启发式增减——例如 [1024]×4 当前环境任何配置最高仅 0.98×（见 `benchmarks/sweep_results.md`），历史 1.06× 复现不出，故该行 0.95× 是环境差异而非启发式回退。
-- **DeepSeek（hid7168，0.99×）**：大 hidden 下 AR comm/compute overlap 是主要瓶颈，launch 旋钮对该场景无帮助，heuristic 不改善。
-- **32K 单序列（0.92×）**：FA O(L²) compute-bound，官方 flash-attn per-tile 效率更高；不是 launch heuristic 可解的问题，需要 FA per-tile pipeline 独立优化。
+- **DeepSeek（hid7168，0.97×）**：大 hidden 下 AR comm/compute overlap 是主要瓶颈。
+- **32K 单序列（0.93×）**：FA O(L²) compute-bound，官方 flash-attn per-tile 效率更高；不是配置可解的问题，需要 FA per-tile pipeline 独立优化。
 
 > 备注：用 PyTorch SDPA 的 FLASH 后端（也是 FlashAttention-2）替换官方包时 ratio 更高（如
 > [2048,2048] 为 1.43×），因为官方 flash-attn 比 SDPA 后端更快、基线更强；表中取官方包的权威数。
 >
 > 正确性：benchmark 每个 shape 还会打印 `err_abs/err_rel [OK vs baseline]`——fused 的 C_sym
-> 与独立的 FA+GEMM+NVLS 基线路径逐 tile 对比，全部 shape `err_rel` 在 ~5e-4–1e-3（bf16 级），
+> 与独立的 FA+GEMM+NVLS 基线路径逐 tile 对比，全部 shape `err_rel` 在 ~4e-4–2e-3（bf16 级），
 > 即融合结果与参考路径一致、算得对。
 
 ## 目录结构
@@ -135,13 +133,21 @@ pip install -e ".[dev]"
 RuntimeError: The NVIDIA driver on your system is too old (found version 12080)
 ```
 
-此时若机器已装 CUDA forward-compat 包（H200 等数据中心卡支持），用 compat 目录下的 userspace 驱动即可：
+此时若机器已装 CUDA forward-compat 包（H200 等数据中心卡支持），用 compat 目录下的 userspace 驱动即可。不同机器的 CUDA 版本目录不同（如本机是 `cuda-13.2`），且 `libcuda.so` 在不同 compat 包里可能直接位于 `compat/` 下、也可能在 `compat/lib/` 子目录下，所以不要写死版本号和布局。优先用版本无关软链并把两种布局都加上：
 
 ```bash
-export LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/compat/lib:$LD_LIBRARY_PATH
+```
+
+若上面仍报 "driver too old"，直接定位 compat 里的 `libcuda.so.1` 再设置：
+
+```bash
+export LD_LIBRARY_PATH="$(dirname "$(find /usr/local/cuda*/compat -name 'libcuda.so.1' | head -1)")":$LD_LIBRARY_PATH
 ```
 
 设置后 `torch.cuda.is_available()` 应为 `True` 且识别为 `NVIDIA H200 (9, 0)`。本文下面所有 Hopper / 多卡命令都假设已设置该变量。
+
+> 注：本机驱动 570.x 已通过 nvidia-smi 报告 CUDA 13.2、torch 也是 cu13.2 构建，二者匹配，实际无需 forward-compat；上面命令仅在出现版本不匹配（驱动旧于 torch 构建版本）时才需要。
 
 ## 测试分级
 

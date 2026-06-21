@@ -2,15 +2,11 @@
 """
 Fused FA + O_proj + NVLS AllReduce persistent kernel (Hopper SM90, CuTe DSL).
 
-PHASE 1 -- scheduler skeleton with STUB payloads (single rank, no real math).
+One persistent grid runs the whole causal-varlen-prefill FA -> O_proj ->
+tensor-parallel NVLS AllReduce pipeline; each CTA dynamically switches between
+FA / O_proj / AR modes via a leader-claimed, smem-broadcast (mode, arg).
 
-This file grows across the plan's phases. Right now it implements only the
-multi-mode persistent *scheduler* and the cross-mode handoff protocol, with
-trivial known-answer stub "compute" so the plumbing can be validated without any
-floating-point math (see test_scheduler_skeleton.py). Real FA / O_proj GEMM /
-NVLS reduce drop into the do_fa / do_oproj / do_ar stubs in later phases.
-
-Protocol implemented (设计文稿.md):
+Scheduler + cross-mode handoff protocol (设计文稿.md):
   * persistent grid of `num_ctas` CTAs; device-wide grid_sync at init + exit.
   * FA tasks claimed from a global atomic counter -> (row_tile, head).
   * head_ready_count[row_tile] release/acquire; the last head of a row publishes
@@ -18,14 +14,14 @@ Protocol implemented (设计文稿.md):
   * O_proj tasks popped via CAS on consume_head.
   * each O_proj task pushes a per-(row_tile,super_group) AR readiness (single
     rank => last-arriver is immediate), claimed once by an AR owner task.
-  * cta_id % 6 static preference table; all CTAs fall through to other sources.
+  * weight-driven CTA role preference (w_fa / w_oproj / w_ar); all CTAs fall
+    through to other sources.
   * termination when fa_done / oproj_done / ar_done all hit their targets.
 
-STUB semantics (axis A, known-answer):
-  do_fa    : writes head_marker[row_tile,head] = row_tile*H_local+head+1 (nonzero)
-  do_oproj : reads ALL H_local markers of its row, asserts each present+correct
-             (any miss => order_err++), writes a partial checksum.
-  do_ar    : terminal-protected once-only completion.
+FA payload reuses the validated dynamic-varlen pieces (M=N=D=128, kv_stages=2,
+causal varlen prompt prefill). For tp_size==1 the AR path degenerates to identity
+(do_ar just sets the terminal done bit); the real multimem ld_reduce/st over the
+C_sym multicast view runs in the tp_size>1 path.
 """
 import cuda.bindings.driver as cuda
 
@@ -39,7 +35,7 @@ from cutlass.cute.nvgpu import warpgroup
 from quack import layout_utils as qlu
 
 # Phase-5 (5b-1b): real FA payload reuses the validated dynamic-varlen FA pieces.
-from mega_attention.kernels.sm90.fa_varlen import softmax_block_dyn, cdiv, LOG2E
+from mega_attention.kernels.sm90.fa_varlen import softmax_block_dyn, LOG2E
 
 # ---- mode codes (broadcast through smem) ----
 MODE_IDLE = 0
@@ -65,7 +61,7 @@ NUM_CTRL = 11
 FINISH_TAG = 0x80000000
 
 
-# ============================================================ grid_sync ====
+# ========= grid_sync ====
 @cute.jit
 def gsync(ctrl: cute.Tensor, idx: cutlass.Constexpr,
           num_ctas: cutlass.Constexpr, bidx, tidx):
@@ -213,28 +209,7 @@ def publish_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor,
                          sem="release", scope="gpu")
 
 
-# =================================================== stub payloads (axis A) =
-@cute.jit
-def do_fa(ctrl: cute.Tensor, head_marker: cute.Tensor, fa_exec: cute.Tensor,
-          head_ready: cute.Tensor, oproj_queue: cute.Tensor,
-          fa_task_id: cutlass.Int32,
-          H_local: cutlass.Constexpr, num_super_groups: cutlass.Constexpr):
-    """STUB FA: write a known marker, bump head_ready, last head publishes O_proj."""
-    row_tile = fa_task_id // H_local
-    head = fa_task_id % H_local
-    marker = row_tile * cutlass.Int32(H_local) + head + cutlass.Int32(1)
-    head_marker[fa_task_id] = marker.to(cutlass.Uint32)     # "O_scratch store"
-    cute.arch.atomic_add(fa_exec.iterator + fa_task_id.to(cutlass.Uint32),
-                         cutlass.Uint32(1), sem="relaxed", scope="gpu")
-    cute.arch.fence_acq_rel_gpu()                            # release marker
-    old = cute.arch.atomic_add(head_ready.iterator + row_tile.to(cutlass.Uint32),
-                               cutlass.Uint32(1), sem="acq_rel", scope="gpu")
-    if (old + cutlass.Uint32(1)) == cutlass.Uint32(H_local):
-        publish_oproj(ctrl, oproj_queue, row_tile, num_super_groups)
-    cute.arch.atomic_add(ctrl.iterator + C_FA_DONE, cutlass.Uint32(1),
-                         sem="release", scope="gpu")
-
-
+# ============================================== producer: publish AR ready ==
 @cute.jit
 def publish_ar_ready(ready_count_owner: cute.Tensor, ar_ready_bits: cute.Tensor,
                      ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr):
@@ -278,40 +253,6 @@ def publish_ar_ready_xrank(rc_local: cute.Tensor, rb_local: cute.Tensor,
 
 
 @cute.jit
-def do_oproj(ctrl: cute.Tensor, head_marker: cute.Tensor, oproj_exec: cute.Tensor,
-             ready_count_owner: cute.Tensor, ar_ready_bits: cute.Tensor,
-             partial_check: cute.Tensor, slot_id: cutlass.Int32,
-             H_local: cutlass.Constexpr, num_super_groups: cutlass.Constexpr,
-             tp_size: cutlass.Constexpr):
-    """STUB O_proj: verify all heads of the row are present, push AR readiness."""
-    row_tile = slot_id // num_super_groups
-    nsg = slot_id % num_super_groups
-    # ordering check: every head marker of this row must be present + correct
-    h = cutlass.Int32(0)
-    bad = cutlass.Uint32(0)
-    while h < cutlass.Int32(H_local):
-        idx = (row_tile * cutlass.Int32(H_local) + h).to(cutlass.Uint32)
-        mk = head_marker[idx]
-        expected = (row_tile * cutlass.Int32(H_local) + h + cutlass.Int32(1)).to(cutlass.Uint32)
-        if mk != expected:
-            bad = bad + cutlass.Uint32(1)
-        h = h + cutlass.Int32(1)
-    if bad != 0:
-        cute.arch.atomic_add(ctrl.iterator + C_ORDER_ERR, bad,
-                             sem="relaxed", scope="gpu")
-    cute.arch.atomic_add(oproj_exec.iterator + slot_id.to(cutlass.Uint32),
-                         cutlass.Uint32(1), sem="relaxed", scope="gpu")
-    # stub "partial" checksum
-    partial_check[slot_id.to(cutlass.Uint32)] = (
-        row_tile * cutlass.Int32(1000) + nsg + cutlass.Int32(1)).to(cutlass.Uint32)
-    # push-to-owner ready (single rank: tp_size==1 => immediate last-arriver)
-    cute.arch.fence_acq_rel_gpu()
-    publish_ar_ready(ready_count_owner, ar_ready_bits, slot_id, tp_size)
-    cute.arch.atomic_add(ctrl.iterator + C_OP_DONE, cutlass.Uint32(1),
-                         sem="release", scope="gpu")
-
-
-@cute.jit
 def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor, ar_exec: cute.Tensor,
          ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr):
     """AR owner: set owner-local done bit (terminal), then reduce/store + count once.
@@ -333,7 +274,7 @@ def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor, ar_exec: cute.Tensor,
                              sem="release", scope="gpu")
 
 
-# ===================================================== schedule (leader) ====
+# == schedule (leader) ====
 @cute.jit
 def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
                   role, num_fa: cutlass.Constexpr, total_oproj: cutlass.Constexpr,
@@ -387,111 +328,18 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
     return mode, arg
 
 
-# ============================================================= driver/kernel =
-class FusedFaOprojArSkeleton:
-    """Phase 1 scheduler skeleton. threads_per_cta is 1 warp-group (128) for now;
-    Phase 2 widens to 3 warp groups (384) and fills do_fa with real FA."""
-
-    def __init__(self, num_fa, num_row_tiles, H_local, num_super_groups,
-                 total_oproj, num_ctas, tp_size=1, rank=0, threads_per_cta=128):
-        self.num_fa = num_fa
-        self.num_row_tiles = num_row_tiles
-        self.H_local = H_local
-        self.num_super_groups = num_super_groups
-        self.total_oproj = total_oproj
-        self.num_ctas = num_ctas
-        self.tp_size = tp_size
-        self.rank = rank
-        self.owner_slots_alloc = (total_oproj + tp_size - 1) // tp_size
-        self.owner_words_alloc = (self.owner_slots_alloc + 63) // 64
-        self.local_owned_ar_tasks = ((max(total_oproj - rank, 0)) + tp_size - 1) // tp_size
-        self.threads_per_cta = threads_per_cta
-
-    @cute.jit
-    def __call__(self, ctrl, head_ready, oproj_queue, ready_count_owner,
-                 ar_ready_bits, ar_done_bits, head_marker, fa_exec, oproj_exec,
-                 ar_exec, partial_check, stream: cuda.CUstream):
-        self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
-                    ar_done_bits, head_marker, fa_exec, oproj_exec, ar_exec,
-                    partial_check).launch(
-            grid=[self.num_ctas, 1, 1],
-            block=[self.threads_per_cta, 1, 1],
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(self, ctrl: cute.Tensor, head_ready: cute.Tensor,
-               oproj_queue: cute.Tensor, ready_count_owner: cute.Tensor,
-               ar_ready_bits: cute.Tensor, ar_done_bits: cute.Tensor,
-               head_marker: cute.Tensor, fa_exec: cute.Tensor,
-               oproj_exec: cute.Tensor, ar_exec: cute.Tensor,
-               partial_check: cute.Tensor):
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        k6 = bidx % cutlass.Int32(6)
-        role = cutlass.Int32(0)
-        if k6 >= cutlass.Int32(4):
-            role = cutlass.Int32(1)
-        if k6 >= cutlass.Int32(5):
-            role = cutlass.Int32(2)
-
-        num_fa = cutlass.const_expr(self.num_fa)
-        total_oproj = cutlass.const_expr(self.total_oproj)
-        H_local = cutlass.const_expr(self.H_local)
-        num_super_groups = cutlass.const_expr(self.num_super_groups)
-        tp_size = cutlass.const_expr(self.tp_size)
-        rank = cutlass.const_expr(self.rank)
-        owner_words_alloc = cutlass.const_expr(self.owner_words_alloc)
-        local_owned_ar = cutlass.const_expr(self.local_owned_ar_tasks)
-        num_ctas = cutlass.const_expr(self.num_ctas)
-
-        # smem broadcast of (mode, arg) from leader to the whole CTA
-        smem = cutlass.utils.SmemAllocator()
-        sma = smem.allocate_tensor(cutlass.Int32, cute.make_layout(2),
-                                   byte_alignment=4)
-
-        gsync(ctrl, C_GS_INIT, num_ctas, bidx, tidx)
-
-        looping = True
-        while looping:
-            if tidx == 0:
-                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, role,
-                                          num_fa, total_oproj, owner_words_alloc,
-                                          tp_size, rank, local_owned_ar)
-                sma[0] = mode
-                sma[1] = arg
-            cute.arch.sync_threads()
-            mode = sma[0]
-            arg = sma[1]
-
-            if mode == MODE_DONE:
-                looping = False
-            else:
-                if tidx == 0:
-                    if mode == MODE_FA:
-                        do_fa(ctrl, head_marker, fa_exec, head_ready, oproj_queue,
-                              arg, H_local, num_super_groups)
-                    if mode == MODE_OPROJ:
-                        do_oproj(ctrl, head_marker, oproj_exec, ready_count_owner,
-                                 ar_ready_bits, partial_check, arg, H_local,
-                                 num_super_groups, tp_size)
-                    if mode == MODE_AR:
-                        do_ar(ctrl, ar_done_bits, ar_exec, arg, tp_size)
-                cute.arch.sync_threads()      # mode-switch teardown barrier
-
-        gsync(ctrl, C_GS_EXIT, num_ctas, bidx, tidx)
-
-
-# ============================================ 5b-1b: real FA-path fused kernel =
+# ========== driver/kernel =
 
 
 class FusedFaOprojAr:
-    """5b-1b: persistent fused kernel with REAL FA (writes O_scratch_local), O_proj
-    and AR still STUBs (single rank). FA payload = the validated FaWsAttnPacked logic
-    inlined into the dispatch loop with LONG-LIVED pipeline states (consumer split
-    fa_k_cons/fa_v_cons), per 设计稿 "Runtime task descriptor" + "long-lived pipeline
-    state". Leader claims+broadcasts (mode,arg); FA runs on all 3 WGs; O_proj/AR
-    leader-only stubs. M=N=D=128, kv_stages=2, causal varlen prompt prefill.
+    """Persistent fused kernel: REAL FA (writes O_scratch_local) + REAL O_proj GEMM
+    (writes C_sym partial) + NVLS AllReduce. FA payload = the validated FaWsAttnPacked
+    logic inlined into the dispatch loop with LONG-LIVED pipeline states (consumer
+    split fa_k_cons/fa_v_cons), per 设计稿 "Runtime task descriptor" + "long-lived
+    pipeline state". Leader claims+broadcasts (mode,arg); FA and O_proj run on the 2
+    consumer WGs (WG0 = TMA producer). AR: tp_size==1 -> identity (do_ar sets the
+    terminal done bit); tp_size>1 -> multimem ld_reduce/st over C_sym multicast.
+    M=N=D=128, kv_stages=2, causal varlen prompt prefill.
     """
 
     def __init__(self, num_fa, num_row_tiles, H_local, D, num_super_groups,
@@ -574,6 +422,11 @@ class FusedFaOprojAr:
         # partition the returned tma_tensor (basis strides). See fa_varlen_sm90.
         mK_v = qlu.select(mK, [0, 2, 1])
         mV_v = qlu.select(mV, [0, 2, 1])
+        # Q same packed-varlen layout: view head LAST [tot_q,D,H], box (M,D). Q now
+        # rides a 1-stage TMA pipeline like K/V (replaces the old cooperative load).
+        mQ_v = qlu.select(mQ, [0, 2, 1])
+        tma_q, tQ = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            op, mQ_v, cute.select(sQ_l, mode=[0, 1]), (self.M, self.D), num_multicast=1)
         tma_k, tK = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op, mK_v, cute.select(sK_l, mode=[0, 1]), (self.N, self.D), num_multicast=1)
         tma_v, tV = cute.nvgpu.cpasync.make_tiled_tma_atom(
@@ -631,6 +484,7 @@ class FusedFaOprojAr:
         @cute.struct
         class Smem:
             bc: cute.struct.MemRange[cutlass.Int32, 4]
+            mbar_q: cute.struct.MemRange[cutlass.Int64, 1 * 2]
             mbar_k: cute.struct.MemRange[cutlass.Int64, self.kv_stages * 2]
             mbar_v: cute.struct.MemRange[cutlass.Int64, self.kv_stages * 2]
             mbar_ab: cute.struct.MemRange[cutlass.Int64, self.oproj_stages * 2]
@@ -650,7 +504,7 @@ class FusedFaOprojAr:
         self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
                     ar_done_bits, fa_exec, oproj_exec, ar_exec, partial_check,
                     tma_k, tK, tma_v, tV, mOscr, mOscr2d, mWo, mCsym, csym_mc,
-                    nvl_mc, nvl_local, mQ, mCuQ, mCuK,
+                    nvl_mc, nvl_local, tma_q, tQ, mCuQ, mCuK,
                     mFaB, mFaMb, tma_a, tA, tma_wo, tWo,
                     mma_qk, mma_pv, mma_op, sQ_l, sK_l, sV_l, sA_l, sWo_l, Smem).launch(
             grid=[self.num_ctas, 1, 1], block=[self.threads, 1, 1],
@@ -664,7 +518,7 @@ class FusedFaOprojAr:
                tma_k: cute.CopyAtom, mK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor,
                mOscr: cute.Tensor, mOscr2d: cute.Tensor, mWo: cute.Tensor, mCsym: cute.Tensor,
                csym_mc: cute.Tensor, nvl_mc: cute.Tensor, nvl_local: cute.Tensor,
-               mQ: cute.Tensor, mCuQ: cute.Tensor, mCuK: cute.Tensor,
+               tma_q: cute.CopyAtom, tQ: cute.Tensor, mCuQ: cute.Tensor, mCuK: cute.Tensor,
                mFaB: cute.Tensor, mFaMb: cute.Tensor,
                tma_a: cute.CopyAtom, tA: cute.Tensor, tma_wo: cute.CopyAtom, tWo: cute.Tensor,
                mma_qk: cute.TiledMma, mma_pv: cute.TiledMma, mma_op: cute.TiledMma,
@@ -692,9 +546,7 @@ class FusedFaOprojAr:
         tp_size = cutlass.const_expr(self.tp_size)
         num_ctas = cutlass.const_expr(self.num_ctas)
         slog2 = cutlass.const_expr(self.scale_log2)
-        Dc = cutlass.const_expr(self.D)
         nthr = cutlass.const_expr(self.threads)
-        MD = cutlass.const_expr(self.M * self.D)
         # O_proj constexprs
         n_kchunks = cutlass.const_expr(self.n_kchunks)
         sgnt = cutlass.const_expr(self.super_group_n_tiles)
@@ -718,18 +570,25 @@ class FusedFaOprojAr:
         sV = cute.make_tensor(cute.recast_ptr(ov + cutlass.const_expr(self._off_sV), sV_l.inner, self.dt), sV_l.outer)
         sA = cute.make_tensor(cute.recast_ptr(ov, sA_l.inner, self.dt), sA_l.outer)
         sWo = cute.make_tensor(cute.recast_ptr(ov + cutlass.const_expr(self._off_sWo), sWo_l.inner, self.dt), sWo_l.outer)
+        tx_q = cute.size_in_bytes(self.dt, cute.slice_(sQ_l, (None, None, 0)))
         tx_k = cute.size_in_bytes(self.dt, cute.slice_(sK_l, (None, None, 0)))
         tx_v = cute.size_in_bytes(self.dt, cute.slice_(sV_l, (None, None, 0)))
         tx_ab = (cute.size_in_bytes(self.dt, cute.slice_(sA_l, (None, None, 0)))
                  + cute.size_in_bytes(self.dt, cute.slice_(sWo_l, (None, None, 0))))
 
         if warp_idx == 0:
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_v)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_wo)
 
         # pipelines + LONG-LIVED states (created ONCE, threaded across dispatch loop)
+        pl_q = pipeline.PipelineTmaAsync.create(
+            barrier_storage=st.mbar_q.data_ptr(), num_stages=1,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_warps),
+            tx_count=tx_q)
         pl_k = pipeline.PipelineTmaAsync.create(
             barrier_storage=st.mbar_k.data_ptr(), num_stages=self.kv_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -749,44 +608,21 @@ class FusedFaOprojAr:
         fa_v_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stages)
         fa_k_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_stages)
         fa_v_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_stages)
+        fa_q_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        fa_q_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
         op_ab_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.oproj_stages)
         op_ab_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.oproj_stages)
 
-        # consumer fragments / accumulators (persist; refilled per task)
+        # NOTE (设计稿 "寄存器 / SSA 生命周期预算"): the big consumer fragments /
+        # accumulators (FA: tCrQ/K/V, acc_S, acc_O, tOrP, row_*; O_proj: tCrA/Wo,
+        # acc_C) are created mode-locally + role-locally (wg_idx>=1 only) INSIDE each
+        # payload branch below, AFTER setmaxregister, ending their life with the mode.
+        # Only long-lived PROTOCOL state (pipeline objects + PipelineState cursors,
+        # created above) persists across tasks. NB (profiled): this scoping is perf-
+        # NEUTRAL -- SSA live ranges are use-def driven, and these rmem were already
+        # used only in mutually-exclusive branches, so ptxas already reused registers.
+        # The 168-reg/spill is FA's OWN consumer working set, not an FA+O_proj union.
         lane = tidx - self.num_dma_threads
-        thr_qk = mma_qk.get_slice(lane)
-        thr_pv = mma_pv.get_slice(lane)
-        tCrQ = mma_qk.make_fragment_A(thr_qk.partition_A(sQ))
-        tCrK = mma_qk.make_fragment_B(thr_qk.partition_B(sK))
-        sVt = qlu.transpose_view(sV)
-        tCrV = mma_pv.make_fragment_B(thr_pv.partition_B(sVt))
-        idS = cute.make_identity_tensor((self.M, self.N))
-        idO = cute.make_identity_tensor((self.M, self.D))
-        acc_S = cute.make_rmem_tensor(thr_qk.partition_C(idS).shape[:3], self.acc_dtype)
-        acc_O = cute.make_rmem_tensor(thr_pv.partition_C(idO).shape[:3], self.acc_dtype)
-        coord_mn = qlu.reshape_acc_to_mn(thr_qk.partition_C(idS))
-        acc_mn = qlu.reshape_acc_to_mn(acc_S)
-        acc_O_mn = qlu.reshape_acc_to_mn(acc_O)
-        nrows = cutlass.const_expr(cute.size(acc_mn, mode=[0]))
-        nkb_qk = cutlass.const_expr(cute.size(tCrQ, mode=[2]))
-        row_max = cute.make_rmem_tensor(nrows, self.acc_dtype)
-        row_sum = cute.make_rmem_tensor(nrows, self.acc_dtype)
-        row_scale = cute.make_rmem_tensor(nrows, self.acc_dtype)
-        tOrP_v = qlu.reshape_acc_to_frgA(acc_S)
-        tOrP = cute.make_rmem_tensor_like(tOrP_v, self.dt)
-        nkb_pv = cutlass.const_expr(cute.size(tOrP, mode=[2]))
-
-        # O_proj consumer fragments (separate MMA; A K-major, Wo MN-major)
-        thr_op = mma_op.get_slice(lane)
-        tCrA = mma_op.make_fragment_A(thr_op.partition_A(sA))
-        sWot = qlu.transpose_view(sWo)
-        tCrWo = mma_op.make_fragment_B(thr_op.partition_B(sWot))
-        idC = cute.make_identity_tensor((self.M, N_TILE))
-        acc_C = cute.make_rmem_tensor(thr_op.partition_C(idC).shape[:3], self.acc_dtype)
-        coord_C = qlu.reshape_acc_to_mn(thr_op.partition_C(idC))
-        acc_C_mn = qlu.reshape_acc_to_mn(acc_C)
-        ncols_C = cutlass.const_expr(cute.size(acc_C_mn, mode=[1]))
-        nkb_op = cutlass.const_expr(cute.size(tCrA, mode=[2]))
 
         gsync(ctrl, C_GS_INIT, num_ctas, bidx, tidx)
         if cutlass.const_expr(tp_size > 1):
@@ -822,27 +658,19 @@ class FusedFaOprojAr:
                     k_start = mCuK[b]
                     q_len = mCuQ[b + cutlass.Int32(1)] - q_start
                     k_len = q_len
-                    q_tile_pk = q_start + mb * cutlass.Int32(128)
                     mask_q_off = mb * cutlass.Int32(128)
                     nblk = mb + cutlass.Int32(1)
 
-                    # cooperative packed Q load (zero-fill invalid rows), then publish
-                    zero = self.dt(0.0)
-                    for i in cutlass.range_constexpr(cdiv(MD, nthr)):
-                        idx = tidx + i * nthr
-                        if idx < MD:
-                            row = idx // Dc
-                            col = idx % Dc
-                            if (mask_q_off + row) < q_len:
-                                sQ[row, col, 0] = mQ[q_tile_pk + row, head, col]
-                            else:
-                                sQ[row, col, 0] = zero
-                    cute.arch.sync_threads()
-
+                    mQ_cur = cute.domain_offset((q_start, None, None), tQ)[None, None, head]
+                    gQ = cute.local_tile(mQ_cur, (self.M, self.D), (None, 0))
                     mK_cur = cute.domain_offset((k_start, None, None), mK)[None, None, head]
                     mV_cur = cute.domain_offset((k_start, None, None), mV)[None, None, head]
                     gK = cute.local_tile(mK_cur, (self.N, self.D), (None, 0))
                     gV = cute.local_tile(mV_cur, (self.N, self.D), (None, 0))
+                    tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(
+                        tma_q, 0, cute.make_layout(1),
+                        cute.group_modes(sQ, 0, cute.rank(sQ) - 1),
+                        cute.group_modes(gQ, 0, cute.rank(gQ) - 1))
                     tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
                         tma_k, 0, cute.make_layout(1),
                         cute.group_modes(sK, 0, cute.rank(sK) - 1),
@@ -854,6 +682,17 @@ class FusedFaOprojAr:
 
                     if wg_idx == 0:
                         if warp_idx == 0:
+                            # Q rides a 1-stage TMA (replaces the old cooperative load):
+                            # issue it once, before the K/V stream, so Q lands together
+                            # with the first K/V block. Padding rows (row >= q_len in the
+                            # causal last m-block) are NOT zero-filled -- attention is
+                            # row-independent and those rows are dropped at O store
+                            # (< q_len), so TMA OOB / next-seq bytes in them are harmless.
+                            pl_q.producer_acquire(fa_q_prod)
+                            cute.copy(tma_q, tQgQ[(None, mb)], tQsQ[(None, fa_q_prod.index)],
+                                      tma_bar_ptr=pl_q.producer_get_barrier(fa_q_prod))
+                            pl_q.producer_commit(fa_q_prod)
+                            fa_q_prod.advance()
                             for j in cutlass.range(nblk, unroll=1):
                                 pl_k.producer_acquire(fa_k_prod)
                                 cute.copy(tma_k, tKgK[(None, j)], tKsK[(None, fa_k_prod.index)],
@@ -867,7 +706,33 @@ class FusedFaOprojAr:
                                 fa_v_prod.advance()
 
                     if wg_idx >= 1:
+                        # FA-mode + consumer-role local rmem (设计稿 寄存器生命周期):
+                        # created here, after setmaxregister, dead when FA mode ends.
+                        thr_qk = mma_qk.get_slice(lane)
+                        thr_pv = mma_pv.get_slice(lane)
+                        tCrQ = mma_qk.make_fragment_A(thr_qk.partition_A(sQ))
+                        tCrK = mma_qk.make_fragment_B(thr_qk.partition_B(sK))
+                        sVt = qlu.transpose_view(sV)
+                        tCrV = mma_pv.make_fragment_B(thr_pv.partition_B(sVt))
+                        idS = cute.make_identity_tensor((self.M, self.N))
+                        idO = cute.make_identity_tensor((self.M, self.D))
+                        acc_S = cute.make_rmem_tensor(thr_qk.partition_C(idS).shape[:3], self.acc_dtype)
+                        acc_O = cute.make_rmem_tensor(thr_pv.partition_C(idO).shape[:3], self.acc_dtype)
+                        coord_mn = qlu.reshape_acc_to_mn(thr_qk.partition_C(idS))
+                        acc_mn = qlu.reshape_acc_to_mn(acc_S)
+                        acc_O_mn = qlu.reshape_acc_to_mn(acc_O)
+                        nrows = cutlass.const_expr(cute.size(acc_mn, mode=[0]))
+                        nkb_qk = cutlass.const_expr(cute.size(tCrQ, mode=[2]))
+                        row_max = cute.make_rmem_tensor(nrows, self.acc_dtype)
+                        row_sum = cute.make_rmem_tensor(nrows, self.acc_dtype)
+                        row_scale = cute.make_rmem_tensor(nrows, self.acc_dtype)
+                        tOrP_v = qlu.reshape_acc_to_frgA(acc_S)
+                        tOrP = cute.make_rmem_tensor_like(tOrP_v, self.dt)
+                        nkb_pv = cutlass.const_expr(cute.size(tOrP, mode=[2]))
+
                         acc_O.fill(0.0)
+                        # wait Q full (1-stage TMA) before any QK reads sQ
+                        pl_q.consumer_wait(fa_q_cons)
                         # Step A: block 0
                         pl_k.consumer_wait(fa_k_cons)
                         acc_S.fill(0.0)
@@ -912,6 +777,11 @@ class FusedFaOprojAr:
                                 acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
                             tOrP.store(qlu.reshape_acc_to_frgA(acc_S).load().to(self.dt))
 
+                        # Q dead: all QK issued+waited (Step A wait_group(0) for nblk==1,
+                        # else middle loop's last wait_group(0)). Release so the next
+                        # task's Q TMA can overwrite sQ.
+                        pl_q.consumer_release(fa_q_cons)
+                        fa_q_cons.advance()
                         # Step E: final PV
                         pl_v.consumer_wait(fa_v_cons)
                         mma_pv.set(warpgroup.Field.ACCUMULATE, True)
@@ -998,6 +868,20 @@ class FusedFaOprojAr:
                                     op_ab_prod.advance()
 
                     if wg_idx >= 1:
+                        # O_proj-mode + consumer-role local rmem (设计稿 寄存器生命周期):
+                        # separate MMA (A K-major, Wo MN-major); dead when O_proj ends.
+                        thr_op = mma_op.get_slice(lane)
+                        tCrA = mma_op.make_fragment_A(thr_op.partition_A(sA))
+                        sWot = qlu.transpose_view(sWo)
+                        tCrWo = mma_op.make_fragment_B(thr_op.partition_B(sWot))
+                        idC = cute.make_identity_tensor((self.M, N_TILE))
+                        acc_C = cute.make_rmem_tensor(thr_op.partition_C(idC).shape[:3], self.acc_dtype)
+                        coord_C = qlu.reshape_acc_to_mn(thr_op.partition_C(idC))
+                        acc_C_mn = qlu.reshape_acc_to_mn(acc_C)
+                        nrows = cutlass.const_expr(cute.size(acc_C_mn, mode=[0]))
+                        ncols_C = cutlass.const_expr(cute.size(acc_C_mn, mode=[1]))
+                        nkb_op = cutlass.const_expr(cute.size(tCrA, mode=[2]))
+
                         for sg in cutlass.range(valid_n_tiles, unroll=1):
                             out_n = base_out + sg
                             remn = cutlass.Int32(hidden) - out_n * cutlass.Int32(N_TILE)
