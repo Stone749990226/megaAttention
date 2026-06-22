@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
 """P3c benchmark: fused FA+O_proj+NVLS-AR (one persistent kernel) vs a non-fused
-baseline (per-batch SDPA + matmul O_proj + NCCL all_reduce), 8xH200.
+best-of-breed baseline (flash_attn_varlen + cuBLAS O_proj + NVLS multimem AllReduce),
+8xH200.
 
+    # 单 shape:
     torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py [--iters N --warmup W]
+    # 跑 README 全表并生成 Markdown+JSON:
+    torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --cases readme
 
-Honest first-version numbers: the fused do_ar is a correctness-first single-pass
-multimem reduce (no comm/compute overlap), so this mainly establishes the baseline
-and locates the bottleneck for later optimization.
+计时用 torch.profiler (kineto): 按 kernel 的 self device time 取纯 GPU 时间, CPU launch
+skew 不影响测量。baseline 的 FA / O_proj / AR 三段分别独立计时, 用来推导 overlap 理论值:
+    t_compute = t_fa + t_oproj          # 共享 tensor core, 串行相加
+    t_serial  = t_fa + t_oproj + t_ar   # 完全不重叠下界
+    t_ideal   = max(t_compute, t_ar)    # 完美重叠下界 (compute 与 NVLink 通信并行)
+    overlap%  = (t_serial - t_fused) / (t_serial - t_ideal)
+注意: 三段用的是外部 best-of-breed 实现 (官方 flash_attn + cuBLAS), 不是融合 kernel 内部
+的 FA/O_proj。所以 overlap% 是 "融合 vs 完美重叠的 best-of-breed", overlap%>100% 表示融合
+连完美重叠的最强基线都打赢; 在内部 FA 较慢的 shape 上 overlap% 可能偏低甚至为负, 这是该口径
+的定义, 不是 bug。
+
+吞吐列全部除以 t_fused (融合实测): compute 和 comm 共享同一段墙钟, 偏低是重叠在起作用的信号。
+    TFLOPS  = (fa_flops + oproj_flops) / t_fused
+    NVLink  = ar_bytes * 2(n-1)/n / t_fused   # bus BW, NCCL 惯例, 可对标 NVLink 峰值
+              (algorithm BW = ar_bytes / t_fused 进 JSON; NVLS multimem 物理约搬 2*bytes,
+               2(n-1)/n 是便于对标的约定而非物理线速)
 """
 import argparse
+import json
 import os
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torch.distributed._symmetric_memory as symm_mem
-from torch.nn.attention import SDPBackend, sdpa_kernel
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
@@ -24,38 +40,95 @@ from cutlass.cute.runtime import from_dlpack
 from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL
 from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts
 
-try:
-    from flash_attn import flash_attn_varlen_func
-    _HAS_FA = True
-except Exception:
-    flash_attn_varlen_func = None
-    _HAS_FA = False
+from flash_attn import flash_attn_varlen_func     # baseline FA: 官方包, 不接受 SDPA fallback
 
 DT = torch.bfloat16
 
+# H200 (SXM) 峰值, 仅用于 utilization 注释; 跑前用拓扑确认。
+H200_BF16_TFLOPS = 989.5          # dense bf16 tensor core
+H200_NVLINK_GBPS = 900.0          # NVLink4 单卡双向聚合
 
-def bench(body, iters, warmup, setup=None):
-    """Time `body` (GPU) per iter; `setup` (untimed) runs before each iter."""
+# profiler 里需要从 self device time 求和中排除的噪声 kernel (reset 的 nccl barrier、
+# 控制位清零的 fill、L2 flush 的 memset、rank 对齐的 _sleep spin 等)。真实算子
+# (FusedFaOprojAr / flash_fwd_kernel / nvjet gemm / multimem_all_reduce) 都不含这些子串。
+_NOISE = ("nccl", "fill", "elementwise", "memset", "memcpy", "copy_", "sleep", "spin")
+
+
+def _self_dev_us(e):
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        if hasattr(e, attr):
+            return float(getattr(e, attr))
+    return 0.0
+
+
+def bench_kineto(body, iters, warmup, barrier=False, align=False, flush_l2=True,
+                 dump=False, tag=""):
+    """用 kineto 测 `body` 的纯 GPU self device time (ms/iter)。
+
+    对窗口内所有非噪声 kernel 的 self device time 求和后除以 iters。对单 kernel, CPU launch
+    skew 不影响测量; 但持久 kernel 内部有跨 rank 自旋 barrier, launch skew 会变成被计入的
+    自旋时间, 故 align=True 时每次 launch 前用 `_sleep + barrier` 把各 rank 起点对齐
+    (MegaMoE 同款), 让 in-kernel barrier 不空转。
+    """
+    flush = torch.empty(int(8e9 // 4), dtype=torch.int, device="cuda") if flush_l2 else None
+
+    def _pre():
+        if flush is not None: flush.zero_()
+        if align:
+            torch.cuda._sleep(int(2e7))   # ~10ms GPU 延迟, 抵消 barrier 释放后的启动抖动
+            dist.barrier()
+        elif barrier:
+            dist.barrier()
+
     for _ in range(warmup):
-        if setup: setup()
-        body()
-    torch.cuda.synchronize(); dist.barrier()
-    total = 0.0
-    ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    for _ in range(iters):
-        if setup: setup()
-        ev0.record(); body(); ev1.record(); torch.cuda.synchronize()
-        total += ev0.elapsed_time(ev1)
-    return total / iters     # ms/iter
+        _pre(); body()
+    torch.cuda.synchronize()
+    if barrier or align: dist.barrier()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            _pre(); body()
+        torch.cuda.synchronize()
+    evts = prof.key_averages()
+    if dump and dist.get_rank() == 0:
+        print(f"\n----- kineto dump [{tag}] -----", flush=True)
+        print(prof.key_averages().table(sort_by="self_cuda_time_total",
+                                         max_name_column_width=80, row_limit=10), flush=True)
+    total_us = sum(_self_dev_us(e) for e in evts
+                   if not any(n in e.key.lower() for n in _NOISE))
+    return total_us / iters / 1e3     # ms/iter
+
+
+# ── theoretical FLOP / byte counts (per rank) ────────────────────────────────
+def fa_flops(seqlens, H_local, D):
+    """causal full-prefill (q==k): per seq per head = 2*M*avg*(d+dv), avg=M/2, dv=d=D."""
+    return float(sum(H_local * 2 * s * (s / 2) * (2 * D) for s in seqlens))
+
+
+def oproj_flops(tot, K_local, hidden):
+    return float(2 * tot * K_local * hidden)
+
+
+def ar_bytes(tot, hidden, dtype_bytes=2):
+    return float(tot * hidden * dtype_bytes)
+
+
+def _tok(n):
+    return f"{n/1024:.1f}K".replace(".0K", "K") if n >= 1024 else str(n)
+
+
+def shape_label(seqlens, H_local, hidden):
+    if len(seqlens) == 1:
+        body = f"[{_tok(seqlens[0])}]"
+    elif len(set(seqlens)) == 1:
+        body = f"[{_tok(seqlens[0])}]x{len(seqlens)}"
+    else:                                    # 混合长尾 varlen: 紧凑摘要, 完整 seqlens 进 JSON
+        body = f"varlen(B={len(seqlens)},tot={_tok(sum(seqlens))},max={_tok(max(seqlens))})"
+    return f"{body} H{H_local} hid{hidden}"
 
 
 def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
-              ws, rank, dev, iters, warmup):
-    """Build buffers, compile fused kernel, time fused and baseline, return dict.
-
-    Returns: {"fused_ms": float, "base_ms": float, "ratio": float}
-    ratio = base_ms / fused_ms  (>1 means fused is faster).
-    """
+              ws, rank, dev, iters, warmup, dump=False):
+    """Build buffers, compile fused kernel, time fused + 3 baseline segments, return row dict."""
     gname = dist.group.WORLD.group_name
 
     D, N_TILE = 128, 128
@@ -114,8 +187,6 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     compiled = cute.compile(ker, *cts, st)
 
     def reset_fused():
-        # per-iter control state must be re-zeroed (counters/queue/bitsets/nvl signal);
-        # sync + cross-rank barrier so the monotonic nvl_barrier sees clean slots.
         for t in (ctrl, head_ready, oproj_queue, rco, fa_exec, oproj_exec, ar_exec,
                   partial_check):
             t.zero_()
@@ -123,34 +194,28 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
         torch.cuda.synchronize(); dist.barrier()
 
     def run_fused():
-        compiled(*cts, st)
+        reset_fused(); compiled(*cts, st)
 
     # ---- best-of-breed non-fused baseline: FlashAttention + GEMM + NVLS AllReduce ----
-    # FA: flash_attn_varlen_func (official pkg) if available, else SDPA forced to the
-    #     FlashAttention backend. O_proj: cuBLAS matmul. AR: NVLS multimem_all_reduce_
-    #     (real NVLS over a symmetric buffer, not NCCL).
     Y_sym = symm_mem.empty(tot, hidden, device=dev, dtype=DT)
     symm_mem.rendezvous(Y_sym, gname)
     cu = cu_q.to(torch.int32); max_s = max(seqlens)
+    O_buf = torch.empty(tot, H_local, D, device=dev, dtype=DT)
+
+    def run_fa():
+        nonlocal O_buf
+        O_buf = flash_attn_varlen_func(Q, K, V, cu, cu, max_s, max_s, causal=True)
+
+    def run_oproj():
+        torch.matmul(O_buf.reshape(tot, K_local), W_o, out=Y_sym)
+
+    def run_ar():
+        torch.ops.symm_mem.multimem_all_reduce_(Y_sym, "sum", gname)
 
     def run_baseline():
-        if _HAS_FA:
-            O = flash_attn_varlen_func(Q, K, V, cu, cu, max_s, max_s, causal=True)  # [tot,H,D]
-        else:
-            O = torch.empty(tot, H_local, D, device=dev, dtype=DT)
-            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                for b in range(meta.num_batch):
-                    s = int(meta.cu_seqlens_q[b]); e = int(meta.cu_seqlens_q[b + 1])
-                    o = F.scaled_dot_product_attention(
-                        Q[s:e].transpose(0, 1).unsqueeze(0), K[s:e].transpose(0, 1).unsqueeze(0),
-                        V[s:e].transpose(0, 1).unsqueeze(0), is_causal=True)
-                    O[s:e] = o.squeeze(0).transpose(0, 1)
-        torch.matmul(O.reshape(tot, K_local), W_o, out=Y_sym)
-        torch.ops.symm_mem.multimem_all_reduce_(Y_sym, "sum", gname)
-        return Y_sym
+        run_fa(); run_oproj(); run_ar(); return Y_sym
 
-    # ---- correctness cross-check: fused C_sym vs baseline (FA+GEMM+NVLS), both paths
-    #      independent; agreement within bf16 tol confirms the fused result is correct ----
+    # ---- correctness cross-check: fused C_sym vs baseline ----
     reset_fused(); run_fused(); torch.cuda.synchronize(); dist.barrier()
     Cf = C_sym.float().cpu()
     Yb = run_baseline().float().cpu(); torch.cuda.synchronize(); dist.barrier()
@@ -164,17 +229,83 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
             ref_max = max(ref_max, gb.abs().max().item())
     err_rel = err_abs / max(ref_max, 1e-6)
 
-    t_fused = bench(run_fused, iters, warmup, setup=reset_fused)
-    t_base = bench(run_baseline, iters, warmup)
+    # ---- timing (kineto) ----
+    t_fused = bench_kineto(run_fused, iters, warmup, align=True, dump=dump, tag="fused")
+    t_fa = bench_kineto(run_fa, iters, warmup, dump=dump, tag="fa")
+    run_fa()  # ensure O_buf valid for oproj timing
+    t_oproj = bench_kineto(run_oproj, iters, warmup, dump=dump, tag="oproj")
+    t_ar = bench_kineto(run_ar, iters, warmup, align=True, dump=dump, tag="ar")
+    t_base = t_fa + t_oproj + t_ar
 
+    # ---- derived metrics ----
+    t_compute = t_fa + t_oproj
+    t_ideal = max(t_compute, t_ar)
+    denom = t_base - t_ideal
+    overlap_pct = (t_base - t_fused) / denom * 100.0 if denom > 1e-9 else float("nan")
+
+    flop = fa_flops(seqlens, H_local, D) + oproj_flops(tot, K_local, hidden)
+    tflops = flop / 1e12 / (t_fused / 1e3)
+    s_bytes = ar_bytes(tot, hidden)
+    bus_factor = 2.0 * (ws - 1) / ws
+    nvl_busbw = s_bytes * bus_factor / 1e9 / (t_fused / 1e3)
+    nvl_algbw = s_bytes / 1e9 / (t_fused / 1e3)
+
+    row = dict(
+        shape=shape_label(seqlens, H_local, hidden), seqlens=seqlens, H_local=H_local,
+        hidden=hidden, tp=ws, tot=tot,
+        fused_ms=t_fused, t_fa=t_fa, t_oproj=t_oproj, t_ar=t_ar,
+        serial_ms=t_base, ideal_ms=t_ideal, overlap_pct=overlap_pct,
+        tflops=tflops, tflops_pct=tflops / H200_BF16_TFLOPS * 100.0,
+        nvl_busbw=nvl_busbw, nvl_algbw=nvl_algbw,
+        nvl_busbw_pct=nvl_busbw / H200_NVLINK_GBPS * 100.0,
+        ratio=t_base / t_fused, err_rel=err_rel,
+        w=(w_fa, w_oproj, w_ar), sg=sg,
+    )
     if rank == 0:
-        fa_name = "flash_attn_varlen" if _HAS_FA else "SDPA-FLASH"
-        ok = "OK" if err_rel < 0.05 else "MISMATCH"
-        print(f"[bench] fused={t_fused:.4f} ms  baseline({fa_name}+GEMM+NVLS-AR)={t_base:.4f} ms  "
-              f"ratio={t_base / t_fused:.3f}x  err_abs={err_abs:.3g} err_rel={err_rel:.3g} "
-              f"[{ok} vs baseline]", flush=True)
+        print(f"[bench] {row['shape']:28s} fused={t_fused:.3f} fa={t_fa:.3f} "
+              f"oproj={t_oproj:.3f} ar={t_ar:.3f} serial={t_base:.3f} ideal={t_ideal:.3f} "
+              f"overlap={overlap_pct:5.0f}% {tflops:4.0f}TF NVL={nvl_busbw:4.0f}GB/s "
+              f"ratio={row['ratio']:.2f}x err_rel={err_rel:.1e}", flush=True)
+    return row
 
-    return dict(fused_ms=t_fused, base_ms=t_base, ratio=t_base / t_fused)
+
+def print_table(rows):
+    cols = ["shape", "tp", "fused", "FA", "O_proj", "AR", "serial", "ideal",
+            "overlap%", "TFLOPS", "NVLink", "ratio", "err_rel"]
+    print("\n| " + " | ".join(cols) + " |")
+    print("| " + " | ".join("---" for _ in cols) + " |")
+    for r in rows:
+        print(f"| {r['shape']} | {r['tp']} | {r['fused_ms']:.3f} | {r['t_fa']:.3f} | "
+              f"{r['t_oproj']:.3f} | {r['t_ar']:.3f} | {r['serial_ms']:.3f} | "
+              f"{r['ideal_ms']:.3f} | {r['overlap_pct']:.0f}% | "
+              f"{r['tflops']:.0f} ({r['tflops_pct']:.0f}%) | "
+              f"{r['nvl_busbw']:.0f} ({r['nvl_busbw_pct']:.0f}%) | "
+              f"{r['ratio']:.2f}x | {r['err_rel']:.1e} |")
+    print("\n说明: 时间单位 ms (kineto self device time)。TFLOPS/NVLink 均除以 t_fused;"
+          " NVLink 为 bus BW=2(n-1)/n 口径 (algorithm BW 见 JSON)。"
+          " overlap% = (serial-fused)/(serial-ideal), 基于外部 best-of-breed 分段, "
+          ">100% 表示融合优于完美重叠的最强基线。", flush=True)
+
+
+# 真实大模型 (8 卡 TP, 按 head 切分, head_dim=128) 锚定的 cases。
+# 当前 kernel 为 MHA: K/V 与 Q head 1:1 (fused_fa_oproj_ar.py:653-667), 不支持 GQA。
+# 故 K/V 用 H_local 个头作 MHA 代理 —— prefill FA compute FLOP 与 GQA 等价, 仅 KV HBM 偏多。
+# 每个模型 3 个场景: 中等单序列 / 长单序列 / 混合长尾 varlen。
+_MIX = [14336, 6144, 3072, 1536, 1024, 768, 512, 256]    # ~27.6K tokens, 长尾混合长度
+README_CASES = [
+    # Qwen3-235B: q64 / kv4, hidden 4096 -> TP8 H_local=8
+    ([8192], 8, 4096),
+    ([32768], 8, 4096),
+    (_MIX, 8, 4096),
+    # GLM-4.5: q96 / kv8, hidden 5120 -> TP8 H_local=12
+    ([8192], 12, 5120),
+    ([32768], 12, 5120),
+    (_MIX, 12, 5120),
+    # Llama-3.1-405B: q128 / kv8, hidden 16384 -> TP8 H_local=16
+    ([8192], 16, 16384),
+    ([32768], 16, 16384),
+    (_MIX, 16, 16384),
+]
 
 
 def main():
@@ -190,6 +321,11 @@ def main():
     ap.add_argument("--sg", type=int, default=4)
     ap.add_argument("--auto", action="store_true",
                     help="用 choose_launch_config 自动选 (w_fa,w_oproj,w_ar,sg)")
+    ap.add_argument("--cases", type=str, default="",
+                    help="'readme' 跑内置全表; 留空跑单 --seqlens")
+    ap.add_argument("--json", type=str, default="", help="把行结果写入该 JSON 路径")
+    ap.add_argument("--dump-kernels", action="store_true",
+                    help="打印每段 profiler kernel 表 (校验名字匹配)")
     args = ap.parse_args()
 
     lr = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(lr)
@@ -199,32 +335,31 @@ def main():
     gname = dist.group.WORLD.group_name
     symm_mem.enable_symm_mem_for_group(gname)
 
-    seqlens = [int(x) for x in args.seqlens.split(",")]
-    H_local, hidden = args.h_local, args.hidden
-
-    meta = build_row_desc(seqlens)
-    if args.auto:
-        from mega_attention.metadata.launch_heuristic import choose_launch_config
-        cfg = choose_launch_config(meta, hidden, tp_size=ws)
-        w_fa, w_oproj, w_ar, sg = cfg.w_fa, cfg.w_oproj, cfg.w_ar, cfg.sg
+    if args.cases == "readme":
+        cases = README_CASES
     else:
-        w_fa, w_oproj, w_ar, sg = args.w_fa, args.w_oproj, args.w_ar, args.sg
+        cases = [([int(x) for x in args.seqlens.split(",")], args.h_local, args.hidden)]
+
+    rows = []
+    for seqlens, H_local, hidden in cases:
+        meta = build_row_desc(seqlens)
+        if args.auto:
+            from mega_attention.metadata.launch_heuristic import choose_launch_config
+            cfg = choose_launch_config(meta, hidden, tp_size=ws)
+            w_fa, w_oproj, w_ar, sg = cfg.w_fa, cfg.w_oproj, cfg.w_ar, cfg.sg
+        else:
+            w_fa, w_oproj, w_ar, sg = args.w_fa, args.w_oproj, args.w_ar, args.sg
+        row = bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
+                        ws, rank, dev, args.iters, args.warmup, dump=args.dump_kernels)
+        rows.append(row)
+        dist.barrier()
 
     if rank == 0:
-        R = meta.num_row_tiles
-        N_TILE = 128
-        num_out, num_super_groups, total_oproj = oproj_task_counts(R, hidden, N_TILE, sg)
-        tot = int(sum(seqlens))
-        num_fa = R * H_local
-        print(f"[bench] seqlens={seqlens} tot={tot} H_local={H_local} hidden={hidden} "
-              f"R={R} num_fa={num_fa} total_oproj={total_oproj} ws={ws}", flush=True)
-
-    res = bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
-                    ws, rank, dev, args.iters, args.warmup)
-    if rank == 0:
-        print(f"[fused] w=({w_fa},{w_oproj},{w_ar}) sg={sg} "
-              f"fused={res['fused_ms']:.3f}ms base={res['base_ms']:.3f}ms "
-              f"ratio={res['ratio']:.2f}x", flush=True)
+        print_table(rows)
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump(rows, f, indent=2)
+            print(f"\n[json] wrote {len(rows)} rows -> {args.json}", flush=True)
 
     dist.barrier(); dist.destroy_process_group()
 
