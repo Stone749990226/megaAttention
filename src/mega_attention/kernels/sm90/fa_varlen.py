@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-Dynamic (runtime-varlen) FA tile kernel (Hopper SM90, CuTe DSL).
+Intermediate dynamic-varlen FA tile kernels for Hopper SM90 CuTe DSL.
 
-This is the FA payload for the FUSED persistent kernel: ONE compiled kernel must
-handle tiles of DIFFERENT runtime shape (causal_varlen_prefill..._plan_zh.md
-"Runtime task descriptor 与动态 varlen payload"). vs the compile-time FaWsAttnKV
-microkernel (Step 3), here q_start / valid_m / k_len / nblk are RUNTIME values
-read in-kernel from a params tensor; the KV-block loop uses cutlass.range (NOT
-range_constexpr); the causal + k_len masks are fully runtime.
+This file is not the core fused kernel. It de-risks the FA payload shape used by
+fused_fa_oproj_ar.py: one compiled kernel must handle row tiles with runtime
+q_start, valid_m, k_len, and nblk. The KV block loop therefore uses cutlass.range
+instead of range_constexpr, and causal/tail predicates are runtime values.
 
 Compile-time (kernel variant): M=128, N=D=128, kv_stages=2, causal prompt prefill.
 Runtime (per task, from `params` int32 tensor): [q_start, valid_m, k_len, nblk].
 
-Addressing for THIS standalone de-risk step matches FaWsAttnKV's validated test:
-contiguous per-(tile,head) Q[M,D] / K,V[Lk,D] for one head; q_start is the tile's
-global Q-row offset (for causal q_pos), k positions are 0..k_len-1. The packed
-multi-sequence domain_offset addressing is added when fusing into the dispatch.
+FaWsAttnDyn uses a compact single-head addressing model. FaWsAttnPacked adds the
+packed varlen Q/K/V addressing needed by the fused kernel, while still launching
+one FA task per kernel for local validation.
 
-Structure mirrors FaWsAttnKV exactly (3WG, (2,1,1) MMA, separate K/V 2-stage
-PipelineTmaAsync with consumer group=#warps, intra-wg QK(cur)/PV(prev) overlap),
-only the loop bounds + mask predicates become runtime.
+Agent note: keep persistent scheduling, O_scratch -> O_proj readiness, and AR
+owner protocol comments in fused_fa_oproj_ar.py. Comments here should describe
+only the standalone FA payload mechanics.
 """
 import cuda.bindings.driver as cuda
 
@@ -43,11 +40,12 @@ def softmax_block_dyn(acc_mn: cute.Tensor, row_max: cute.Tensor, row_sum: cute.T
                       row_scale: cute.Tensor, nrows: cutlass.Constexpr,
                       slog2: cutlass.Constexpr, is_first: cutlass.Constexpr,
                       coord_mn: cute.Tensor, n_block, q_start, k_len):
-    """Online-softmax step with RUNTIME causal + k_len masking (q_len==k_len prompt).
+    """Online-softmax step with runtime causal and k_len masking.
 
-    is_first is COMPILE-TIME (Step A vs middle); n_block / q_start / k_len are
-    RUNTIME. Every (row, col): valid iff kv_pos <= q_pos AND kv_pos < k_len.
-    row_sum keeps LOCAL per-thread partial sums; quad reduction deferred to finalize.
+    is_first remains compile-time for the prologue/middle split. n_block, q_start,
+    and k_len are runtime. A score is valid only when kv_pos <= q_pos and
+    kv_pos < k_len. row_sum stores local per-thread partial sums; the warp-quad
+    reduction is deferred to finalization.
     """
     for r in cutlass.range_constexpr(nrows):
         coord_row = coord_mn[r, None]
@@ -77,9 +75,12 @@ def softmax_block_dyn(acc_mn: cute.Tensor, row_max: cute.Tensor, row_sum: cute.T
 
 
 class FaWsAttnDyn:
-    """Runtime-varlen FA tile. Same warp-spec/pipeline as FaWsAttnKV; q_start /
-    valid_m / k_len / nblk are read from `params` at runtime so ONE compiled
-    kernel serves all shapes. Lk is the max allocated KV length (compile-time)."""
+    """Runtime-varlen FA payload prototype with compact single-head addressing.
+
+    q_start, valid_m, k_len, and nblk are read from `params` at runtime so one
+    compiled kernel can serve multiple tile shapes. Lk_max is only the allocation
+    envelope for this standalone validation path.
+    """
 
     def __init__(self, M, N, D, Lk_max, softmax_scale=None, acc_dtype=cutlass.Float32,
                  kv_stages=2):
@@ -153,7 +154,7 @@ class FaWsAttnDyn:
         nthr = cutlass.const_expr(self.threads)
         MD = cutlass.const_expr(self.M * self.D)
 
-        # ---- runtime task descriptor ----
+        # Runtime task descriptor for this standalone FA task.
         q_start = mParams[0]
         valid_m = mParams[1]
         k_len = mParams[2]
@@ -195,7 +196,7 @@ class FaWsAttnDyn:
         tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
             tma_v, 0, cute.make_layout(1), cute.group_modes(sV, 0, 2), cute.group_modes(gV, 0, 2))
 
-        # ---- WG0: producer (dynamic nblk) ----
+        # WG0 producer: dynamic nblk K/V stream.
         if wg_idx == 0:
             cute.arch.setmaxregister_decrease(40)
             if warp_idx == 0:
@@ -213,7 +214,7 @@ class FaWsAttnDyn:
                     kp.advance()
                     vp.advance()
 
-        # ---- WG1/WG2: consumers (dynamic nblk; intra-wg QK(cur)/PV(prev) overlap) ----
+        # WG1/WG2 consumers: dynamic nblk with QK(current)/PV(previous) overlap.
         if wg_idx >= 1:
             cute.arch.setmaxregister_increase(232)
             lane = tidx - self.num_dma_threads
@@ -245,7 +246,7 @@ class FaWsAttnDyn:
             tOrP = cute.make_rmem_tensor_like(tOrP_v, self.dt)
             nkb_pv = cutlass.const_expr(cute.size(tOrP, mode=[2]))
 
-            # Step A: block 0 — QK + softmax only
+            # First block initializes the online-softmax state.
             pl_k.consumer_wait(sr)
             acc_S.fill(0.0)
             mma_qk.set(warpgroup.Field.ACCUMULATE, True)
@@ -260,7 +261,7 @@ class FaWsAttnDyn:
                               True, coord_mn, cutlass.Int32(0), q_start, k_len)
             tOrP.store(tOrP_v.load().to(self.dt))
 
-            # Middle: current=j overlaps PV(previous=j-1), j = 1..nblk-1 (runtime)
+            # Middle blocks overlap QK(current) with PV(previous).
             for j in cutlass.range(1, nblk, unroll=1):
                 srv = sr.clone()
                 sr.advance()
@@ -288,7 +289,7 @@ class FaWsAttnDyn:
                     acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
                 tOrP.store(qlu.reshape_acc_to_frgA(acc_S).load().to(self.dt))
 
-            # Step E: final PV (previous = last processed block)
+            # Final PV consumes the last softmax block.
             srv = sr.clone()
             pl_v.consumer_wait(srv)
             mma_pv.set(warpgroup.Field.ACCUMULATE, True)
@@ -300,11 +301,11 @@ class FaWsAttnDyn:
             cute.nvgpu.warpgroup.wait_group(0)
             pl_v.consumer_release(srv)
 
-            # finalize: quad-reduce row_sum, divide; mask invalid rows
+            # Finalize: warp-quad reduce row_sum, divide, and mask invalid rows.
             for r in cutlass.range_constexpr(nrows):
-                # warp_reduction_sum is a warp-collective shuffle (full-warp mask):
-                # call it UNCONDITIONALLY (uniform across the warp). Guarding it behind
-                # valid_m diverges the warp when valid_m % 8 != 0 -> shuffle deadlock.
+                # Hazard: warp_reduction_sum is a warp-collective shuffle. Call it
+                # unconditionally; guarding it with valid_m can diverge a partial row
+                # tile and hang the CTA.
                 s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
                 if coord_mn[r, 0][0] < valid_m:
                     inv = cutlass.Float32(1.0) / s
@@ -315,15 +316,12 @@ class FaWsAttnDyn:
 
 
 class FaWsAttnPacked:
-    """Fused-kernel FA payload, standalone-testable. Reads packed varlen Q/K/V
-    [tot, H, D] at RUNTIME (fa_row_tile, head) decoded from cu_seqlens + fa_row_desc,
-    runs dynamic causal FA, writes O_scratch[fa_row_tile, :, head, :].
+    """Packed-varlen FA payload validation kernel.
 
-    Same 3WG / (2,1,1) / separate-K/V-pipeline / intra-wg-overlap structure as
-    FaWsAttnDyn; adds FA4-style packed-varlen TMA addressing (atom over the full
-    packed tensor; in-kernel cute.domain_offset by cu_seqlens[batch] + head slice).
-    Grid [1,1,1], one task per launch; ONE compiled kernel serves all tasks
-    (task id read from mTask[0] at runtime).
+    Reads packed varlen Q/K/V [tot, H, D], decodes (fa_row_tile, head) from the
+    runtime task id and row descriptor, runs dynamic causal FA, and writes
+    O_scratch[fa_row_tile, :, head, :]. It validates the payload addressing used by
+    fused_fa_oproj_ar.py but does not contain the persistent scheduler.
     """
 
     def __init__(self, M, N, D, H_local, softmax_scale=None,
@@ -361,19 +359,14 @@ class FaWsAttnPacked:
         sV_l = self._smem(dt, self.N, self.D, self.kv_stages)
 
         op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
-        # FA4 SM90 recipe (flash_fwd_sm90.py): logical view [tot,H,D] -> [tot,D,H]
-        # (head LAST) so the rank-2 TMA tiler (N, D) maps onto (token, D) only; head
-        # is mode 2 and is NOT in the TMA box (sliced at runtime in-kernel). This is a
-        # view transform (no physical transpose).
+        # Packed-varlen TMA invariant: use a head-last [tot, D, H] view so the
+        # rank-2 TMA box covers only (token, D). Head is sliced at runtime and is not
+        # part of the TMA tile.
         mK_v = qlu.select(mK, [0, 2, 1])
         mV_v = qlu.select(mV, [0, 2, 1])
-        # FA4 flash_fwd_sm90.py:288 — build the atom over the FULL 3D [tot,D,H] view.
-        # The rank-2 tiler (N, D) maps onto modes 0,1 = (token, D); head (mode 2) is a
-        # non-box iteration mode (sliced into the base pointer at runtime in-kernel).
-        # make_tiled_tma_atom returns (atom, tma_tensor). The tma_tensor carries the
-        # BASIS strides that the atom's gbasis references; the gmem partition MUST use
-        # it (tK/tV), NOT the original concrete-strided view (FA4 flash_fwd_sm90.py:359
-        # passes tma_tensor_K, not mK).
+        # TMA tensor contract: make_tiled_tma_atom returns a basis-strided tensor that
+        # must be used for gmem partitioning. Do not partition the original concrete
+        # view after building the atom.
         tma_k, tK = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op, mK_v, cute.select(sK_l, mode=[0, 1]), (self.N, self.D), num_multicast=1)
         tma_v, tV = cute.nvgpu.cpasync.make_tiled_tma_atom(
@@ -416,7 +409,7 @@ class FaWsAttnPacked:
         nthr = cutlass.const_expr(self.threads)
         MD = cutlass.const_expr(self.M * self.D)
 
-        # ---- runtime task descriptor (each WG decodes from mTask) ----
+        # Runtime FA task descriptor. Each WG decodes the same mTask value locally.
         tid = mTask[0]
         ft = tid // cutlass.Int32(H_local)
         head = tid % cutlass.Int32(H_local)
@@ -425,10 +418,10 @@ class FaWsAttnPacked:
         q_start = mCuQ[b]
         k_start = mCuK[b]
         q_len = mCuQ[b + cutlass.Int32(1)] - q_start
-        k_len = q_len                                   # complete prompt prefill
+        k_len = q_len                                   # full-prompt prefill invariant
         q_tile_pk = q_start + mb * cutlass.Int32(128)   # packed Q-row offset
         mask_q_off = mb * cutlass.Int32(128)            # seq-local q tile offset
-        nblk = mb + cutlass.Int32(1)                    # causal: tile mb sees blocks 0..mb
+        nblk = mb + cutlass.Int32(1)                    # causal prompt: blocks 0..mb
 
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_k)
@@ -443,7 +436,7 @@ class FaWsAttnPacked:
         sK = st.sK.get_tensor(sK_l.outer, swizzle=sK_l.inner)
         sV = st.sV.get_tensor(sV_l.outer, swizzle=sV_l.inner)
 
-        # cooperative packed Q load (zero-fill invalid rows to avoid OOB / garbage)
+        # Standalone packed path zero-fills invalid Q rows before the FA payload.
         zero = self.dt(0.0)
         for i in cutlass.range_constexpr(cdiv(MD, nthr)):
             idx = tidx + i * nthr
@@ -466,11 +459,8 @@ class FaWsAttnPacked:
             barrier_storage=st.mbar_v.data_ptr(), num_stages=self.kv_stages,
             producer_group=prodv, consumer_group=consv, tx_count=tx_v)
 
-        # FA4 packed-varlen addressing: offset the packed tensor by the batch's
-        # token start, slice the (runtime) head, then tile by (N, D).
-        # FA4 recipe: mK/mV are the [tot,D,H] views. Offset token (mode0), slice the
-        # runtime head (mode2) -> [tot, D], then tile (token->N blocks, D fixed at tile 0).
-        # Box covers (token, D) only; head is already sliced out.
+        # Packed-varlen addressing: offset by the sequence token start, slice the
+        # runtime head, then tile the resulting [tokens, D] view by (N, D).
         mK_cur = cute.domain_offset((k_start, None, None), mK)[None, None, head]   # [tot, D]
         mV_cur = cute.domain_offset((k_start, None, None), mV)[None, None, head]
         gK = cute.local_tile(mK_cur, (self.N, self.D), (None, 0))      # [N, D, n_tblk]
@@ -482,7 +472,7 @@ class FaWsAttnPacked:
             tma_v, 0, cute.make_layout(1),
             cute.group_modes(sV, 0, cute.rank(sV) - 1), cute.group_modes(gV, 0, cute.rank(gV) - 1))
 
-        # ---- WG0: producer (dynamic nblk) ----
+        # WG0 producer: dynamic nblk K/V stream.
         if wg_idx == 0:
             cute.arch.setmaxregister_decrease(40)
             if warp_idx == 0:
@@ -500,7 +490,7 @@ class FaWsAttnPacked:
                     kp.advance()
                     vp.advance()
 
-        # ---- WG1/WG2: consumers (dynamic nblk; intra-wg QK(cur)/PV(prev) overlap) ----
+        # WG1/WG2 consumers: dynamic nblk with QK(current)/PV(previous) overlap.
         if wg_idx >= 1:
             cute.arch.setmaxregister_increase(232)
             lane = tidx - self.num_dma_threads

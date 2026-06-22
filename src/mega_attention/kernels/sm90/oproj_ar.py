@@ -10,38 +10,33 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 
 """
-Fused row-parallel O_proj GEMM + intra-node NVLS Reduce-Scatter + AllGather
-(LDMCxSTMC) for SM90 / Hopper (CuTe DSL). See gemm_allreduce.md / plan.md.
+Intermediate standalone O_proj GEMM + NVLS AllReduce kernel for SM90 / Hopper.
+
+This file is not the core fused FA -> O_proj -> AR kernel. It validates the
+O_proj + symmetric-memory NVLS mechanics that are later integrated into
+fused_fa_oproj_ar.py.
 
     O_local [M,K] @ W_o [K,N] -> partial [M,N]   (per-rank, k-major A / k-major B)
-    out = sum_{r=0..W-1} partial                 (NVLS RS+AG; result written in place
-                                                  into the symmetric buffer C, every rank
-                                                  ends up with the full [M,N] result)
+    C = sum_{r=0..W-1} partial                    (NVLS multimem reduce/store in place)
 
-One persistent warp-specialized kernel: a DMA warp group feeds WGMMA, the MMA warp group(s)
-produce each tile's partial and TMA-store it into a *symmetric* buffer C, and a dedicated
-comm warp group walks the identical tile schedule. Once all ranks have written a tile
-(per-tile cross-rank flag), rank r reduces only its own M-shard (BLOCK_M/W rows) of the
-tile: `multimem.ld_reduce` over the multicast view C_mc gathers+sums all ranks' shard rows
-in the NVSwitch, then `multimem.st` on the *same* C_mc pointer broadcasts the sum back into
-every rank's C (in place -> no separate `out` buffer). A single per-SM sys-scope completion
-barrier at kernel exit guarantees all ranks' stores have landed before C is read. The comm
-of tile t overlaps the GEMM of later tiles. Derived from CUTLASS's
-hopper/dense_gemm_persistent.py; the RS+AG epilogue follows the SM100 LDMCxSTMC reference.
+One persistent warp-specialized kernel feeds WGMMA from a DMA warp group, writes
+per-rank partials into a symmetric buffer, and uses a comm warp group to perform
+the multicast-view reduce/store. The fused_fa_oproj_ar.py path uses a different
+task identity and owner-readiness protocol; do not treat this standalone scheduler
+as the source of truth for the final fused kernel.
 """
 
 
 class OProjARFusedKernelSM90:
-    """Fused O_proj GEMM + one-shot NVLS multimem AllReduce (bf16 in / fp32 acc, SM90).
+    """Standalone O_proj GEMM + one-shot NVLS multimem AllReduce.
 
     :param acc_dtype: WGMMA accumulator dtype (Float32).
     :param tile_shape_mn: CTA output tile (M,N); M in {64,128}, N in {64,128,256}, K is 64.
-    :param cluster_shape_mn: cluster dims (kept (1,1) for this fused design).
+    :param cluster_shape_mn: cluster dims (kept (1,1) here).
     :param swizzle_size / raster_along_m: persistent-scheduler L2 locality knobs.
 
-    Call (see benchmarks/bench_oproj_ar.py): builds TMA atoms + the multicast C/flag views from raw symmetric
-    -memory multicast pointers, then launches one kernel that produces partials into the
-    symmetric C and reduces them in place via NVLS RS+AG (result ends up in C).
+    The caller builds TMA atoms plus multicast C/flag views from raw symmetric-memory
+    pointers, then launches this standalone validation kernel.
     """
 
     def __init__(
@@ -89,16 +84,14 @@ class OProjARFusedKernelSM90:
         self.tiled_mma = None
 
         self.occupancy = 1
-        # MegaAttn: cross-rank AllReduce handshake granularity. Each SM does ONE
-        # flag bump + spin per batch of `comm_batch_tiles` (G) tiles (in its
-        # persistent execution order) instead of one per tile, cutting cross-rank
-        # NVLink round-trips ~G x (plan: per-tile -> per-batch). G=1 reproduces
-        # the per-tile behaviour (numerical regression baseline).
+        # Standalone AR handshake granularity. Each SM does one flag bump + spin per
+        # batch of comm_batch_tiles in its persistent execution order. G=1 reproduces
+        # the per-tile baseline.
         self.comm_batch_tiles = comm_batch_tiles
         self.num_dma_warp_groups = 1
         self.num_mma_warp_groups = math.prod(self.atom_layout_mnk)
-        # MegaAttn: one extra warp group does the NVLS RS+AG (LDMCxSTMC) AllReduce,
-        # overlapping the AR of tile t with the GEMM of tile t+1 (plan section 2/6).
+        # One extra warp group performs NVLS multimem reduce/store, overlapping the
+        # communication of one tile with GEMM work on later tiles.
         self.num_comm_warp_groups = 1
         self.num_warps_per_warp_group = 4
         self.num_threads_per_warp_group = self.num_warps_per_warp_group * 32
@@ -135,8 +128,8 @@ class OProjARFusedKernelSM90:
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.num_mma_threads
         )
-        # MegaAttn: comm-group-only barrier (thread 0 does the cross-rank wait,
-        # the rest of the comm warp group waits on it before reading C_mc).
+        # Comm-group-only barrier: one thread performs the cross-rank wait, then the
+        # rest of the comm warp group can read the multicast C view.
         self.num_comm_threads = (
             self.num_comm_warp_groups * self.num_threads_per_warp_group
         )
@@ -515,13 +508,13 @@ class OProjARFusedKernelSM90:
             cute.slice_(self.tile_shape_mnk, (None, None, 0)),
             (None, None, None),
         )
-        # MegaAttn: number of N-tiles -> global (rank-independent) tile id =
-        # m_idx * num_n_tiles + n_idx, used to index the cross-rank flag.
+        # Rank-independent tile id = m_idx * num_n_tiles + n_idx. It indexes the
+        # standalone cross-rank flag protocol in this file.
         num_n_tiles = cute.size(gC_mnl, mode=[3])
-        # MegaAttn RS+AG: tile the multicast view of C by the per-rank M-shard
-        # (BLOCK_M/W rows). rank r owns shard row-block r of every BLOCK_M output
-        # tile; for GEMM tile (cm,cn) rank r's shard is shard-tile (cm*W + r, cn).
-        # ld_reduce + st (LDMCxSTMC) both act on this shard view, in place.
+        # Standalone NVLS reduce/store shard:
+        # rank r owns shard row-block r of every BLOCK_M output tile. For GEMM tile
+        # (cm, cn), rank r's shard is (cm * W + r, cn). ld_reduce and st both operate
+        # on this multicast shard view in place.
         # Requires BLOCK_M % world_size == 0 and (BLOCK_M/W) % 8 == 0.
         m_shard = self.tile_shape_mnk[0] // world_size
         shard_tiler = (m_shard, self.tile_shape_mnk[1], 1)
@@ -530,19 +523,18 @@ class OProjARFusedKernelSM90:
             cute.slice_(shard_tiler, (None, None, 0)),
             (None, None, None),
         )
-        # number of M-tiles -> total tile count = num_m_tiles * num_n_tiles, used
-        # to offset the per-SM completion-barrier slots past the per-batch region.
+        # Total tile count also defines where the per-SM completion barrier slots begin
+        # after the per-batch flag region.
         num_m_tiles = cute.size(gC_mnl, mode=[2])
 
-        # MegaAttn per-batch handshake params (plan: per-tile -> per-batch).
-        # The persistent scheduler gives SM `sm_id` the linear tiles
-        # sm_id, sm_id+grid, sm_id+2*grid, ... A "batch" = G consecutive tiles in
-        # that SM's *execution order* (local index p // G). The flag slot only
-        # depends on (sm_id, p//G, max_batches_per_sm) -> rank-independent, since
-        # all ranks launch the same grid and walk the same schedule.
+        # Standalone per-batch handshake:
+        # The persistent scheduler gives SM `sm_id` linear tiles
+        # sm_id, sm_id+grid, sm_id+2*grid, ... A batch is G consecutive tiles in that
+        # SM's execution order. The flag slot is rank-independent because all ranks
+        # launch the same grid and walk the same tile schedule.
         #   batch flag slot = sm_id * max_batches_per_sm + (p // G)
-        # max_batches_per_sm / grid_size use the *same* formula as benchmarks/bench_oproj_ar.py so the
-        # host flag allocation and device slot indexing agree exactly.
+        # Host allocation and device indexing must use this same max_batches_per_sm
+        # formula.
         comm_batch_tiles = self.comm_batch_tiles
         num_tiles_total = num_m_tiles * num_n_tiles
         bidx_sm, bidy_sm, bidz_sm = cute.arch.block_idx()

@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-Fused FA + O_proj + NVLS AllReduce persistent kernel (Hopper SM90, CuTe DSL).
+Hopper SM90 persistent fused kernel for causal varlen full-prompt prefill.
 
-One persistent grid runs the whole causal-varlen-prefill FA -> O_proj ->
-tensor-parallel NVLS AllReduce pipeline; each CTA dynamically switches between
-FA / O_proj / AR modes via a leader-claimed, smem-broadcast (mode, arg).
+Scope invariant:
+  * One persistent grid runs FA -> O_proj -> tensor-parallel NVLS AllReduce.
+  * The first-version semantic contract is causal varlen prefill with q_len == k_len.
+  * FA/O_proj/AR share a 128-row task identity; no decode, append prefill, SplitKV,
+    paged KV, non-causal, or non-SM90 path belongs here.
 
-Scheduler + cross-mode handoff protocol (设计文稿.md):
-  * persistent grid of `num_ctas` CTAs; device-wide grid_sync at init + exit.
-  * FA tasks claimed from a global atomic counter -> (row_tile, head).
-  * head_ready_count[row_tile] release/acquire; the last head of a row publishes
-    that row's O_proj tasks into an ordered ready queue (reserve/publish_tail).
-  * O_proj tasks popped via CAS on consume_head.
-  * each O_proj task pushes a per-(row_tile,super_group) AR readiness (single
-    rank => last-arriver is immediate), claimed once by an AR owner task.
-  * weight-driven CTA role preference (w_fa / w_oproj / w_ar); all CTAs fall
-    through to other sources.
-  * termination when fa_done / oproj_done / ar_done all hit their targets.
+Scheduler protocol:
+  * A CTA leader claims one work item and broadcasts (mode, arg) through shared memory.
+  * FA work comes from a global task counter and maps to (fa_row_tile, head).
+  * The last local head for a row tile publishes that row's O_proj super-group tasks
+    through the ordered ready queue.
+  * O_proj completion pushes readiness to the deterministic AR owner for the same
+    (fa_row_tile, n_super_group) identity.
+  * Termination is legal only after FA, O_proj, and this rank's AR-owner work all
+    reached their done counts.
 
-FA payload reuses the validated dynamic-varlen pieces (M=N=D=128, kv_stages=2,
-causal varlen prompt prefill). For tp_size==1 the AR path degenerates to identity
-(do_ar just sets the terminal done bit); the real multimem ld_reduce/st over the
-C_sym multicast view runs in the tp_size>1 path.
+Agent note: keep comments anchored to stable protocol names and invariants, not to
+design-document line numbers or temporary experiment phases.
 """
 import cuda.bindings.driver as cuda
 
@@ -34,17 +32,17 @@ import cutlass.utils.distributed as cda
 from cutlass.cute.nvgpu import warpgroup
 from quack import layout_utils as qlu
 
-# Phase-5 (5b-1b): real FA payload reuses the validated dynamic-varlen FA pieces.
+# FA payload helper shared with the standalone dynamic-varlen FA path.
 from mega_attention.kernels.sm90.fa_varlen import softmax_block_dyn, LOG2E
 
-# ---- mode codes (broadcast through smem) ----
+# Mode codes broadcast through shared memory by the CTA leader.
 MODE_IDLE = 0
 MODE_FA = 1
 MODE_OPROJ = 2
 MODE_AR = 3
 MODE_DONE = 4
 
-# ---- ctrl[] scalar slots (all Uint32) ----
+# ctrl[] scalar slots. All entries are Uint32 and zero-initialized by the host.
 C_FA_COUNTER = 0
 C_FA_DONE = 1
 C_OP_RESERVE = 2
@@ -61,11 +59,12 @@ NUM_CTRL = 11
 FINISH_TAG = 0x80000000
 
 
-# ========= grid_sync ====
+# ============================================================================
+# Device-wide synchronization helpers
 @cute.jit
 def gsync(ctrl: cute.Tensor, idx: cutlass.Constexpr,
           num_ctas: cutlass.Constexpr, bidx, tidx):
-    """Mega-MoE device-wide barrier on ctrl[idx] (Uint32, zeroed by host)."""
+    """Single-kernel grid barrier using a host-zeroed ctrl[idx] word."""
     cute.arch.sync_threads()
     if tidx == 0:
         delta = cutlass.Uint32(1)
@@ -85,12 +84,11 @@ def gsync(ctrl: cute.Tensor, idx: cutlass.Constexpr,
 @cute.jit
 def nvl_barrier(sig_local: cute.Tensor, sig_mc: cute.Tensor, slot: cutlass.Constexpr,
                 tp_size: cutlass.Constexpr, bidx, tidx):
-    """Device-side cross-rank NVLink barrier (monotonic add1 + spin), CTA0 only.
+    """Cross-rank NVLink barrier used around the persistent kernel body.
 
-    multimem_red_add1 on the multicast signal bumps EVERY rank's slot by 1; this rank
-    spins on its LOCAL slot until it reaches tp_size. Sandwich with local grid_sync
-    (caller) so all CTAs are quiesced before/after. 验证: scratch/_probe_nvlbarrier.py.
-    monotonic add1 needs a fresh slot per barrier (init/exit) within a launch.
+    Protocol invariant: only CTA0 participates in the cross-rank signal, while local
+    grid_sync before/after this helper keeps the rest of the rank quiesced. The
+    monotonic add-one signal needs a distinct slot for each barrier within a launch.
     """
     cute.arch.sync_threads()
     if bidx == 0:
@@ -101,7 +99,8 @@ def nvl_barrier(sig_local: cute.Tensor, sig_mc: cute.Tensor, slot: cutlass.Const
     cute.arch.sync_threads()
 
 
-# =============================================== work-source claim helpers ==
+# ============================================================================
+# Work-source claim helpers
 @cute.jit
 def try_fa(ctrl: cute.Tensor, num_fa: cutlass.Constexpr):
     """Bounded atomic claim of the next FA task. Returns (found, fa_task_id)."""
@@ -120,7 +119,11 @@ def try_fa(ctrl: cute.Tensor, num_fa: cutlass.Constexpr):
 
 @cute.jit
 def try_pop_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor):
-    """CAS pop from the O_proj ready queue. Returns (found, slot_id)."""
+    """CAS pop from the published O_proj ready queue.
+
+    Happens-before: seeing C_OP_PUBLISH with acquire makes the queue entry visible.
+    CAS on C_OP_CONSUME gives single-consumer ownership of that slot.
+    """
     found = cutlass.Int32(0)
     arg = cutlass.Int32(-1)
     head = cute.arch.atomic_add(ctrl.iterator + C_OP_CONSUME, cutlass.Uint32(0),
@@ -142,17 +145,17 @@ def try_pop_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor):
 def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
                  owner_words_alloc: cutlass.Constexpr, tp_size: cutlass.Constexpr,
                  rank: cutlass.Constexpr, local_owned_ar: cutlass.Constexpr):
-    """Scan this rank's owner-local ar_ready_bits (uint64 bitset) from a word cursor,
-    ffs-via-popc the lowest set bit, atomicAnd-clear it (CAS-free single-owner claim).
+    """Claim one AR owner task from this rank's owner-local ready bitset.
 
-    Returns (found, ar_slot_id). owner_idx = word*64 + bit_index;
-    ar_slot_id = owner_idx*tp_size + rank (设计稿 确定性 owner 反解)。
+    The scan starts from a shared word cursor, finds the lowest set bit in a word,
+    and clears it with atomicAnd. Clearing a set bit is the ownership claim.
 
-    Tail guard: owner_slots_alloc = ceil(total_oproj/tp_size) rounds up, so owner_idx
-    in [local_owned_ar, owner_slots_alloc) are invalid tail slots (设计稿 §1772 "尾部
-    无效槽位不参与调度"). In correct operation publish_ar_ready never sets those bits,
-    but we still clear-and-skip any that appear so a stray bit can't wedge the scan or
-    over-count ar_done.
+    Identity invariant: owner_idx = word * 64 + bit_index, and
+    ar_slot_id = owner_idx * tp_size + rank for this owner rank.
+
+    Tail invariant: owner_slots_alloc may be rounded up. Bits whose owner_idx is
+    outside local_owned_ar are invalid tail slots; clear-and-skip them so a stray bit
+    cannot wedge the scanner or over-count C_AR_DONE.
     """
     found = cutlass.Int32(0)
     arg = cutlass.Int32(-1)
@@ -184,11 +187,17 @@ def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
     return found, arg
 
 
-# ============================================== producer: publish O_proj ===
+# ============================================================================
+# Producers: FA -> O_proj ready queue
 @cute.jit
 def publish_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor,
                   row_tile: cutlass.Int32, num_super_groups: cutlass.Constexpr):
-    """Reserve / write / ordered-publish this row's num_super_groups O_proj tasks."""
+    """Reserve, write, then ordered-publish this row tile's O_proj tasks.
+
+    Queue invariant: consumers may read only [consume_head, publish_tail). Reservation
+    can run ahead, but publish_tail advances in reservation order so consumers never
+    observe holes or uninitialized queue entries.
+    """
     n = cutlass.Uint32(num_super_groups)
     start = cute.arch.atomic_add(ctrl.iterator + C_OP_RESERVE, n,
                                  sem="relaxed", scope="gpu")
@@ -198,7 +207,7 @@ def publish_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor,
         oproj_queue[start + i] = base + i          # slot_id = row*nsg + i
         i = i + cutlass.Uint32(1)
     cute.arch.fence_acq_rel_gpu()                   # entries before publish
-    # ordered publish: wait until publish_tail == our reservation start
+    # Ordered publish: wait until all earlier reservations are visible.
     spinning = True
     while spinning:
         pt = cute.arch.atomic_add(ctrl.iterator + C_OP_PUBLISH, cutlass.Uint32(0),
@@ -209,13 +218,16 @@ def publish_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor,
                          sem="release", scope="gpu")
 
 
-# ============================================== producer: publish AR ready ==
+# ============================================================================
+# Producers: O_proj -> AR owner readiness
 @cute.jit
 def publish_ar_ready(ready_count_owner: cute.Tensor, ar_ready_bits: cute.Tensor,
                      ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr):
-    """push-to-owner ready: bump owner-local ready_count[owner_idx]; the last arriver
-    (== tp_size) sets the owner-local ar_ready_bits bit (设计稿 确定性 owner 映射).
-    owner_rank = ar_slot_id % tp_size (this rank for tp=1); owner_idx = ar_slot_id // tp_size.
+    """Single-rank push-to-owner readiness for one AR slot.
+
+    The owner is deterministic: owner_rank = ar_slot_id % tp_size and
+    owner_idx = ar_slot_id // tp_size. For tp_size == 1, the current rank is always
+    the last arriver and sets the ready bit immediately.
     """
     owner_idx = ar_slot_id // cutlass.Int32(tp_size)
     old = cute.arch.atomic_add(ready_count_owner.iterator + owner_idx.to(cutlass.Uint32),
@@ -231,10 +243,11 @@ def publish_ar_ready(ready_count_owner: cute.Tensor, ar_ready_bits: cute.Tensor,
 def publish_ar_ready_xrank(rc_local: cute.Tensor, rb_local: cute.Tensor,
                            ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr,
                            rc_ptrs: cutlass.Constexpr, rb_ptrs: cutlass.Constexpr):
-    """Cross-rank push-to-owner: bump owner_rank's ready_count[owner_idx] (sys-scope
-    peer atomic via buffer_ptrs[owner_rank]); last arriver sets owner_rank's
-    ar_ready_bits. owner_rank=ar_slot_id%tp_size selected by a constexpr-ptr if-ladder
-    (验证: scratch/_probe_peerwrite.py). rc_ptrs/rb_ptrs are per-rank symmetric VAs.
+    """Cross-rank push-to-owner readiness for one AR slot.
+
+    This uses sys-scope peer atomics to increment owner_rank's ready_count[owner_idx].
+    The rank that observes tp_size arrivals publishes the owner-local ready bit.
+    rc_ptrs/rb_ptrs are per-rank symmetric virtual addresses baked into the kernel.
     """
     owner_rank = ar_slot_id % cutlass.Int32(tp_size)
     owner_idx = ar_slot_id // cutlass.Int32(tp_size)
@@ -255,11 +268,10 @@ def publish_ar_ready_xrank(rc_local: cute.Tensor, rb_local: cute.Tensor,
 @cute.jit
 def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor, ar_exec: cute.Tensor,
          ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr):
-    """AR owner: set owner-local done bit (terminal), then reduce/store + count once.
+    """Complete an AR owner task for the single-rank identity case.
 
-    tp_size==1: AR is the identity (C_sym partial already == final), so the data
-    reduce is a no-op; the real multimem.ld_reduce/multimem.st on C_sym_mc lands
-    here in the multi-rank phase. owner_idx = ar_slot_id // tp_size.
+    For tp_size == 1, C_sym partial is already the final value. The done bit still
+    enforces single completion and drives the common scheduler termination protocol.
     """
     owner_idx = ar_slot_id // cutlass.Int32(tp_size)
     word = (owner_idx // cutlass.Int32(64)).to(cutlass.Uint32)
@@ -269,18 +281,23 @@ def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor, ar_exec: cute.Tensor,
     old_done = cute.arch.atomic_or(ar_done_bits.iterator + word, bit,
                                    sem="acq_rel", scope="gpu")
     if (old_done & bit) == cutlass.Int64(0):
-        # multi-rank: multimem.ld_reduce.add + multimem.st over C_sym_mc here.
+        # Single-rank identity path: no data movement, only terminal accounting.
         cute.arch.atomic_add(ctrl.iterator + C_AR_DONE, cutlass.Uint32(1),
                              sem="release", scope="gpu")
 
 
-# == schedule (leader) ====
+# ============================================================================
+# CTA leader scheduler
 @cute.jit
 def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
                   role, num_fa: cutlass.Constexpr, total_oproj: cutlass.Constexpr,
                   owner_words_alloc: cutlass.Constexpr, tp_size: cutlass.Constexpr,
                   rank: cutlass.Constexpr, local_owned_ar: cutlass.Constexpr):
-    """Leader-only: return (mode, arg). role 0=prefer FA, 1=OPROJ, 2=AR."""
+    """Pick one task for the CTA leader and return (mode, arg).
+
+    Role controls only the preferred probe order. Every CTA falls through to the other
+    work sources, so role assignment is a bias, not a static partition.
+    """
     mode = cutlass.Int32(MODE_IDLE)
     arg = cutlass.Int32(-1)
 
@@ -295,7 +312,7 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
     if all_done:
         mode = cutlass.Int32(MODE_DONE)
     else:
-        # preference order by role (0=FA,1=OPROJ,2=AR); all fall through.
+        # Preference order by role; all roles fall through to all work sources.
         s0 = cutlass.Int32(MODE_FA); s1 = cutlass.Int32(MODE_OPROJ); s2 = cutlass.Int32(MODE_AR)
         if role == 1:
             s0 = cutlass.Int32(MODE_OPROJ); s1 = cutlass.Int32(MODE_AR); s2 = cutlass.Int32(MODE_FA)
@@ -303,7 +320,7 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
             s0 = cutlass.Int32(MODE_AR); s1 = cutlass.Int32(MODE_FA); s2 = cutlass.Int32(MODE_OPROJ)
 
         found = cutlass.Int32(0)
-        # try s0, then s1, then s2
+        # Try s0, then s1, then s2.
         ci = cutlass.Int32(0)
         while ci < cutlass.Int32(3):
             src = s0
@@ -328,18 +345,17 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
     return mode, arg
 
 
-# ========== driver/kernel =
+# ============================================================================
+# Driver and kernel
 
 
 class FusedFaOprojAr:
-    """Persistent fused kernel: REAL FA (writes O_scratch_local) + REAL O_proj GEMM
-    (writes C_sym partial) + NVLS AllReduce. FA payload = the validated FaWsAttnPacked
-    logic inlined into the dispatch loop with LONG-LIVED pipeline states (consumer
-    split fa_k_cons/fa_v_cons), per 设计稿 "Runtime task descriptor" + "long-lived
-    pipeline state". Leader claims+broadcasts (mode,arg); FA and O_proj run on the 2
-    consumer WGs (WG0 = TMA producer). AR: tp_size==1 -> identity (do_ar sets the
-    terminal done bit); tp_size>1 -> multimem ld_reduce/st over C_sym multicast.
-    M=N=D=128, kv_stages=2, causal varlen prompt prefill.
+    """CuTe DSL wrapper for the persistent fused kernel.
+
+    Runtime task descriptors are decoded inside the dispatch loop from (mode, arg).
+    Pipeline objects and PipelineState cursors are long-lived across tasks; payload
+    fragments and accumulators are mode-local. WG0 is the TMA producer, while WG1/WG2
+    consume the lower and upper 64 rows of the 128-row tile.
     """
 
     def __init__(self, num_fa, num_row_tiles, H_local, D, num_super_groups,
@@ -348,9 +364,8 @@ class FusedFaOprojAr:
                  csym_mc_ptr=0, nvl_mc_ptr=0, nvl_local_ptr=0, rc_ptrs=(), rb_ptrs=(),
                  softmax_scale=None, acc_dtype=cutlass.Float32,
                  w_fa=4, w_oproj=1, w_ar=1):
-        # multi-rank (tp>1) NVLS constants: baked into the kernel as closure ints
-        # (must NOT be cute.compile args -> 64-bit ptr would be truncated). For tp==1
-        # they are unused (single-rank path). 设计稿 §1883/§2287.
+        # Multi-rank NVLS pointers are baked as closure constants. Do not move them to
+        # cute.compile args: 64-bit virtual addresses would be truncated.
         self.csym_mc_ptr = csym_mc_ptr          # C_sym multicast VA (multimem reduce)
         self.nvl_mc_ptr = nvl_mc_ptr            # nvl_barrier signal multicast VA
         self.nvl_local_ptr = nvl_local_ptr      # this rank's nvl signal VA (spin read)
@@ -367,18 +382,18 @@ class FusedFaOprojAr:
         self.num_ctas = num_ctas
         self.tp_size = tp_size
         self.rank = rank
-        # ---- role weights (weight-driven CTA role preference) ----
+        # CTA role preference weights. These are scheduler biases, not fixed roles.
         self.w_fa = w_fa
         self.w_oproj = w_oproj
         self.w_ar = w_ar if tp_size > 1 else 0
-        # ---- AR owner-local control sizing (设计稿: 确定性 owner 映射) ----
-        # owner_rank = ar_slot_id % tp_size ; owner_idx = ar_slot_id // tp_size
+        # Deterministic AR owner mapping:
+        # owner_rank = ar_slot_id % tp_size; owner_idx = ar_slot_id // tp_size.
         self.owner_slots_alloc = (total_oproj + tp_size - 1) // tp_size
         self.owner_words_alloc = (self.owner_slots_alloc + 63) // 64
         self.local_owned_ar_tasks = max(total_oproj - rank, 0)
         self.local_owned_ar_tasks = (self.local_owned_ar_tasks + tp_size - 1) // tp_size
         self.kv_stages = kv_stages
-        # ---- O_proj params (设计稿 O_proj/AR Mode) ----
+        # O_proj/AR tile parameters for the fixed first-version kernel variant.
         self.hidden = hidden
         self.N_TILE = N_TILE
         self.super_group_n_tiles = super_group_n_tiles
@@ -413,17 +428,16 @@ class FusedFaOprojAr:
         sQ_l = self._smem(dt, self.M, self.D, 1)
         sK_l = self._smem(dt, self.N, self.D, self.kv_stages)
         sV_l = self._smem(dt, self.N, self.D, self.kv_stages)
-        # O_proj tensor smem: A[M,K_CHUNK], Wo[K_CHUNK,N_TILE], oproj_stages each
+        # O_proj SMEM operands: A[M,K_CHUNK] and Wo[K_CHUNK,N_TILE], both staged.
         sA_l = self._smem(dt, self.M, self.K_CHUNK, self.oproj_stages)
         sWo_l = self._smem(dt, self.K_CHUNK, self.N_TILE, self.oproj_stages)
 
         op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
-        # packed-varlen K/V: view head LAST [tot,D,H]; atom box covers (token,D);
-        # partition the returned tma_tensor (basis strides). See fa_varlen_sm90.
+        # Packed-varlen K/V are viewed as head-last [tot, D, H] so the TMA atom
+        # copies a contiguous (token, D) tile for the selected head.
         mK_v = qlu.select(mK, [0, 2, 1])
         mV_v = qlu.select(mV, [0, 2, 1])
-        # Q same packed-varlen layout: view head LAST [tot_q,D,H], box (M,D). Q now
-        # rides a 1-stage TMA pipeline like K/V (replaces the old cooperative load).
+        # Q uses the same head-last packed-varlen view and a one-stage TMA pipeline.
         mQ_v = qlu.select(mQ, [0, 2, 1])
         tma_q, tQ = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op, mQ_v, cute.select(sQ_l, mode=[0, 1]), (self.M, self.D), num_multicast=1)
@@ -432,9 +446,9 @@ class FusedFaOprojAr:
         tma_v, tV = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op, mV_v, cute.select(sV_l, mode=[0, 1]), (self.N, self.D), num_multicast=1)
 
-        # O_proj A = O_scratch[ft] = rows [ft*128, +128) of a [R*128, K_local] view.
-        # O_scratch [R,128,H,D] is row-major contiguous so flattened K = h*D+d and the
-        # row-major [R*128, K_local] view is exact; M-tile index == ft (128-aligned).
+        # O_proj A view invariant:
+        # O_scratch[R,128,H,D] is contiguous in (H,D), so flattening to
+        # [R*128, K_local] preserves K = h*D + d. The O_proj M tile index is ft.
         R = cutlass.const_expr(self.num_row_tiles)
         K_local = cutlass.const_expr(self.K_local)
         mOscr2d = cute.make_tensor(
@@ -452,15 +466,18 @@ class FusedFaOprojAr:
             dt, dt, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.MN,
             self.acc_dtype, atom_layout_mnk=self.mma_atom_layout_mnk, tiler_mn=(64, self.D),
             a_source=warpgroup.OperandSource.RMEM)
-        # O_proj GEMM: A K-major (smem), B = transpose_view(sWo) MN-major. C = A @ W_o.
+        # O_proj GEMM operand contract: A is K-major in SMEM; transpose_view(sWo)
+        # presents W_o as the MN-major B operand expected by the MMA atom.
         mma_op = sm90_utils.make_trivial_tiled_mma(
             dt, dt, warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.MN,
             self.acc_dtype, atom_layout_mnk=self.mma_atom_layout_mnk,
             tiler_mn=(64, self.N_TILE))
 
-        # ---- tensor SMEM overlay: FA (sQ/sK/sV) and O_proj (sA/sWo) share ONE byte
-        # range (设计稿 §1505: union, NOT sum; a CTA is in one mode at a time, drained
-        # before switch). mbarriers stay separate. Offsets carved at aligned cosizes. ----
+        # SMEM overlay invariant:
+        # FA tensors (sQ/sK/sV) and O_proj tensors (sA/sWo) share one byte range. This
+        # is a union, not a sum. A CTA is in exactly one payload mode at a time, and
+        # each mode drains its TMA/WGMMA work before the next mode may overwrite the
+        # overlay. Pipeline mbarriers stay separate from the tensor overlay.
         eltb = cutlass.const_expr(dt.width // 8)
         ae = cutlass.const_expr(self.align // eltb)                 # align in elements
 
@@ -490,7 +507,8 @@ class FusedFaOprojAr:
             mbar_ab: cute.struct.MemRange[cutlass.Int64, self.oproj_stages * 2]
             overlay: cute.struct.Align[cute.struct.MemRange[dt, overlay_n], self.align]
 
-        # multi-rank NVLS views from baked-constant VAs (tp==1: null, unused).
+        # Multi-rank NVLS views from baked constant VAs. For tp_size == 1 they are
+        # null/unused but still constructed to keep the compiled call signature fixed.
         csym_mc = cute.make_tensor(
             cute.make_ptr(mCsym.element_type, self.csym_mc_ptr, cute.AddressSpace.gmem,
                           assumed_align=16), mCsym.layout)
@@ -547,13 +565,13 @@ class FusedFaOprojAr:
         num_ctas = cutlass.const_expr(self.num_ctas)
         slog2 = cutlass.const_expr(self.scale_log2)
         nthr = cutlass.const_expr(self.threads)
-        # O_proj constexprs
+        # O_proj compile-time parameters for this launch variant.
         n_kchunks = cutlass.const_expr(self.n_kchunks)
         sgnt = cutlass.const_expr(self.super_group_n_tiles)
         N_TILE = cutlass.const_expr(self.N_TILE)
         hidden = cutlass.const_expr(self.hidden)
         num_out_n_tiles = cutlass.const_expr(self.num_out_n_tiles)
-        # AR owner constexprs
+        # AR owner-local compile-time parameters for this rank.
         rank = cutlass.const_expr(self.rank)
         owner_words_alloc = cutlass.const_expr(self.owner_words_alloc)
         local_owned_ar = cutlass.const_expr(self.local_owned_ar_tasks)
@@ -562,8 +580,10 @@ class FusedFaOprojAr:
         st = al.allocate(Smem)
         sma_ptr = st.bc.data_ptr()
         sma = cute.make_tensor(sma_ptr, cute.make_layout(4))
-        # tensor overlay: FA (sQ/sK/sV) and O_proj (sA/sWo) carve the SAME byte range.
-        # swizzle must live on the POINTER (recast_ptr), not the layout, for WGMMA.
+        # SMEM overlay materialization:
+        # FA and O_proj tensors carve the same backing range. The swizzle must live on
+        # the recast pointer, not just on the layout, for WGMMA to interpret SMEM
+        # addresses correctly.
         ov = st.overlay.data_ptr()
         sQ = cute.make_tensor(cute.recast_ptr(ov, sQ_l.inner, self.dt), sQ_l.outer)
         sK = cute.make_tensor(cute.recast_ptr(ov + cutlass.const_expr(self._off_sK), sK_l.inner, self.dt), sK_l.outer)
@@ -583,7 +603,10 @@ class FusedFaOprojAr:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_wo)
 
-        # pipelines + LONG-LIVED states (created ONCE, threaded across dispatch loop)
+        # Long-lived pipeline invariant:
+        # Pipeline objects and PipelineState cursors are created once and threaded
+        # across all tasks. Do not recreate PipelineState inside a mode branch unless
+        # the matching SMEM mbarrier is also reinitialized.
         pl_q = pipeline.PipelineTmaAsync.create(
             barrier_storage=st.mbar_q.data_ptr(), num_stages=1,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -613,15 +636,10 @@ class FusedFaOprojAr:
         op_ab_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.oproj_stages)
         op_ab_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.oproj_stages)
 
-        # NOTE (设计稿 "寄存器 / SSA 生命周期预算"): the big consumer fragments /
-        # accumulators (FA: tCrQ/K/V, acc_S, acc_O, tOrP, row_*; O_proj: tCrA/Wo,
-        # acc_C) are created mode-locally + role-locally (wg_idx>=1 only) INSIDE each
-        # payload branch below, AFTER setmaxregister, ending their life with the mode.
-        # Only long-lived PROTOCOL state (pipeline objects + PipelineState cursors,
-        # created above) persists across tasks. NB (profiled): this scoping is perf-
-        # NEUTRAL -- SSA live ranges are use-def driven, and these rmem were already
-        # used only in mutually-exclusive branches, so ptxas already reused registers.
-        # The 168-reg/spill is FA's OWN consumer working set, not an FA+O_proj union.
+        # Register lifetime invariant:
+        # Large consumer fragments/accumulators are created inside their payload mode
+        # and only for consumer warp groups. Only protocol state lives across tasks.
+        # This keeps the FA/O_proj payload lifetimes explicit for future agent edits.
         lane = tidx - self.num_dma_threads
 
         gsync(ctrl, C_GS_INIT, num_ctas, bidx, tidx)
@@ -649,7 +667,8 @@ class FusedFaOprojAr:
                 looping = False
             else:
                 if mode == MODE_FA:
-                    # ---- decode runtime FA descriptor (every thread) ----
+                    # Decode runtime FA descriptor. Every thread derives the same
+                    # descriptor from arg; no CTA-local descriptor protocol is used.
                     ft = arg // cutlass.Int32(H_local)
                     head = arg % cutlass.Int32(H_local)
                     b = mFaB[ft]
@@ -682,12 +701,11 @@ class FusedFaOprojAr:
 
                     if wg_idx == 0:
                         if warp_idx == 0:
-                            # Q rides a 1-stage TMA (replaces the old cooperative load):
-                            # issue it once, before the K/V stream, so Q lands together
-                            # with the first K/V block. Padding rows (row >= q_len in the
-                            # causal last m-block) are NOT zero-filled -- attention is
-                            # row-independent and those rows are dropped at O store
-                            # (< q_len), so TMA OOB / next-seq bytes in them are harmless.
+                            # Q TMA invariant:
+                            # Issue Q once before the K/V stream so it is available
+                            # for the first QK block. Padding rows in the final row tile
+                            # are not zero-filled; they are masked before O_scratch is
+                            # made visible to O_proj.
                             pl_q.producer_acquire(fa_q_prod)
                             cute.copy(tma_q, tQgQ[(None, mb)], tQsQ[(None, fa_q_prod.index)],
                                       tma_bar_ptr=pl_q.producer_get_barrier(fa_q_prod))
@@ -706,8 +724,8 @@ class FusedFaOprojAr:
                                 fa_v_prod.advance()
 
                     if wg_idx >= 1:
-                        # FA-mode + consumer-role local rmem (设计稿 寄存器生命周期):
-                        # created here, after setmaxregister, dead when FA mode ends.
+                        # FA payload fragments are consumer-WG local and die at the end
+                        # of this mode branch.
                         thr_qk = mma_qk.get_slice(lane)
                         thr_pv = mma_pv.get_slice(lane)
                         tCrQ = mma_qk.make_fragment_A(thr_qk.partition_A(sQ))
@@ -731,9 +749,9 @@ class FusedFaOprojAr:
                         nkb_pv = cutlass.const_expr(cute.size(tOrP, mode=[2]))
 
                         acc_O.fill(0.0)
-                        # wait Q full (1-stage TMA) before any QK reads sQ
+                        # Q must be fully loaded before any QK MMA reads sQ.
                         pl_q.consumer_wait(fa_q_cons)
-                        # Step A: block 0
+                        # First K block initializes the online softmax state.
                         pl_k.consumer_wait(fa_k_cons)
                         acc_S.fill(0.0)
                         mma_qk.set(warpgroup.Field.ACCUMULATE, True)
@@ -749,7 +767,7 @@ class FusedFaOprojAr:
                                           True, coord_mn, cutlass.Int32(0), mask_q_off, k_len)
                         tOrP.store(tOrP_v.load().to(self.dt))
 
-                        # Middle: QK(j) overlaps PV(j-1)
+                        # Middle blocks overlap QK(j) with PV(j-1).
                         for j in cutlass.range(1, nblk, unroll=1):
                             pl_k.consumer_wait(fa_k_cons)
                             acc_S.fill(0.0)
@@ -777,12 +795,11 @@ class FusedFaOprojAr:
                                 acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
                             tOrP.store(qlu.reshape_acc_to_frgA(acc_S).load().to(self.dt))
 
-                        # Q dead: all QK issued+waited (Step A wait_group(0) for nblk==1,
-                        # else middle loop's last wait_group(0)). Release so the next
-                        # task's Q TMA can overwrite sQ.
+                        # Mode-local lifetime: after all QK work has waited, sQ is dead
+                        # and the Q pipeline stage can be released for the next FA task.
                         pl_q.consumer_release(fa_q_cons)
                         fa_q_cons.advance()
-                        # Step E: final PV
+                        # Final PV consumes the last softmax block.
                         pl_v.consumer_wait(fa_v_cons)
                         mma_pv.set(warpgroup.Field.ACCUMULATE, True)
                         cute.nvgpu.warpgroup.fence()
@@ -794,16 +811,16 @@ class FusedFaOprojAr:
                         pl_v.consumer_release(fa_v_cons)
                         fa_v_cons.advance()
 
-                        # finalize + store O_scratch[ft, :, head, :]
+                        # Store this head's O_scratch tile. The later head_ready release
+                        # is the visibility handoff to O_proj.
                         gOscr = mOscr[ft, None, head, None]
                         gO = cute.local_tile(gOscr, (self.M, self.D), (None, None))
                         tCgO = thr_pv.partition_C(gO[(None, None, 0, 0)])
                         for r in cutlass.range_constexpr(nrows):
-                            # warp_reduction_sum is a warp-collective shuffle: call it
-                            # UNCONDITIONALLY for every row (uniform across the warp).
-                            # Guarding it behind the valid_m predicate diverges the warp
-                            # whenever valid_m splits a warp's 8-row sub-block (valid_m % 8
-                            # != 0 at the boundary) -> the shuffle deadlocks -> CTA hangs.
+                            # Hazard: warp_reduction_sum is a warp-collective shuffle.
+                            # Call it unconditionally for every row. Guarding the call
+                            # behind valid_m can diverge a warp at a partial row tile and
+                            # hang the CTA.
                             s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
                             if (mask_q_off + coord_mn[r, 0][0]) < q_len:
                                 inv = cutlass.Float32(1.0) / s
@@ -812,7 +829,8 @@ class FusedFaOprojAr:
                                 acc_O_mn[r, None].store(acc_O_mn[r, None].load() * cutlass.Float32(0.0))
                         tCgO.store(acc_O.load().to(mOscr.element_type))
 
-                    # ---- control tail: elected lane after all WGs done ----
+                    # FA control tail. After the CTA sync, all O_scratch stores for this
+                    # FA task are complete from the CTA's point of view.
                     cute.arch.sync_threads()
                     if tidx == 0:
                         cute.arch.atomic_add(fa_exec.iterator + arg.to(cutlass.Uint32),
@@ -826,7 +844,9 @@ class FusedFaOprojAr:
                                              sem="release", scope="gpu")
 
                 if mode == MODE_OPROJ:
-                    # ---- decode O_proj slot (every thread) ----
+                    # Decode O_proj slot. arg is the stable slot_id:
+                    # fa_row_tile = slot_id / num_super_groups,
+                    # n_super_group = slot_id % num_super_groups.
                     ft = arg // cutlass.Int32(num_super_groups)
                     nsg = arg % cutlass.Int32(num_super_groups)
                     base_out = nsg * cutlass.Int32(sgnt)
@@ -842,8 +862,8 @@ class FusedFaOprojAr:
                     if valid_m > cutlass.Int32(128):
                         valid_m = cutlass.Int32(128)
 
-                    # gmem tiles from the TMA tensors (tA/tWo carry basis strides that
-                    # match the atom's gbasis); index M-tile ft + k-chunk at copy time.
+                    # TMA tensor contract: tA/tWo carry basis strides matching the atom's
+                    # gmem basis; concrete ft, k_chunk, and out_n are selected at copy time.
                     gA = cute.local_tile(tA, (self.M, self.K_CHUNK), (None, None, None))
                     gWo = cute.local_tile(tWo, (self.K_CHUNK, N_TILE), (None, None))
                     tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
@@ -868,8 +888,8 @@ class FusedFaOprojAr:
                                     op_ab_prod.advance()
 
                     if wg_idx >= 1:
-                        # O_proj-mode + consumer-role local rmem (设计稿 寄存器生命周期):
-                        # separate MMA (A K-major, Wo MN-major); dead when O_proj ends.
+                        # O_proj payload fragments are consumer-WG local and die at the
+                        # end of this mode branch.
                         thr_op = mma_op.get_slice(lane)
                         tCrA = mma_op.make_fragment_A(thr_op.partition_A(sA))
                         sWot = qlu.transpose_view(sWo)
@@ -901,7 +921,9 @@ class FusedFaOprojAr:
                                 cute.nvgpu.warpgroup.wait_group(0)
                                 pl_ab.consumer_release(op_ab_cons)
                                 op_ab_cons.advance()
-                            # predicated store acc_C -> C_sym[ft, :, out_n, :] (no collective)
+                            # Tail invariant: only valid token rows and valid hidden
+                            # columns are written to C_sym. Invalid tail elements are not
+                            # required to be cleared.
                             gC = mCsym[ft, None, out_n, None]
                             tCgC = thr_op.partition_C(gC)
                             gC_mn = qlu.reshape_acc_to_mn(tCgC)
@@ -917,8 +939,9 @@ class FusedFaOprojAr:
                     if tidx == 0:
                         cute.arch.atomic_add(oproj_exec.iterator + arg.to(cutlass.Uint32),
                                              cutlass.Uint32(1), sem="relaxed", scope="gpu")
-                        cute.arch.fence_acq_rel_gpu()            # partial store before ready
-                        # push-to-owner ready (arg == ar_slot_id); last arriver sets bit
+                        cute.arch.fence_acq_rel_gpu()            # C_sym partial before ready
+                        # arg is also ar_slot_id. The last rank to publish readiness sets
+                        # the owner-local ready bit.
                         if cutlass.const_expr(tp_size == 1):
                             publish_ar_ready(ready_count_owner, ar_ready_bits, arg, tp_size)
                         else:
@@ -931,8 +954,8 @@ class FusedFaOprojAr:
                         if tidx == 0:
                             do_ar(ctrl, ar_done_bits, ar_exec, arg, tp_size)
                     else:
-                        # owner: NVLS reduce the whole ar_tile in C_sym via multimem,
-                        # thread-parallel over 8-bf16 chunks (n contiguous). 设计稿 §1883.
+                        # AR owner reduces the whole C_sym tile through the multicast
+                        # view, parallelized over contiguous 8-bf16 chunks in N.
                         ft_ar = arg // cutlass.Int32(num_super_groups)
                         nsg_ar = arg % cutlass.Int32(num_super_groups)
                         base_ar = nsg_ar * cutlass.Int32(sgnt)
@@ -970,4 +993,4 @@ class FusedFaOprojAr:
 
         gsync(ctrl, C_GS_EXIT, num_ctas, bidx, tidx)
         if cutlass.const_expr(tp_size > 1):
-            nvl_barrier(nvl_local, nvl_mc, 1, tp_size, bidx, tidx)   # exit: all ranks done
+            nvl_barrier(nvl_local, nvl_mc, 1, tp_size, bidx, tidx)   # all ranks exited

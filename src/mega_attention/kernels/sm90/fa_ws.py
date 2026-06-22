@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-Design-structured FA tile microkernel (Hopper SM90, CuTe DSL), warp-specialized
-per causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md (FA Mode section).
+Intermediate FA tile microkernel for Hopper SM90 CuTe DSL experiments.
 
-Single class: FaWsAttnKV — one 128-row FA tile = softmax(Q K^T * scale) V over
-Lk keys, structured for the final fused FA+O_proj+AR kernel:
+This file is not the core fused kernel. It isolates the FA warp-specialized
+payload that feeds the real path in fused_fa_oproj_ar.py.
+
+Single class: FaWsAttnKV computes one 128-row FA tile:
+    O = softmax(Q K^T * scale) V
 
   * 3 warp groups: WG0 = TMA producer (single DMA warp loads K/V), WG1/WG2 =
     WGMMA consumers. atom_layout_mnk=(2,1,1), tiler_mn=(64,N): WG1 owns rows
     0..63, WG2 owns rows 64..127. Online-softmax reductions stay within each
-    WG's own 64 rows (warp-quad reduce) — no cross-WG row_max/row_sum/acc_O
-    merge (设计稿: "softmax 规约只在各自 owned 的 64 行内完成").
+    WG's own 64 rows; there is no cross-WG row_max/row_sum/acc_O merge.
   * Q cooperative-loaded once; K and V on SEPARATE 2-stage TMA pipelines
     (different lifetimes: K freed after QK, V after PV).
   * FA4-style intra-wg overlap: QK(current block) overlaps PV(previous block)
     via two committed WGMMA groups + wait_group(1)/wait_group(0).
   * causal prompt prefill + varlen tail predication via q_start / valid_m / k_len.
 
-Uses cutlass.cute / hopper_helpers / cutlass.pipeline primitives (adapts
-oproj_ar.py's proven pipeline structure; no flash_attn.cute import).
+Agent note: keep comments here scoped to the local FA mechanism. The production
+task handoff, ready queue, O_proj, and AR protocol live in fused_fa_oproj_ar.py.
 """
 import cuda.bindings.driver as cuda
 
@@ -44,12 +45,10 @@ def softmax_block(acc_mn: cute.Tensor, row_max: cute.Tensor, row_sum: cute.Tenso
                   coord_mn: cute.Tensor, n_block: cutlass.Constexpr,
                   causal: cutlass.Constexpr, q_start: cutlass.Constexpr,
                   k_len: cutlass.Constexpr):
-    """One online-softmax step on the QK C-fragment (per-thread mn view).
+    """Online-softmax step on the QK C-fragment.
 
-    Updates row_max/row_sum in place; writes P (=exp) back into acc_mn; fills
-    row_scale[r] = correction factor for acc_O (1.0 on the first block). row_sum
-    accumulates LOCAL (per-thread) partial sums; the quad reduction is deferred
-    to finalize (matches flash_fwd online_softmax).
+    row_max/row_sum are maintained per consumer WG. row_sum accumulates local
+    per-thread partial sums; the warp-quad reduction is deferred to finalization.
     """
     for r in cutlass.range_constexpr(nrows):
         if cutlass.const_expr(causal or n_block * 128 + 127 >= k_len):
@@ -85,12 +84,11 @@ def softmax_block(acc_mn: cute.Tensor, row_max: cute.Tensor, row_sum: cute.Tenso
 
 
 class FaWsAttnKV:
-    """2-WG kv-block attention: O[M,D] = softmax(Q K^T * scale) V over Lk keys.
+    """Single-tile FA payload prototype.
 
-    step 2b (multi-block, tile_m=64/128). Q loaded once via its own 1-stage
-    pipeline; K/V per block via a 2-stage pipeline. Register-resident online
-    softmax with cross-block correction (softmax_block). Supports causal prompt
-    prefill and varlen tail predication through q_start / valid_m / k_len.
+    Q is loaded once; K and V stream through separate TMA pipelines. The payload
+    supports causal prompt prefill and varlen tail predication through q_start,
+    valid_m, and k_len, but it does not implement persistent scheduling.
     """
 
     def __init__(self, M, N, D, Lk, softmax_scale=None, acc_dtype=cutlass.Float32,
@@ -137,9 +135,8 @@ class FaWsAttnKV:
         sK_l = self._smem(dt, self.N, self.D, self.kv_stages)
         sV_l = self._smem(dt, self.N, self.D, self.kv_stages)
 
-        # FA4 Hopper: Q cooperative-loaded once; K and V via SEPARATE TMA
-        # pipelines (K released right after QK, V after PV — different lifetimes,
-        # must not share one pipeline). 设计文稿 "FA K/V pipeline 与 intra-wg overlap".
+        # Pipeline invariant: K and V use separate TMA pipelines because K is released
+        # after QK while V remains live for PV. Do not merge them into one pipeline.
         op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
         tma_k, tK = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op, mK, cute.slice_(sK_l, (None, None, 0)), (self.N, self.D), num_multicast=1)
@@ -221,7 +218,7 @@ class FaWsAttnKV:
         tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
             tma_v, 0, cute.make_layout(1), cute.group_modes(sV, 0, 2), cute.group_modes(gV, 0, 2))
 
-        # ---- WG0: producer (separate K and V pipelines, lockstep states) ----
+        # WG0 producer: separate K/V pipelines with lockstep software states.
         if wg_idx == 0:
             cute.arch.setmaxregister_decrease(40)
             if warp_idx == 0:
@@ -239,11 +236,9 @@ class FaWsAttnKV:
                     kp.advance()
                     vp.advance()
 
-        # ---- WG1/WG2: consumers (both warpgroups run this block; the (2,1,1)
-        #      tiled MMA splits M so WG1 owns rows 0..63, WG2 owns rows 64..127,
-        #      each with its own softmax/acc_O — no cross-WG merge). Structure:
-        #      Step A = QK-only prologue (block 0); middle loop = FA4 intra-wg
-        #      overlap of QK(current) with PV(previous); Step E = PV-only epilogue.
+        # Consumer invariant: the (2,1,1) MMA split gives each consumer WG its own
+        # 64-row slice and its own online-softmax state. Do not add a cross-WG merge.
+        # The loop shape is QK prologue, overlapped QK/PV middle, then final PV.
         if wg_idx >= 1:
             cute.arch.setmaxregister_increase(232)
             lane = tidx - self.num_dma_threads
@@ -275,7 +270,7 @@ class FaWsAttnKV:
             tOrP = cute.make_rmem_tensor_like(tOrP_v, self.dt)
             nkb_pv = cutlass.const_expr(cute.size(tOrP, mode=[2]))
 
-            # ---- Step A: first block — QK + softmax only; tOrP=P(0), acc_O=0 ----
+            # First block initializes P(0) and the online-softmax state.
             pl_k.consumer_wait(sr)
             acc_S.fill(0.0)
             mma_qk.set(warpgroup.Field.ACCUMULATE, True)
@@ -290,7 +285,7 @@ class FaWsAttnKV:
                           coord_mn, 0, self.causal, self.q_start, self.k_len)
             tOrP.store(tOrP_v.load().to(self.dt))
 
-            # ---- Middle: current=j overlaps PV(previous=j-1) ----
+            # Middle blocks overlap QK(current) with PV(previous).
             for j in cutlass.range_constexpr(1, nblk):
                 srv = sr.clone()        # V uses previous block's stage
                 sr.advance()            # K advances to current block
@@ -308,17 +303,17 @@ class FaWsAttnKV:
                     cute.gemm(mma_pv, acc_O, tOrP[(None, None, kb)],
                               tCrV[(None, None, kb, srv.index)], acc_O)
                 cute.nvgpu.warpgroup.commit_group()
-                cute.nvgpu.warpgroup.wait_group(1)   # QK(current) done; PV(prev) flying
+                cute.nvgpu.warpgroup.wait_group(1)   # QK current done; PV previous flying
                 pl_k.consumer_release(sr)
                 softmax_block(acc_mn, row_max, row_sum, row_scale, nrows, slog2, False,
                               coord_mn, j, self.causal, self.q_start, self.k_len)
-                cute.nvgpu.warpgroup.wait_group(0)   # PV(prev) done
+                cute.nvgpu.warpgroup.wait_group(0)   # PV previous done
                 pl_v.consumer_release(srv)
                 for r in cutlass.range_constexpr(nrows):
                     acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
-                tOrP.store(qlu.reshape_acc_to_frgA(acc_S).load().to(self.dt))  # P(current)
+                tOrP.store(qlu.reshape_acc_to_frgA(acc_S).load().to(self.dt))  # P current
 
-            # ---- Step E: final PV (previous = last block) ----
+            # Final PV consumes the last softmax block.
             srv = sr.clone()
             pl_v.consumer_wait(srv)
             mma_pv.set(warpgroup.Field.ACCUMULATE, True)
@@ -330,7 +325,7 @@ class FaWsAttnKV:
             cute.nvgpu.warpgroup.wait_group(0)
             pl_v.consumer_release(srv)
 
-            # finalize: quad-reduce row_sum, divide
+            # Finalize: warp-quad reduce row_sum, divide, and mask invalid rows.
             for r in cutlass.range_constexpr(nrows):
                 if coord_mn[r, 0][0] < self.valid_m:
                     s = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
