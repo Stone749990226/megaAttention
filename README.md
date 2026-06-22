@@ -2,227 +2,126 @@
 
 `megaAttention` 是一个 Hopper SM90-only 的实验性 fused serving kernel 项目。
 
-核心目标是在 decoder-only serving 的完整 prompt prefill 阶段，将下面三段计算融合进一个 persistent kernel：
+核心目标是在 decoder-only serving 的完整 prompt prefill 阶段，把下面三段计算融合进**一个 persistent kernel**：
 
 ```text
 causal varlen FlashAttention -> O_proj -> tensor-parallel NVLS AllReduce
 ```
 
-第一版聚焦：
+FA、O_proj、AR 共用同一个 128 行 row tile 作为 task identity，由同一个 persistent
+scheduler 调度，用 Python + CuTe DSL 实现。
 
-- Hopper SM90 GPU。
-- causal attention。
-- varlen prefill。
-- 每个 sequence 满足 `q_len == k_len`。
-- Q token 数量较多的 prompt 阶段。
-- FA、O_proj、AR 共用 128 行 row tile。
-- 使用 Python + CuTe DSL 实现和验证。
+聚焦场景：Hopper SM90、causal attention、varlen prefill、Q token 数量较多。
 
-第一版不覆盖：
-
-- decode。
-- append prefill。
-- chunked prefill。
-- `seqlen_q != seqlen_k` 的尾部对齐 causal mask。
-- Ampere、Ada、Blackwell 或其他架构。
-- 非 causal attention。
-
-核心设计文档见：
+核心设计文档：
 
 ```text
 docs/design/causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md
 ```
 
-## 当前状态
+## 已完成
 
-| 模块 | 状态 |
-| --- | --- |
-| row tile metadata / `row_desc` | 已实现 |
-| 动态 varlen FA tile | 已验证 |
-| O_proj tile microkernel | 已验证 |
-| standalone O_proj + NVLS AR | 已验证（8×H200） |
-| persistent scheduler skeleton | 已验证 |
-| real FA in fused scheduler | 已验证（含 multi_seq；原 finalize warp 发散死锁已修复） |
-| real O_proj in fused kernel | 已验证（单卡 tp_size=1，C_sym partial 对 `oproj_reference`） |
-| AR owner 调度协议 in fused kernel | 已验证（单卡 tp_size=1：确定性 owner 映射 + owner-local u64 bitset + exactly-once/terminate） |
-| real NVLS AR（多卡 multimem reduce/store） | 已验证（8×H200：symmetric C_sym multicast reduce + 跨 rank owner 寻址 + nvl_barrier，整链对 full_chain_reference err~5e-3） |
+主线开发已整体完成：`real FA + real O_proj + real NVLS AllReduce` 已在同一个 persistent
+调度器内跑通，单卡 `tp_size=1`（AR 退化为恒等）与 8×H200 `tp_size=8`（owner 用
+`multimem.ld_reduce/st` 在 C_sym multicast view 上做 in-place AllReduce）两条路径均验证通过。
 
-当前 fused kernel 已在同一个 persistent 调度器内跑通 **real FA + real O_proj + real NVLS AllReduce**：
-单卡 `tp_size=1` 与 8×H200 `tp_size=8` 两条路径都验证通过。tp_size=1 下 AR 退化为恒等；
-tp_size=8 下 owner 用 `multimem.ld_reduce/st` 在 C_sym multicast view 上做 in-place AllReduce。
+- host 侧 varlen row tile metadata 与 workspace size 计算（`row_desc`）。
+- 动态 varlen FA tile、O_proj tile microkernel、standalone O_proj + NVLS AR 验证路径。
+- persistent scheduler：FA task counter → O_proj ready queue → AR owner readiness，
+  exactly-once + 正常终止。
+- 标准 GQA（K/V 按 `kv_head = q_head // q_per_kv` 复用）。
+- host 侧 launch heuristic（按 FA/O_proj MAC 比分桶选 role 权重与 super-group 数）。
+- 正确性：fused 的 C_sym 对 best-of-breed 串行基线逐 tile 对比，全 shape `err_rel` 在
+  bf16 级（~4e-4–2e-3）。
 
-### 分阶段验证状态（单卡 H200）
+## Roadmap
 
-| 阶段 | commit | 验证 |
-| --- | --- | --- |
-| P0 修 multi_seq 死锁 | `7f711d1` | `test_fused_fa_path` / `test_fa_packed` / `test_fa_varlen` 全过（含 `valid_m%8≠0` 回归） |
-| P1 real O_proj 接入 | `1cd547b` | `test_fused_oproj_path` 4 用例（C_sym 对 `oproj_reference`，err~0.0018） |
-| P2 AR owner 协议 | `9b028c9` | `test_scheduler_skeleton` 5 passed；fused 两路径全过；exactly-once / 正常终止 |
-| P3 多卡 NVLS | 本次 | `test_fused_full_chain`（8×H200，torchrun）：整链 C_sym 对 `full_chain_reference` err~5e-3，AR per-rank owner 计数正确；单卡两路径回归不退化 |
+当前范围之外、尚未实现，按需推进：
 
-### 性能（8×H200，`benchmarks/bench_fused_fa_oproj_ar.py`）
+- chunked prefill。
+- paged KV、SplitKV、partial O/LSE combine、非 causal attention。
+- FA per-tile pipeline 进一步优化（长单序列 compute-bound 场景）。
+- AR comm/compute overlap 优化（大 hidden 下 AR 占比偏高）。
+- 稳定 public API 封装与 `runtime/`（workspace 分配、launch wrapper、参数校验）。
 
-fused（单 persistent kernel）vs 非融合 best-of-breed 基线
-（官方 **`flash_attn_varlen_func`**（flash-attn 2.7.4）+ cuBLAS GEMM + **NVLS `multimem_all_reduce_`**），
-固定配置 `w=(w_fa,w_oproj,w_ar)=(4,1,1)`、`sg=4`（50 iters / 20 warmup）：
+## 性能
 
-| shape | fused | FA+GEMM+NVLS 基线 | ratio | err_rel |
-| --- | --- | --- | --- | --- |
-| [2048,2048] H8 hid2048 (4K) | 0.194 ms | 0.229 ms | 1.19× | 4.6e-4 |
-| [1024]×4 H16 hid2048 (4K) | 0.252 ms | 0.243 ms | 0.97× | 9.3e-4 |
-| [4096,4096] H8 hid4096 (8K) | 0.510 ms | 0.692 ms | **1.36×** | 8.1e-4 |
-| [8192] H8 hid2048 (8K, 单序列) | 0.605 ms | 0.757 ms | **1.25×** | 1.7e-3 |
-| [2048]×8 H8 hid2048 (16K) | 0.538 ms | 0.678 ms | **1.26×** | 8.3e-4 |
-| [8192,8192] H8 hid2048 (16K) | 1.030 ms | 1.286 ms | **1.25×** | 4.1e-4 |
-| [8192,8192] H8 hid4096 (16K) | 1.218 ms | 1.683 ms | **1.38×** | 8.9e-4 |
-| [8192,8192] H16 hid7168 (16K, DeepSeek) | 3.244 ms | 3.157 ms | 0.97× | 1.6e-3 |
-| [16384] H8 hid2048 (16K, 单序列) | 1.941 ms | 2.152 ms | 1.11× | 4.1e-4 |
-| [16384] H16 hid4096 (16K, 单序列) | 4.301 ms | 4.093 ms | 0.95× | 2.1e-3 |
-| [16384,16384] H8 hid2048 (32K) | 3.799 ms | 3.887 ms | 1.02× | 9.0e-4 |
-| [32768] H8 hid2048 (32K, 单序列) | 7.362 ms | 6.864 ms | 0.93× | 4.5e-4 |
-
-说明：
-- **DeepSeek（hid7168，0.97×）**：大 hidden 下 AR comm/compute overlap 是主要瓶颈。
-- **32K 单序列（0.93×）**：FA O(L²) compute-bound，官方 flash-attn per-tile 效率更高；不是配置可解的问题，需要 FA per-tile pipeline 独立优化。
-
-> 备注：用 PyTorch SDPA 的 FLASH 后端（也是 FlashAttention-2）替换官方包时 ratio 更高（如
-> [2048,2048] 为 1.43×），因为官方 flash-attn 比 SDPA 后端更快、基线更强；表中取官方包的权威数。
->
-> 正确性：benchmark 每个 shape 还会打印 `err_abs/err_rel [OK vs baseline]`——fused 的 C_sym
-> 与独立的 FA+GEMM+NVLS 基线路径逐 tile 对比，全部 shape `err_rel` 在 ~4e-4–2e-3（bf16 级），
-> 即融合结果与参考路径一致、算得对。
-
-### GQA 性能（chunk-prefill，8×H200，`--cases readme --auto`）
-
-kernel 现已支持标准 GQA（K/V 按 `kv_head = q_head // q_per_kv` 复用）。下表用真实 GQA 配置：
-K/V 以真实 `H_kv_local = H_local / q_per_kv` 个 head 构造，baseline 也走原生 GQA 的
-`flash_attn_varlen_func`。锚定大模型 TP8 per-rank 形状 + chunk-prefill 多段不规整 varlen
-（每段 ≤8K）。计时为 kineto self device time（30 iters / 10 warmup）。
-
-旗舰 GQA 模型 `num_kv_heads ≤ 8`，TP8 下每 rank 只剩 1 个 KV head（kv<8 跨 rank 复制），即
-per-rank MQA（`kv1`）——这是真实部署形态。额外加一个合成 `num_kv_heads=16` 配置，TP8 下每
-rank=2 个 KV head（`kv2`），真正压多-KV-head 寻址路径。
+8×H200，`benchmarks/bench_fused_fa_oproj_ar.py --cases readme --auto`，fused（单 persistent
+kernel）vs 非融合 best-of-breed 基线（官方 `flash_attn_varlen_func` + cuBLAS GEMM + NVLS
+`multimem_all_reduce_`）。锚定大模型 TP8 per-rank 形状 + 多段不规整 varlen，kineto self
+device time（30 iters / 10 warmup）：
 
 | 模型 (per-rank @ TP8) | batch (tot tokens) | fused ms | overlap% | TFLOPS (util) | NVLink GB/s | ratio | err_rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B H8/kv1 hid4096 | varlen B8 ~22.6K | 1.261 | 68% | 340 (34%) | 263 | **1.43×** | 7.1e-4 |
-| Qwen3-235B-A22B H8/kv1 hid4096 | varlen B6 ~13.4K | 0.775 | 73% | 315 (32%) | 254 | **1.43×** | 8.2e-4 |
-| Qwen3-Coder-480B-A35B H12/kv1 hid6144 | varlen B8 ~22.6K | 2.190 | 50% | 360 (36%) | 227 | **1.26×** | 8.5e-4 |
-| Qwen3-Coder-480B-A35B H12/kv1 hid6144 | varlen B6 ~13.4K | 1.315 | 50% | 344 (35%) | 225 | **1.24×** | 7.7e-4 |
-| GLM-4.6 H12/kv1 hid5120 | varlen B8 ~22.6K | 1.936 | 50% | 370 (37%) | 214 | **1.23×** | 8.1e-4 |
-| GLM-4.6 H12/kv1 hid5120 | varlen B6 ~13.4K | 1.174 | 56% | 349 (35%) | 210 | **1.25×** | 9.3e-4 |
-| Llama-3.1-405B H16/kv1 hid16384 | varlen B8 ~22.6K | 5.124 | 36% | 395 (40%) | 259 | **1.19×** | 1.3e-3 |
-| Llama-3.1-405B H16/kv1 hid16384 | varlen B6 ~13.4K | 3.038 | 37% | 388 (39%) | 260 | **1.20×** | 1.5e-3 |
-| 合成 kv16 stress H16/kv2 hid8192 | varlen B8 ~22.6K | 2.844 | 64% | 438 (44%) | 234 | **1.32×** | 1.5e-3 |
-| 合成 kv16 stress H16/kv2 hid8192 | varlen B6 ~13.4K | 1.686 | 68% | 426 (43%) | 234 | **1.34×** | 8.7e-4 |
+| Qwen3-235B-A22B hid4096 | varlen B8 ~22.6K | 1.261 | 68% | 340 (34%) | 263 | **1.43×** | 7.1e-4 |
+| Qwen3-235B-A22B hid4096 | varlen B6 ~13.4K | 0.775 | 73% | 315 (32%) | 254 | **1.43×** | 8.2e-4 |
+| Qwen3-Coder-480B hid6144 | varlen B8 ~22.6K | 2.190 | 50% | 360 (36%) | 227 | **1.26×** | 8.5e-4 |
+| GLM-4.6 hid5120 | varlen B8 ~22.6K | 1.936 | 50% | 370 (37%) | 214 | **1.23×** | 8.1e-4 |
+| Llama-3.1-405B hid16384 | varlen B8 ~22.6K | 5.124 | 36% | 395 (40%) | 259 | **1.19×** | 1.3e-3 |
+| Llama-3.1-405B hid16384 | varlen B6 ~13.4K | 3.038 | 37% | 388 (39%) | 260 | **1.20×** | 1.5e-3 |
+| 合成 stress hid8192 | varlen B8 ~22.6K | 2.844 | 64% | 438 (44%) | 234 | **1.32×** | 1.5e-3 |
 
-说明：
-- 全部 case `err_rel < 1.5e-3`（fused GQA C_sym 对原生 GQA best-of-breed 基线，bf16 级一致）。
-- 真实旗舰模型 TP8 = `kv1`（per-rank MQA）是物理现实；多-KV-head 寻址的正确性由 `kv2` stress
-  用例和数值测试（`q_per_kv=2/4`）共同覆盖。`kv2` stress 的 TFLOPS 利用率最高（~44%）。
-- fused 相对 best-of-breed 串行基线全面 **1.19–1.43×**；大 hidden（Llama hid16384）下 AR
-  comm 占比高、overlap 偏低，是已知瓶颈。
-- chunk-prefill 用例为多段不规整 varlen（`_CHUNK_BIG` 8 段 / `_CHUNK_SMALL` 6 段，每段 ≤7.7K），
-  不含超长单序列；完整 seqlens 见 `benchmarks/bench_fused_fa_oproj_ar.py` 的 `README_CASES`。
+fused 相对 best-of-breed 串行基线全面 **1.19–1.43×**；大 hidden（如 Llama hid16384）下 AR
+comm 占比高、overlap 偏低，是已知瓶颈。完整用例集见 `bench_fused_fa_oproj_ar.py` 的
+`README_CASES`。
 
 ## 目录结构
 
 ```text
 src/mega_attention/
-  metadata/       # host 侧 varlen row tile 描述和 workspace size 计算
-  reference/      # PyTorch 参考实现
-  kernels/sm90/   # Hopper SM90 CuTe DSL kernel 原型
-  runtime/        # 后续放 workspace 分配、launch wrapper、参数校验
+  metadata/       # host 侧 varlen row tile 描述、workspace size、launch heuristic
+  reference/      # PyTorch 全链路参考实现（数值校验）
+  kernels/sm90/   # Hopper SM90 CuTe DSL kernel
+    fa_varlen.py / fa_ws.py       # FA tile / varlen FA payload
+    oproj_tile.py                 # 单 CTA O_proj tile microkernel
+    oproj_ar.py                   # standalone O_proj GEMM + NVLS AR 验证路径
+    fused_fa_oproj_ar.py          # 最终 fused persistent kernel
+  runtime/        # 占位：后续放 workspace 分配、launch wrapper、参数校验
 
 tests/
-  metadata/       # CPU 可跑的元数据测试
+  metadata/       # CPU 可跑的元数据 / launch heuristic 测试
   kernels/        # Hopper 单卡 kernel 测试
-  fused/          # persistent scheduler / fused path 阶段测试
+  fused/          # persistent scheduler / fused path 测试
 
-benchmarks/       # benchmark driver
+benchmarks/       # benchmark driver、launch-config sweep
 scripts/          # profiling、对比、smoke 脚本
 docs/             # 设计、状态、外部参考阅读笔记、profiling 文档
-scratch/          # 临时执行方案和实验记录
-third_party/      # 外部实现参考；flash-attention / DeepGEMM 为固定 submodule，不是运行时依赖
+third_party/      # 外部参考（flash-attention / DeepGEMM submodule，非运行时依赖）
 ```
 
 ## 安装
-
-开发安装：
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-核心依赖包括 PyTorch、CuTe DSL、CUDA Python bindings 和 quack kernels。完整 fused / NVLS 路径还需要 Hopper GPU、NCCL NVLS、`torch.distributed._symmetric_memory` 和支持 multicast 的 symmetric memory 环境。
+核心依赖：PyTorch、CuTe DSL、CUDA Python bindings、quack kernels。完整 fused / NVLS 路径还需
+Hopper GPU、NCCL NVLS、`torch.distributed._symmetric_memory` 和支持 multicast 的 symmetric
+memory 环境。实测可用版本：`nvidia-cutlass-dsl 4.5.0`、`quack-kernels 0.4.1`。
 
-实测可用版本：`nvidia-cutlass-dsl 4.5.0`、`quack-kernels 0.4.1`（`pyproject.toml` 的版本下限以此为准）。
+### CUDA 驱动 / forward-compat
 
-### CUDA 驱动 / forward-compat 注意
-
-如果 PyTorch 是基于 CUDA 13 构建（如 `torch 2.x+cu130`），而机器的 NVIDIA 内核驱动只支持到 CUDA 12.8（如 driver 570.x），直接运行任何 GPU 测试都会报：
-
-```text
-RuntimeError: The NVIDIA driver on your system is too old (found version 12080)
-```
-
-此时若机器已装 CUDA forward-compat 包（H200 等数据中心卡支持），用 compat 目录下的 userspace 驱动即可。不同机器的 CUDA 版本目录不同（如本机是 `cuda-13.2`），且 `libcuda.so` 在不同 compat 包里可能直接位于 `compat/` 下、也可能在 `compat/lib/` 子目录下，所以不要写死版本号和布局。优先用版本无关软链并把两种布局都加上：
+如果 PyTorch 基于 CUDA 13 构建（如 `torch 2.x+cu130`），而机器内核驱动只支持到更低版本，运行
+GPU 测试会报 `The NVIDIA driver on your system is too old`。此时若已装 CUDA forward-compat 包
+（H200 等数据中心卡支持），加上 compat 目录到 `LD_LIBRARY_PATH` 即可（两种布局都加上）：
 
 ```bash
 export LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/compat/lib:$LD_LIBRARY_PATH
-```
-
-若上面仍报 "driver too old"，直接定位 compat 里的 `libcuda.so.1` 再设置：
-
-```bash
+# 若仍报错，直接定位 compat 里的 libcuda.so.1：
 export LD_LIBRARY_PATH="$(dirname "$(find /usr/local/cuda*/compat -name 'libcuda.so.1' | head -1)")":$LD_LIBRARY_PATH
 ```
 
-设置后 `torch.cuda.is_available()` 应为 `True` 且识别为 `NVIDIA H200 (9, 0)`。本文下面所有 Hopper / 多卡命令都假设已设置该变量。
+## 测试
 
-> 注：本机驱动 570.x 已通过 nvidia-smi 报告 CUDA 13.2、torch 也是 cu13.2 构建，二者匹配，实际无需 forward-compat；上面命令仅在出现版本不匹配（驱动旧于 torch 构建版本）时才需要。
-
-## 测试分级
-
-CPU / 普通本机可跑：
+目标环境是多卡 Hopper + NVSwitch/NVLS。核心 kernel 整链测试与 benchmark：
 
 ```bash
-pytest tests/metadata
+torchrun --nproc_per_node=8 tests/fused/test_fused_full_chain.py   # 整链对 full_chain_reference
+torchrun --nproc_per_node=8 benchmarks/bench_fused_fa_oproj_ar.py --cases readme --auto
 ```
-
-Hopper 单卡可跑：
-
-```bash
-pytest tests/kernels
-pytest tests/fused/test_scheduler_skeleton.py
-```
-
-`tests/fused/test_fused_fa_path.py`、`tests/fused/test_fused_oproj_path.py` 和
-`tests/fused/test_fa_packed.py` 目前是 standalone 脚本（只有 `main()`，没有 `test_` 函数），
-用 `pytest` 跑会 `collected 0 items`。要跑它们用脚本方式：
-
-```bash
-python tests/fused/test_fa_packed.py          # FA payload 全 PASS（含 multi_seq）
-python tests/fused/test_fused_fa_path.py       # fused FA 路径全 PASS（含 multi_seq / vm44_300）
-python tests/fused/test_fused_oproj_path.py    # fused FA+O_proj+AR 协议，C_sym 对 oproj_reference
-```
-
-**已解决**：早期 `multi_seq [200,64,300]` 在 fused scheduler 死锁的问题已在 P0 定位并修复
-（根因是 FA finalize 把 warp-collective `warp_reduction_sum` 放在按 `valid_m` 发散的分支里，
-`valid_m%8≠0` 时 warp 内发散调用 shuffle 死锁；修复为无条件调用，见 `test_fa_varlen` 的
-`vm_split_m44` 与 `test_fused_fa_path` 的 `vm44_300` 回归用例）。
-
-多卡 Hopper + NVSwitch/NVLS 环境：
-
-```bash
-torchrun --nproc_per_node=8 benchmarks/bench_oproj_ar.py --iters 30 --warmup 10
-```
-
-本机 4070 Laptop GPU 不支持 SM90 CuTe kernel。它适合跑 metadata/reference 级别测试，不适合跑 Hopper kernel 或 NVLS benchmark。
 
 ## 开发原则
 
 - 先保持核心算法路径清楚，再考虑对外 API。
-- `src/mega_attention/kernels/sm90/` 里的 kernel 是阶段性原型，不承诺稳定导入路径。
-- 最终 public API 应该在 real FA + real O_proj + real NVLS AR 全部接入 fused kernel 后再暴露。
-- 所有新测试应标明运行前提：CPU、Hopper 单卡或多卡 NVLS。
+- `kernels/sm90/` 里 `fa_varlen` / `fa_ws` / `oproj_tile` / `oproj_ar` 是验证用原型，最终路径以
+  `fused_fa_oproj_ar.py` 为准；不承诺稳定导入路径。
