@@ -106,8 +106,8 @@ def try_fa(ctrl: cute.Tensor, num_fa: cutlass.Constexpr):
     """Bounded atomic claim of the next FA task. Returns (found, fa_task_id)."""
     found = cutlass.Int32(0)
     arg = cutlass.Int32(-1)
-    cnt = cute.arch.atomic_add(ctrl.iterator + C_FA_COUNTER, cutlass.Uint32(0),
-                               sem="relaxed", scope="gpu")
+    cnt = cute.arch.load(ctrl.iterator + C_FA_COUNTER, cutlass.Uint32,
+                         sem="relaxed", scope="gpu")
     if cnt < num_fa:                       # pre-check avoids unbounded over-claim
         tid = cute.arch.atomic_add(ctrl.iterator + C_FA_COUNTER, cutlass.Uint32(1),
                                    sem="relaxed", scope="gpu")
@@ -126,10 +126,10 @@ def try_pop_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor):
     """
     found = cutlass.Int32(0)
     arg = cutlass.Int32(-1)
-    head = cute.arch.atomic_add(ctrl.iterator + C_OP_CONSUME, cutlass.Uint32(0),
-                                sem="relaxed", scope="gpu")
-    tail = cute.arch.atomic_add(ctrl.iterator + C_OP_PUBLISH, cutlass.Uint32(0),
-                                sem="acquire", scope="gpu")
+    head = cute.arch.load(ctrl.iterator + C_OP_CONSUME, cutlass.Uint32,
+                          sem="relaxed", scope="gpu")
+    tail = cute.arch.load(ctrl.iterator + C_OP_PUBLISH, cutlass.Uint32,
+                          sem="acquire", scope="gpu")
     if head < tail:
         old = cute.arch.atomic_cas(ctrl.iterator + C_OP_CONSUME,
                                    cmp=head, val=head + cutlass.Uint32(1),
@@ -160,14 +160,14 @@ def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
     found = cutlass.Int32(0)
     arg = cutlass.Int32(-1)
     found_w = cutlass.Uint32(0)
-    start = cute.arch.atomic_add(ctrl.iterator + C_AR_CURSOR, cutlass.Uint32(0),
-                                 sem="relaxed", scope="gpu")
+    start = cute.arch.load(ctrl.iterator + C_AR_CURSOR, cutlass.Uint32,
+                           sem="relaxed", scope="gpu")
     i = cutlass.Uint32(0)
     n = cutlass.Uint32(owner_words_alloc)
     while (i < n) and (found == 0):
         w = (start + i) % n
-        word = cute.arch.atomic_add(ar_ready_bits.iterator + w, cutlass.Int64(0),
-                                    sem="acquire", scope="gpu")
+        word = cute.arch.load(ar_ready_bits.iterator + w, cutlass.Int64,
+                              sem="acquire", scope="gpu")
         if word != cutlass.Int64(0):
             lowest = word & (cutlass.Int64(0) - word)         # isolate lowest set bit
             bit_index = cute.arch.popc(lowest - cutlass.Int64(1))   # trailing-zero count
@@ -210,8 +210,8 @@ def publish_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor,
     # Ordered publish: wait until all earlier reservations are visible.
     spinning = True
     while spinning:
-        pt = cute.arch.atomic_add(ctrl.iterator + C_OP_PUBLISH, cutlass.Uint32(0),
-                                  sem="acquire", scope="gpu")
+        pt = cute.arch.load(ctrl.iterator + C_OP_PUBLISH, cutlass.Uint32,
+                            sem="acquire", scope="gpu")
         if pt == start:
             spinning = False
     cute.arch.atomic_add(ctrl.iterator + C_OP_PUBLISH, n,
@@ -301,12 +301,12 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
     mode = cutlass.Int32(MODE_IDLE)
     arg = cutlass.Int32(-1)
 
-    fa_d = cute.arch.atomic_add(ctrl.iterator + C_FA_DONE, cutlass.Uint32(0),
-                                sem="acquire", scope="gpu")
-    op_d = cute.arch.atomic_add(ctrl.iterator + C_OP_DONE, cutlass.Uint32(0),
-                                sem="acquire", scope="gpu")
-    ar_d = cute.arch.atomic_add(ctrl.iterator + C_AR_DONE, cutlass.Uint32(0),
-                                sem="acquire", scope="gpu")
+    fa_d = cute.arch.load(ctrl.iterator + C_FA_DONE, cutlass.Uint32,
+                          sem="acquire", scope="gpu")
+    op_d = cute.arch.load(ctrl.iterator + C_OP_DONE, cutlass.Uint32,
+                          sem="acquire", scope="gpu")
+    ar_d = cute.arch.load(ctrl.iterator + C_AR_DONE, cutlass.Uint32,
+                          sem="acquire", scope="gpu")
     all_done = (fa_d >= num_fa) and (op_d >= total_oproj) and (ar_d >= local_owned_ar)
 
     if all_done:

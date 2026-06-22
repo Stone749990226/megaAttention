@@ -52,3 +52,30 @@ NVLS AllReduce**，单卡 `tp_size=1` 与 8×H200 `tp_size=8` 两条路径都数
 | Workspace 生命周期与全局同步 / local grid_sync / nvl_barrier | 🟢 | P3 用到 nvl_barrier；workspace size 由 `row_desc` 计算 |
 | 长寿命 pipeline state、mbarrier 复用、mode 切换 drain 规则 | ❓ | 整链能跑通说明基本成立，但 mode 切换 drain 的边界正确性缺独立断言，**风险项**，见下 |
 | 第一版不做的事情（decode/append/chunked/paged/splitkv…） | ⚪ | 按约束不实现 |
+
+---
+
+## 调度热路径优化记录（2026-06-22）
+
+针对 `schedule_pick` 及其 `try_*` claim helper 的调度税做了一轮评估与改动。
+
+**已落地（保留）**：把调度热路径上 9 处**只读**的 `atomic_add(ptr, 0, sem, scope)`
+改为纯 `cute.arch.load(ptr, dtype, sem, scope)`（`try_fa` 的 counter 预检、
+`try_pop_oproj` 的 head/tail、`try_claim_ar` 的 cursor 与 ready word、`publish_oproj`
+的 publish 自旋、`schedule_pick` 的三个 done 计数）。语义不变（relaxed/acquire +
+gpu scope 一一对应），但去掉了 RMW：不再占用 L2 atomic ALU、不再独占 cache line，多个
+轮询 leader 可共享 read 同一条 L2 line。`gsync` 网格 barrier 未动。
+
+**尝试后放弃**：idle backoff（三类 source 全 miss 时 PTX `nanosleep` 指数退避）。
+原因——persistent grid 下 CTA 常驻，空转 CTA backoff 也不会把 SM 让给别人，经典 backoff
+理由不成立；它唯一能削的是空转 leader 对共享 L2 的读流量，而上面的 acquire-load 已把每次
+轮询变成廉价可共享 load，边际收益很小；且指数退避到 μs 级会在 pipeline fill/drain/相变
+等最该快的窗口给任务拾取加延迟。
+
+**验证（8×H200，9 个真实模型 shape，kineto self device time）**：改动前后整链 `err_rel`
+逐位一致；fused 墙钟 delta 落在 run-to-run 噪声内（geomean +0.2%，双向都有），删除 backoff
+后 geomean 几乎不变，反向印证 backoff 无贡献。墙钟无明显收益符合预期——调度读成本被 μs~ms
+级 FA/O_proj task body 摊薄，这批 shape 是 compute-bound。改动取其**正确性零影响 + 每次
+轮询更便宜 + 无墙钟下行**。要量化“更便宜的轮询”需用 ncu 看 `lts__t_sectors_op_atom*`
+等 atomic 吞吐指标（比墙钟灵敏），或构造 contention-bound shape，列为后续可选项。
+
