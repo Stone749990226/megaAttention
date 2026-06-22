@@ -34,18 +34,20 @@ def _i32(a, dev):
 
 
 def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tiles=4,
-             num_ctas=8, seed=0, w_fa=4, w_oproj=1, w_ar=1):
+             num_ctas=8, seed=0, w_fa=4, w_oproj=1, w_ar=1, q_per_kv=1):
     torch.manual_seed(seed)
     dev = torch.device(DEV)
     meta = build_row_desc(seqlens)
     R = meta.num_row_tiles
-    num_fa = R * H_local
+    num_fa = R * H_local                       # FA task 仍按 Q head 数
+    assert H_local % q_per_kv == 0, (H_local, q_per_kv)
+    H_kv = H_local // q_per_kv
     _, num_super_groups, total_oproj = oproj_task_counts(R, hidden, N_TILE, super_group_n_tiles)
     tot = int(sum(seqlens))
 
     Q = (torch.randn(tot, H_local, D, device=dev, dtype=DT) * 0.2)
-    K = (torch.randn(tot, H_local, D, device=dev, dtype=DT) * 0.2)
-    V = (torch.randn(tot, H_local, D, device=dev, dtype=DT) * 0.2)
+    K = (torch.randn(tot, H_kv, D, device=dev, dtype=DT) * 0.2)
+    V = (torch.randn(tot, H_kv, D, device=dev, dtype=DT) * 0.2)
     Oscr = torch.zeros(R, 128, H_local, D, device=dev, dtype=DT)
     # O_proj is now real: provide W_o / C_sym buffers (this test only checks O_scratch
     # + scheduler, but the fused kernel runs the full FA -> O_proj path).
@@ -84,7 +86,7 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     ker = FusedFaOprojAr(num_fa=num_fa, num_row_tiles=R, H_local=H_local, D=D,
                          num_super_groups=num_super_groups, total_oproj=total_oproj,
                          num_ctas=num_ctas, hidden=hidden, tp_size=1, N_TILE=N_TILE,
-                         super_group_n_tiles=super_group_n_tiles,
+                         super_group_n_tiles=super_group_n_tiles, q_per_kv=q_per_kv,
                          w_fa=w_fa, w_oproj=w_oproj, w_ar=w_ar)
     ts = torch.cuda.Stream(); st = cuda.CUstream(ts.cuda_stream)
     compiled = cute.compile(ker, *cts, st)
@@ -135,18 +137,23 @@ def _check(name, r, tol=2e-2):
 
 def main():
     cases = [
-        ("uniform_128",   [128],          4, 512),
-        ("varlen_200",    [200],          4, 512),
+        ("uniform_128",   [128],          4, 512, 1),
+        ("varlen_200",    [200],          4, 512, 1),
         # 单序列 [300]: 末 tile valid_m=44 (300%128, 非 8 的倍数) -> finalize 的 warp
         # collective shuffle 若放在 valid_m 发散分支内会死锁。显式回归该 bug。
-        ("vm44_300",      [300],          4, 512),
-        ("multi_seq",     [200, 64, 300], 4, 768),
-        ("multiseq_h8",   [128, 384, 64], 8, 512),
+        ("vm44_300",      [300],          4, 512, 1),
+        ("multi_seq",     [200, 64, 300], 4, 768, 1),
+        ("multiseq_h8",   [128, 384, 64], 8, 512, 1),
+        # GQA: 8 Q head 共享 2 KV head (q_per_kv=4)，跨多序列 + 含 tail tile
+        ("gqa_q4_h8",     [200, 64, 300], 8, 512, 4),
+        # GQA: q_per_kv=2，验证非整 tile 末尾 (300%128=44) 下的 K/V 复用
+        ("gqa_q2_h8_vm44", [300],         8, 512, 2),
     ]
     failed = 0
-    for name, seqlens, H, hidden in cases:
+    for name, seqlens, H, hidden, q_per_kv in cases:
         try:
-            r = run_case(seqlens, H, hidden=hidden, seed=hash(name) % 1000)
+            r = run_case(seqlens, H, hidden=hidden, seed=hash(name) % 1000,
+                         q_per_kv=q_per_kv)
             if not _check(name, r):
                 failed += 1
         except Exception as e:  # noqa: BLE001

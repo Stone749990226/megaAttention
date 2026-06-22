@@ -188,11 +188,12 @@ pytest tests/metadata
 pytest tests/kernels
 # 下面两个是 standalone 脚本（没有 test_ 函数），用 pytest 跑会 collected 0 items：
 python tests/fused/test_fa_packed.py
-python tests/fused/test_fused_fa_path.py   # 已知：multi_seq 用例在 fused scheduler 里死锁，单序列用例通过
+python tests/fused/test_fused_fa_path.py 
 torchrun --nproc_per_node=8 benchmarks/bench_oproj_ar.py --iters 30 --warmup 10
 ```
 
 根据上下文选择能运行的最小验证集合，并明确说明哪些测试没有运行以及原因。
+当你进行代码上的修改后，需要运行benchmark测试与修改前进行对比验证。
 
 ## 回答和落盘语言
 

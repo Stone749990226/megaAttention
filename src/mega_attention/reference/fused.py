@@ -42,20 +42,24 @@ def shapes(world_size: int):
 
 # ---------------------------------------------------------------- inputs ----
 def make_qkv_inputs(rank: int, world_size: int, seqlens_q, device,
-                    dtype=DTYPE, seqlens_k=None, seed_base: int = 1234):
+                    dtype=DTYPE, seqlens_k=None, seed_base: int = 1234,
+                    q_per_kv: int = 1):
     """Per-rank varlen-packed Q/K/V and the O_proj weight.
 
     Returns
     -------
-    Q, K, V : [total_tokens, H_local, D] bf16 (varlen packed; K/V use seqlens_k).
-    W_o     : [K_local, hidden] bf16 (k-major contiguous; same per-rank seed
-              convention as reference.py so ranks genuinely differ).
+    Q : [tot_q, H_local, D] bf16；K, V : [tot_k, H_kv_local, D] bf16，
+        H_kv_local = H_local // q_per_kv（q_per_kv == 1 即 MHA）。
+    W_o : [K_local, hidden] bf16，K_local = H_local*D（O_proj K 维按 Q head 数，
+          不随 q_per_kv 变；同 reference.py 的 per-rank seed 约定，确保各 rank 不同）。
     """
     seqlens_q = np.asarray(seqlens_q, dtype=np.int64)
     if seqlens_k is None:
         seqlens_k = seqlens_q
     seqlens_k = np.asarray(seqlens_k, dtype=np.int64)
     h_local, d, hidden, k_local = shapes(world_size)
+    assert h_local % q_per_kv == 0, (h_local, q_per_kv)
+    h_kv_local = h_local // q_per_kv
     tot_q = int(seqlens_q.sum())
     tot_k = int(seqlens_k.sum())
 
@@ -65,8 +69,8 @@ def make_qkv_inputs(rank: int, world_size: int, seqlens_q, device,
     gw = torch.Generator(device=device).manual_seed(seed_base + rank)
 
     Q = (torch.randn(tot_q, h_local, d, device=device, dtype=dtype, generator=gq) * 0.1)
-    K = (torch.randn(tot_k, h_local, d, device=device, dtype=dtype, generator=gk) * 0.1)
-    V = (torch.randn(tot_k, h_local, d, device=device, dtype=dtype, generator=gv) * 0.1)
+    K = (torch.randn(tot_k, h_kv_local, d, device=device, dtype=dtype, generator=gk) * 0.1)
+    V = (torch.randn(tot_k, h_kv_local, d, device=device, dtype=dtype, generator=gv) * 0.1)
     W_o = (torch.randn(k_local, hidden, device=device, dtype=dtype, generator=gw)
            * (k_local ** -0.5))
     return Q.contiguous(), K.contiguous(), V.contiguous(), W_o.contiguous()
@@ -76,9 +80,14 @@ def make_qkv_inputs(rank: int, world_size: int, seqlens_q, device,
 def fa_reference(Q, K, V, meta: RowDescMeta, softmax_scale=None):
     """Causal varlen prefill attention in fp32.
 
-    Q : [tot_q, H, D], K/V : [tot_k, H, D] (varlen packed). Returns O [tot_q, H, D].
+    Q : [tot_q, H_local, D], K/V : [tot_k, H_kv_local, D] (varlen packed).
+    支持标准 GQA：q_per_kv = H_local / H_kv_local，连续分组 kv_head = q_head // q_per_kv。
+    q_per_kv == 1 即退化为 MHA。Returns O [tot_q, H_local, D].
     """
     h_local = Q.shape[1]
+    h_kv = K.shape[1]
+    assert h_local % h_kv == 0, (h_local, h_kv)
+    q_per_kv = h_local // h_kv
     d = Q.shape[2]
     scale = softmax_scale if softmax_scale is not None else d ** -0.5
     O = torch.zeros_like(Q, dtype=torch.float32)
@@ -87,10 +96,13 @@ def fa_reference(Q, K, V, meta: RowDescMeta, softmax_scale=None):
         ks = int(meta.cu_seqlens_k[b]); ke = int(meta.cu_seqlens_k[b + 1])
         if qe == qs:
             continue
-        # [H, Lq, D] / [H, Lk, D] for batched SDPA
+        # [H, Lq, D] / [H_kv, Lk, D] for batched SDPA；GQA 时把 K/V 沿 head 维展开到 H
         q = Q[qs:qe].float().transpose(0, 1)
         k = K[ks:ke].float().transpose(0, 1)
         v = V[ks:ke].float().transpose(0, 1)
+        if q_per_kv > 1:
+            k = k.repeat_interleave(q_per_kv, dim=0)
+            v = v.repeat_interleave(q_per_kv, dim=0)
         # causal mask aligned to the bottom-right (seqlen_q may != seqlen_k).
         o = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
         O[qs:qe] = o.transpose(0, 1)

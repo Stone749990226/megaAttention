@@ -39,21 +39,26 @@ def cdiv(a, b):
 def softmax_block_dyn(acc_mn: cute.Tensor, row_max: cute.Tensor, row_sum: cute.Tensor,
                       row_scale: cute.Tensor, nrows: cutlass.Constexpr,
                       slog2: cutlass.Constexpr, is_first: cutlass.Constexpr,
-                      coord_mn: cute.Tensor, n_block, q_start, k_len):
+                      coord_mn: cute.Tensor, n_block, q_start, k_len,
+                      need_mask: cutlass.Constexpr = True):
     """Online-softmax step with runtime causal and k_len masking.
 
     is_first remains compile-time for the prologue/middle split. n_block, q_start,
     and k_len are runtime. A score is valid only when kv_pos <= q_pos and
     kv_pos < k_len. row_sum stores local per-thread partial sums; the warp-quad
     reduction is deferred to finalization.
+
+    need_mask is compile-time. 右->左遍历时只有对角块需要 mask；左侧全可见块传
+    need_mask=False 跳过逐元素比较（n_block 此时不参与计算）。
     """
     for r in cutlass.range_constexpr(nrows):
         coord_row = coord_mn[r, None]
-        for c in cutlass.range_constexpr(cute.size(acc_mn, mode=[1])):
-            q_pos = q_start + coord_row[c][0]
-            kv_pos = n_block * 128 + coord_row[c][1]
-            if (kv_pos > q_pos) or (kv_pos >= k_len):
-                acc_mn[r, c] = -cutlass.Float32.inf
+        if cutlass.const_expr(need_mask):
+            for c in cutlass.range_constexpr(cute.size(acc_mn, mode=[1])):
+                q_pos = q_start + coord_row[c][0]
+                kv_pos = n_block * 128 + coord_row[c][1]
+                if (kv_pos > q_pos) or (kv_pos >= k_len):
+                    acc_mn[r, c] = -cutlass.Float32.inf
         row = acc_mn[r, None].load()
         m_old = row_max[r]
         if cutlass.const_expr(is_first):

@@ -92,6 +92,39 @@ fused（单 persistent kernel）vs 非融合 best-of-breed 基线
 > 与独立的 FA+GEMM+NVLS 基线路径逐 tile 对比，全部 shape `err_rel` 在 ~4e-4–2e-3（bf16 级），
 > 即融合结果与参考路径一致、算得对。
 
+### GQA 性能（chunk-prefill，8×H200，`--cases readme --auto`）
+
+kernel 现已支持标准 GQA（K/V 按 `kv_head = q_head // q_per_kv` 复用）。下表用真实 GQA 配置：
+K/V 以真实 `H_kv_local = H_local / q_per_kv` 个 head 构造，baseline 也走原生 GQA 的
+`flash_attn_varlen_func`。锚定大模型 TP8 per-rank 形状 + chunk-prefill 多段不规整 varlen
+（每段 ≤8K）。计时为 kineto self device time（30 iters / 10 warmup）。
+
+旗舰 GQA 模型 `num_kv_heads ≤ 8`，TP8 下每 rank 只剩 1 个 KV head（kv<8 跨 rank 复制），即
+per-rank MQA（`kv1`）——这是真实部署形态。额外加一个合成 `num_kv_heads=16` 配置，TP8 下每
+rank=2 个 KV head（`kv2`），真正压多-KV-head 寻址路径。
+
+| 模型 (per-rank @ TP8) | batch (tot tokens) | fused ms | overlap% | TFLOPS (util) | NVLink GB/s | ratio | err_rel |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-235B-A22B H8/kv1 hid4096 | varlen B8 ~22.6K | 1.261 | 68% | 340 (34%) | 263 | **1.43×** | 7.1e-4 |
+| Qwen3-235B-A22B H8/kv1 hid4096 | varlen B6 ~13.4K | 0.775 | 73% | 315 (32%) | 254 | **1.43×** | 8.2e-4 |
+| Qwen3-Coder-480B-A35B H12/kv1 hid6144 | varlen B8 ~22.6K | 2.190 | 50% | 360 (36%) | 227 | **1.26×** | 8.5e-4 |
+| Qwen3-Coder-480B-A35B H12/kv1 hid6144 | varlen B6 ~13.4K | 1.315 | 50% | 344 (35%) | 225 | **1.24×** | 7.7e-4 |
+| GLM-4.6 H12/kv1 hid5120 | varlen B8 ~22.6K | 1.936 | 50% | 370 (37%) | 214 | **1.23×** | 8.1e-4 |
+| GLM-4.6 H12/kv1 hid5120 | varlen B6 ~13.4K | 1.174 | 56% | 349 (35%) | 210 | **1.25×** | 9.3e-4 |
+| Llama-3.1-405B H16/kv1 hid16384 | varlen B8 ~22.6K | 5.124 | 36% | 395 (40%) | 259 | **1.19×** | 1.3e-3 |
+| Llama-3.1-405B H16/kv1 hid16384 | varlen B6 ~13.4K | 3.038 | 37% | 388 (39%) | 260 | **1.20×** | 1.5e-3 |
+| 合成 kv16 stress H16/kv2 hid8192 | varlen B8 ~22.6K | 2.844 | 64% | 438 (44%) | 234 | **1.32×** | 1.5e-3 |
+| 合成 kv16 stress H16/kv2 hid8192 | varlen B6 ~13.4K | 1.686 | 68% | 426 (43%) | 234 | **1.34×** | 8.7e-4 |
+
+说明：
+- 全部 case `err_rel < 1.5e-3`（fused GQA C_sym 对原生 GQA best-of-breed 基线，bf16 级一致）。
+- 真实旗舰模型 TP8 = `kv1`（per-rank MQA）是物理现实；多-KV-head 寻址的正确性由 `kv2` stress
+  用例和数值测试（`q_per_kv=2/4`）共同覆盖。`kv2` stress 的 TFLOPS 利用率最高（~44%）。
+- fused 相对 best-of-breed 串行基线全面 **1.19–1.43×**；大 hidden（Llama hid16384）下 AR
+  comm 占比高、overlap 偏低，是已知瓶颈。
+- chunk-prefill 用例为多段不规整 varlen（`_CHUNK_BIG` 8 段 / `_CHUNK_SMALL` 6 段，每段 ≤7.7K），
+  不含超长单序列；完整 seqlens 见 `benchmarks/bench_fused_fa_oproj_ar.py` 的 `README_CASES`。
+
 ## 目录结构
 
 ```text

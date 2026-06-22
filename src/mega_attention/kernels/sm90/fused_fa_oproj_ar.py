@@ -360,6 +360,7 @@ class FusedFaOprojAr:
 
     def __init__(self, num_fa, num_row_tiles, H_local, D, num_super_groups,
                  total_oproj, num_ctas, hidden, tp_size=1, rank=0, kv_stages=2,
+                 q_per_kv=1,
                  N_TILE=128, super_group_n_tiles=4, K_CHUNK=64, oproj_stages=4,
                  csym_mc_ptr=0, nvl_mc_ptr=0, nvl_local_ptr=0, rc_ptrs=(), rb_ptrs=(),
                  softmax_scale=None, acc_dtype=cutlass.Float32,
@@ -374,6 +375,10 @@ class FusedFaOprojAr:
         self.num_fa = num_fa
         self.num_row_tiles = num_row_tiles
         self.H_local = H_local
+        # 标准 GQA：H_local 是 Q head 数，K/V 复用 H_kv_local 个 head。
+        assert H_local % q_per_kv == 0, (H_local, q_per_kv)
+        self.q_per_kv = q_per_kv                 # 连续分组比；==1 即 MHA
+        self.H_kv_local = H_local // q_per_kv
         self.M = 128
         self.N = 128
         self.D = D
@@ -670,7 +675,10 @@ class FusedFaOprojAr:
                     # Decode runtime FA descriptor. Every thread derives the same
                     # descriptor from arg; no CTA-local descriptor protocol is used.
                     ft = arg // cutlass.Int32(H_local)
-                    head = arg % cutlass.Int32(H_local)
+                    head = arg % cutlass.Int32(H_local)          # Q head
+                    # 标准 GQA：连续 q_per_kv 个 Q head 共享一个 K/V head。
+                    q_per_kv = cutlass.const_expr(self.q_per_kv)
+                    kv_head = head // cutlass.Int32(q_per_kv)
                     b = mFaB[ft]
                     mb = mFaMb[ft]
                     q_start = mCuQ[b]
@@ -682,8 +690,8 @@ class FusedFaOprojAr:
 
                     mQ_cur = cute.domain_offset((q_start, None, None), tQ)[None, None, head]
                     gQ = cute.local_tile(mQ_cur, (self.M, self.D), (None, 0))
-                    mK_cur = cute.domain_offset((k_start, None, None), mK)[None, None, head]
-                    mV_cur = cute.domain_offset((k_start, None, None), mV)[None, None, head]
+                    mK_cur = cute.domain_offset((k_start, None, None), mK)[None, None, kv_head]
+                    mV_cur = cute.domain_offset((k_start, None, None), mV)[None, None, kv_head]
                     gK = cute.local_tile(mK_cur, (self.N, self.D), (None, 0))
                     gV = cute.local_tile(mV_cur, (self.N, self.D), (None, 0))
                     tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(
@@ -711,7 +719,8 @@ class FusedFaOprojAr:
                                       tma_bar_ptr=pl_q.producer_get_barrier(fa_q_prod))
                             pl_q.producer_commit(fa_q_prod)
                             fa_q_prod.advance()
-                            for j in cutlass.range(nblk, unroll=1):
+                            for i in cutlass.range(nblk, unroll=1):
+                                j = nblk - cutlass.Int32(1) - i      # 右->左：对角块先 load
                                 pl_k.producer_acquire(fa_k_prod)
                                 cute.copy(tma_k, tKgK[(None, j)], tKsK[(None, fa_k_prod.index)],
                                           tma_bar_ptr=pl_k.producer_get_barrier(fa_k_prod))
@@ -751,7 +760,7 @@ class FusedFaOprojAr:
                         acc_O.fill(0.0)
                         # Q must be fully loaded before any QK MMA reads sQ.
                         pl_q.consumer_wait(fa_q_cons)
-                        # First K block initializes the online softmax state.
+                        # 右->左：第一个处理的是对角块 (n = nblk-1)，唯一需要 causal+k_len mask。
                         pl_k.consumer_wait(fa_k_cons)
                         acc_S.fill(0.0)
                         mma_qk.set(warpgroup.Field.ACCUMULATE, True)
@@ -764,11 +773,14 @@ class FusedFaOprojAr:
                         pl_k.consumer_release(fa_k_cons)
                         fa_k_cons.advance()
                         softmax_block_dyn(acc_mn, row_max, row_sum, row_scale, nrows, slog2,
-                                          True, coord_mn, cutlass.Int32(0), mask_q_off, k_len)
+                                          True, coord_mn, nblk - cutlass.Int32(1),
+                                          mask_q_off, k_len)
                         tOrP.store(tOrP_v.load().to(self.dt))
 
-                        # Middle blocks overlap QK(j) with PV(j-1).
-                        for j in cutlass.range(1, nblk, unroll=1):
+                        # 右->左中间块 (n = nblk-1-i, 递减到 0)：QK(n) overlaps PV(n+1)。
+                        # n 全在对角线左侧、完全可见，跳过 mask。
+                        for i in cutlass.range(1, nblk, unroll=1):
+                            n = nblk - cutlass.Int32(1) - i
                             pl_k.consumer_wait(fa_k_cons)
                             acc_S.fill(0.0)
                             mma_qk.set(warpgroup.Field.ACCUMULATE, True)
@@ -787,7 +799,8 @@ class FusedFaOprojAr:
                             pl_k.consumer_release(fa_k_cons)
                             fa_k_cons.advance()
                             softmax_block_dyn(acc_mn, row_max, row_sum, row_scale, nrows, slog2,
-                                              False, coord_mn, j, mask_q_off, k_len)
+                                              False, coord_mn, n, mask_q_off, k_len,
+                                              need_mask=False)
                             cute.nvgpu.warpgroup.wait_group(0)
                             pl_v.consumer_release(fa_v_cons)
                             fa_v_cons.advance()

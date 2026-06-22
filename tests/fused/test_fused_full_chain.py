@@ -33,6 +33,8 @@ def main():
     symm_mem.enable_symm_mem_for_group(gname)
 
     seqlens, H_local, D, hidden = [200, 64, 300], 4, 128, 512
+    q_per_kv = 2                                   # GQA: 4 Q head 共享 2 KV head
+    H_kv = H_local // q_per_kv
     N_TILE, sg = 128, 4
     torch.manual_seed(1000 + rank)
     meta = build_row_desc(seqlens)
@@ -48,8 +50,8 @@ def main():
     # per-rank inputs (different seeds -> AR is a real cross-rank sum)
     g = torch.Generator(device=dev).manual_seed(1234 + rank)
     Q = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
-    K = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
-    V = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
+    K = torch.randn(tot, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
+    V = torch.randn(tot, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
     W_o = torch.randn(K_local, hidden, device=dev, dtype=DT, generator=g) * (K_local ** -0.5)
     W_o_pad = torch.zeros(K_local, hidden_pad, device=dev, dtype=DT); W_o_pad[:, :hidden] = W_o
     Oscr = torch.zeros(R, 128, H_local, D, device=dev, dtype=DT)
@@ -81,7 +83,7 @@ def main():
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
 
     ker = FusedFaOprojAr(
-        num_fa=num_fa, num_row_tiles=R, H_local=H_local, D=D,
+        num_fa=num_fa, num_row_tiles=R, H_local=H_local, D=D, q_per_kv=q_per_kv,
         num_super_groups=num_super_groups, total_oproj=total_oproj, num_ctas=8,
         hidden=hidden, tp_size=ws, rank=rank, N_TILE=N_TILE, super_group_n_tiles=sg,
         csym_mc_ptr=hC.multicast_ptr, nvl_mc_ptr=hN.multicast_ptr,

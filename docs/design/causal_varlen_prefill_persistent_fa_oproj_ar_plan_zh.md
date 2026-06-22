@@ -22,6 +22,10 @@ causal mask、online softmax、TMA/WGMMA/mbarrier 协作等实现细节。它不
 - Q token 数量较多。
 - decoder-only serving 中的 prompt 阶段。
 - 完整 prompt prefill：每个 sequence 满足 `q_len == k_len`。
+- attention head 支持 MHA 与标准 GQA：Q head 数 `H_local`，K/V head 数 `H_kv_local`，
+  分组比 `q_per_kv = H_local / H_kv_local`（`q_per_kv == 1` 即退化为 MHA）。这里只做
+  标准 GQA（kernel 内按 `kv_head = q_head / q_per_kv` 复用 K/V head），不做 pack_gqa
+  把 group 维折进 M 的优化。
 - FlashAttention 后接 O_proj。
 - O_proj 后接 tensor-parallel NVLS AllReduce。
 - 使用一个 persistent kernel，把 FA、O_proj、AllReduce 串在同一个 kernel 内。
@@ -63,6 +67,32 @@ k_index <= q_index + (seqlen_k - seqlen_q)
 
 第一版 fused kernel 显式排除这种 append/decode/chunked prefill 路径，避免把复杂度混入
 第一版 O_proj/AR 融合验证。
+
+### Q/K/V head 模型与 GQA
+
+第一版同时支持 MHA 和标准 GQA。每个 TP rank 上：
+
+```text
+Q : [tot_q, H_local,    D]      # H_local    = 本 rank 上的 Q head 数
+K : [tot_k, H_kv_local, D]      # H_kv_local = 本 rank 上的 K/V head 数
+V : [tot_k, H_kv_local, D]
+q_per_kv = H_local / H_kv_local # 连续分组比，H_local % q_per_kv == 0
+```
+
+GQA 语义：连续 `q_per_kv` 个 Q head 共享同一个 K/V head：
+
+```text
+O[t, h] = softmax(Q[t, h] @ K[h / q_per_kv]^T * scale) @ V[h / q_per_kv]
+kv_head = q_head / q_per_kv           # 整数除，head 连续分组
+```
+
+关键不变量：**attention 输出仍是每个 Q head 一份**，所以 `H_local`（Q head 数）才是
+O_scratch、head_ready、O_proj、AR 各级 layout 与计数的依据；GQA 只改变 K/V 的 head 寻址，
+不改变下游任何 layout、task 计数或 ready/count/owner 协议。`q_per_kv == 1` 时本节退化为 MHA，
+必须与原 MHA 路径逐元素等价。
+
+TP 约束：全局 `H_kv` 需能被 TP 整除，每 rank 的 `q_per_kv = H_local / H_kv_local`
+与全局 `H_q / H_kv` 一致。
 
 ### Tile 尺寸约定
 
@@ -106,10 +136,14 @@ O_scratch[fa_row_tile_id, m, head, d]      # m = 0 .. 127
 fa_row_key : 一个 varlen sequence 内的一组 128 个 Q rows，逻辑上 (batch_idx, fa_m_block)
 batch_idx  : 当前 serving batch 中的序列编号
 fa_m_block : 当前 sequence 内的 128 行 Q tile 编号，不跨 sequence 递增
-head       : 当前 TP rank 上的 local attention head
+head       : 当前 TP rank 上的 local attention head（Q head，范围 0 .. H_local-1）
 m          : FA tile 内的行位置 (0 .. FA_M_TILE-1)
 d          : head_dim 维度
 ```
+
+GQA 下 `head` 是 Q head，K/V 的 head 在 kernel 内按 `kv_head = head / q_per_kv` 派生
+（见“Q/K/V head 模型与 GQA”）。FA task 仍以 Q head 为粒度，task 数 `num_fa_row_tiles * H_local`
+不变，O_scratch 仍按 Q head 数 `H_local` 组织。
 
 物理存储使用压平后的 FA row tile id：
 
@@ -292,6 +326,7 @@ compile-time:
     K_CHUNK = 64
     oproj_stages = 4
     H_local / K_local / hidden tile 参数按 launch variant 固定
+    q_per_kv / H_kv_local 按 launch variant 固定（MHA 时 q_per_kv = 1）
 ```
 
 每个 task 的 varlen 坐标、有效行数、KV block 范围、O_proj tail 范围在 runtime 解码：
@@ -317,7 +352,8 @@ FA task 的 runtime descriptor：
 fa_task_id = atomicAdd(fa_task_counter, 1)
 
 fa_row_tile_id = fa_task_id / H_local
-head           = fa_task_id % H_local
+head           = fa_task_id % H_local     # Q head
+kv_head        = head / q_per_kv          # 标准 GQA：连续 q_per_kv 个 Q head 共享一个 K/V head
 
 row_desc       = fa_row_desc[fa_row_tile_id]
 batch_idx      = row_desc.batch_idx
@@ -1225,7 +1261,7 @@ Step A: first_half(B3)
     wait K.stage0 full
     QK(B3) -> acc_S
     release K.stage0
-    mask / online_softmax(acc_S)
+    mask + online_softmax(acc_S)      # B3 是对角块：唯一需要 causal + k_len mask
     tOrP = P(B3)
 
 Step B: current=B2, previous=B3
@@ -1237,18 +1273,18 @@ Step B: current=B2, previous=B3
 
     wait_group(1)       # 等较老的 QK(B2) 完成，允许 PV(B3) 继续飞
     release K.stage1
-    mask / online_softmax(acc_S)      # acc_S 原地变成 P(B2)
+    online_softmax(acc_S)             # B2 全可见，跳过 mask；acc_S 原地变成 P(B2)
 
     wait_group(0)       # 等 PV(B3) 完成
     release V.stage0
     tOrP = P(B2)        # 覆盖旧 P(B3)，给下一轮 PV(B2) 用
 
 Step C: current=B1, previous=B2
-    QK(B1) overlaps PV(B2)
+    QK(B1) overlaps PV(B2)；B1 全可见，跳过 mask
     end: tOrP = P(B1)
 
 Step D: current=B0, previous=B1
-    QK(B0) overlaps PV(B1)
+    QK(B0) overlaps PV(B1)；B0 全可见，跳过 mask
     end: tOrP = P(B0)
 
 Step E: last_half(B0)
@@ -1256,6 +1292,13 @@ Step E: last_half(B0)
     PV(B0): tOrP=P(B0) @ V(B0) -> acc_O
     release V.stage1
 ```
+
+掩码分段（与 FA4 一致，但因第一版 `FA_M_TILE == N_TILE == 128` 而退化为最简形态）：
+对一个 Q row tile（行 `[mb*128, mb*128+127]`），causal 的三角边界 `kv_pos <= q_pos`
+与尾部边界 `kv_pos < k_len` 都只落在对角块 `n = mb` 之内；左侧块 `n < mb` 的列全部
+`< mb*128 <= k_len` 且 `<= 所有 q_pos`，因此**完全可见、无需 mask**。所以右→左遍历时
+**只有第一个处理的对角块需要 mask，其余块走免 mask 快路径**，省掉 `mb` 个块的逐元素
+mask 比较，并让对角块（含 query 自身位置的 keys）先建立 running max，减少后续 rescale。
 
 这里 `P` 不在 K/V stage 中。QK 的 WGMMA 输出 `acc_S` 是当前 WG 的寄存器 accumulator；
 `online_softmax(acc_S)` 会把 scores 原地改写成未归一化概率 `P`，再通过
@@ -2343,7 +2386,8 @@ barrier 3: signal[1] 从 tp_size 减到 0
 - KV split。
 - paged KV。
 - block sparsity。
-- pack_gqa 优化。
+- pack_gqa 优化（标准 GQA 已支持，见“Q/K/V head 模型与 GQA”；这里仅排除把 group 维
+  折进 M 维、KV 整组复用的 pack_gqa 实现，该优化收益主要在 decode/短 query）。
 - 独立 comm warp group。
 - 跨 WG 合并同一行或同一元素的 accumulator。
 

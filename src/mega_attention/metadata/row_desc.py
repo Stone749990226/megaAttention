@@ -74,7 +74,9 @@ class RowDescMeta:
     """Unified 128-row schedule metadata for one varlen batch.
 
     `t` denotes a flattened row_tile_id in [0, num_row_tiles). FA task id is
-    `t * H_local + head`; O_proj/AR slot id is `t * num_super_groups + nsg`.
+    `t * H_local + head`，其中 H_local 是 Q head 数；GQA 下 K/V 在 kernel 内按
+    kv_head = head // q_per_kv 复用（H_kv_local = H_local // q_per_kv），FA task 数
+    与 O_scratch 仍按 Q head 数 H_local 组织。O_proj/AR slot id 是 `t * num_super_groups + nsg`。
     """
 
     num_batch: int

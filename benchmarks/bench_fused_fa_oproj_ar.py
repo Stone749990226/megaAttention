@@ -116,22 +116,29 @@ def _tok(n):
     return f"{n/1024:.1f}K".replace(".0K", "K") if n >= 1024 else str(n)
 
 
-def shape_label(seqlens, H_local, hidden):
+def shape_label(seqlens, H_local, hidden, q_per_kv=1):
     if len(seqlens) == 1:
         body = f"[{_tok(seqlens[0])}]"
     elif len(set(seqlens)) == 1:
         body = f"[{_tok(seqlens[0])}]x{len(seqlens)}"
     else:                                    # 混合长尾 varlen: 紧凑摘要, 完整 seqlens 进 JSON
         body = f"varlen(B={len(seqlens)},tot={_tok(sum(seqlens))},max={_tok(max(seqlens))})"
-    return f"{body} H{H_local} hid{hidden}"
+    hd = f"H{H_local}" if q_per_kv == 1 else f"H{H_local}/kv{H_local // q_per_kv}"
+    return f"{body} {hd} hid{hidden}"
 
 
 def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
-              ws, rank, dev, iters, warmup, dump=False):
-    """Build buffers, compile fused kernel, time fused + 3 baseline segments, return row dict."""
+              ws, rank, dev, iters, warmup, dump=False, q_per_kv=1):
+    """Build buffers, compile fused kernel, time fused + 3 baseline segments, return row dict.
+
+    q_per_kv: 标准 GQA 分组比 (per rank)。K/V 用 H_kv_local = H_local // q_per_kv 个 head；
+    q_per_kv == 1 即 MHA。baseline flash_attn_varlen_func 原生支持 GQA。
+    """
     gname = dist.group.WORLD.group_name
 
     D, N_TILE = 128, 128
+    assert H_local % q_per_kv == 0, (H_local, q_per_kv)
+    H_kv = H_local // q_per_kv
     meta = build_row_desc(seqlens)
     R = meta.num_row_tiles
     K_local = H_local * D
@@ -143,8 +150,8 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
 
     g = torch.Generator(device=dev).manual_seed(1234 + rank)
     Q = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
-    K = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
-    V = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
+    K = torch.randn(tot, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
+    V = torch.randn(tot, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
     W_o = torch.randn(K_local, hidden, device=dev, dtype=DT, generator=g) * (K_local ** -0.5)
     W_o_pad = torch.zeros(K_local, hidden_pad, device=dev, dtype=DT); W_o_pad[:, :hidden] = W_o
     Oscr = torch.zeros(R, 128, H_local, D, device=dev, dtype=DT)
@@ -174,7 +181,7 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
 
     ker = FusedFaOprojAr(
-        num_fa=num_fa, num_row_tiles=R, H_local=H_local, D=D,
+        num_fa=num_fa, num_row_tiles=R, H_local=H_local, D=D, q_per_kv=q_per_kv,
         num_super_groups=num_super_groups, total_oproj=total_oproj, num_ctas=132,
         hidden=hidden, tp_size=ws, rank=rank, N_TILE=N_TILE, super_group_n_tiles=sg,
         csym_mc_ptr=hC.multicast_ptr, nvl_mc_ptr=hN.multicast_ptr,
@@ -251,8 +258,8 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     nvl_algbw = s_bytes / 1e9 / (t_fused / 1e3)
 
     row = dict(
-        shape=shape_label(seqlens, H_local, hidden), seqlens=seqlens, H_local=H_local,
-        hidden=hidden, tp=ws, tot=tot,
+        shape=shape_label(seqlens, H_local, hidden, q_per_kv), seqlens=seqlens, H_local=H_local,
+        hidden=hidden, tp=ws, tot=tot, q_per_kv=q_per_kv, H_kv_local=H_kv,
         fused_ms=t_fused, t_fa=t_fa, t_oproj=t_oproj, t_ar=t_ar,
         serial_ms=t_base, ideal_ms=t_ideal, overlap_pct=overlap_pct,
         tflops=tflops, tflops_pct=tflops / H200_BF16_TFLOPS * 100.0,
@@ -287,24 +294,34 @@ def print_table(rows):
           ">100% 表示融合优于完美重叠的最强基线。", flush=True)
 
 
-# 真实大模型 (8 卡 TP, 按 head 切分, head_dim=128) 锚定的 cases。
-# 当前 kernel 为 MHA: K/V 与 Q head 1:1 (fused_fa_oproj_ar.py:653-667), 不支持 GQA。
-# 故 K/V 用 H_local 个头作 MHA 代理 —— prefill FA compute FLOP 与 GQA 等价, 仅 KV HBM 偏多。
-# 每个模型 3 个场景: 中等单序列 / 长单序列 / 混合长尾 varlen。
-_MIX = [14336, 6144, 3072, 1536, 1024, 768, 512, 256]    # ~27.6K tokens, 长尾混合长度
+# 真实大模型 (8 卡 TP, head_dim=128) + 一个合成 GQA stress 配置, 锚定 chunk-prefill 场景。
+# kernel 支持标准 GQA: K/V 按 kv_head = q_head // q_per_kv 复用。每个 case 是
+# (seqlens, H_local, hidden, q_per_kv), 均为 per-rank (TP8) 值。
+#
+# 旗舰 GQA 模型 num_kv_heads<=8, TP8 下每 rank 只剩 1 个 KV head (kv<8 跨 rank 复制),
+# 即 per-rank MQA (H_kv_local=1, q_per_kv=H_local) —— 这是真实部署形态。
+# 额外加一个合成 num_kv_heads=16 配置: TP8 下每 rank=2 个 KV head (H_kv_local=2),
+# 真正压多-KV-head 寻址路径 (kv_head = head // q_per_kv 取到 0/1)。
+#
+# chunk-prefill: 不对超长单序列一次 prefill。用多段不规整 varlen, 每段<=8K, 总量中等批。
+_CHUNK_BIG = [7680, 5376, 3968, 2560, 1664, 1024, 640, 256]    # ~23.2K tokens, 8 段不规整
+_CHUNK_SMALL = [6912, 3200, 1792, 1088, 512, 256]             # ~13.8K tokens, 6 段不规整
 README_CASES = [
-    # Qwen3-235B: q64 / kv4, hidden 4096 -> TP8 H_local=8
-    ([8192], 8, 4096),
-    ([32768], 8, 4096),
-    (_MIX, 8, 4096),
-    # GLM-4.5: q96 / kv8, hidden 5120 -> TP8 H_local=12
-    ([8192], 12, 5120),
-    ([32768], 12, 5120),
-    (_MIX, 12, 5120),
-    # Llama-3.1-405B: q128 / kv8, hidden 16384 -> TP8 H_local=16
-    ([8192], 16, 16384),
-    ([32768], 16, 16384),
-    (_MIX, 16, 16384),
+    # Qwen3-235B-A22B: q64/kv4/hidden4096 -> TP8 H_local=8, kv->1, q_per_kv=8
+    (_CHUNK_BIG, 8, 4096, 8),
+    (_CHUNK_SMALL, 8, 4096, 8),
+    # Qwen3-Coder-480B-A35B: q96/kv8/hidden6144 -> TP8 H_local=12, kv->1, q_per_kv=12
+    (_CHUNK_BIG, 12, 6144, 12),
+    (_CHUNK_SMALL, 12, 6144, 12),
+    # GLM-4.6: q96/kv8/hidden5120 -> TP8 H_local=12, kv->1, q_per_kv=12
+    (_CHUNK_BIG, 12, 5120, 12),
+    (_CHUNK_SMALL, 12, 5120, 12),
+    # Llama-3.1-405B: q128/kv8/hidden16384 -> TP8 H_local=16, kv->1, q_per_kv=16
+    (_CHUNK_BIG, 16, 16384, 16),
+    (_CHUNK_SMALL, 16, 16384, 16),
+    # 合成 GQA stress: q128/kv16/hidden8192 -> TP8 H_local=16, H_kv_local=2, q_per_kv=8
+    (_CHUNK_BIG, 16, 8192, 8),
+    (_CHUNK_SMALL, 16, 8192, 8),
 ]
 
 
@@ -315,6 +332,8 @@ def main():
     ap.add_argument("--seqlens", type=str, default="2048,2048")
     ap.add_argument("--hidden", type=int, default=2048)
     ap.add_argument("--h_local", type=int, default=8)
+    ap.add_argument("--q_per_kv", type=int, default=1,
+                    help="标准 GQA 分组比 (per rank); 1=MHA。H_kv_local = h_local // q_per_kv")
     ap.add_argument("--w_fa", type=int, default=4)
     ap.add_argument("--w_oproj", type=int, default=1)
     ap.add_argument("--w_ar", type=int, default=1)
@@ -338,10 +357,11 @@ def main():
     if args.cases == "readme":
         cases = README_CASES
     else:
-        cases = [([int(x) for x in args.seqlens.split(",")], args.h_local, args.hidden)]
+        cases = [([int(x) for x in args.seqlens.split(",")], args.h_local, args.hidden,
+                  args.q_per_kv)]
 
     rows = []
-    for seqlens, H_local, hidden in cases:
+    for seqlens, H_local, hidden, q_per_kv in cases:
         meta = build_row_desc(seqlens)
         if args.auto:
             from mega_attention.metadata.launch_heuristic import choose_launch_config
@@ -350,7 +370,8 @@ def main():
         else:
             w_fa, w_oproj, w_ar, sg = args.w_fa, args.w_oproj, args.w_ar, args.sg
         row = bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
-                        ws, rank, dev, args.iters, args.warmup, dump=args.dump_kernels)
+                        ws, rank, dev, args.iters, args.warmup, dump=args.dump_kernels,
+                        q_per_kv=q_per_kv)
         rows.append(row)
         dist.barrier()
 
