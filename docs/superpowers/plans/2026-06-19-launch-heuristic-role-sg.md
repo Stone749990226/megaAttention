@@ -4,7 +4,7 @@
 
 **Goal:** 给 fused FA+O_proj+NVLS AR persistent kernel 加一层 host 侧 launch 启发式，按 shape 自适应选择 FA:O_proj:AR role 软配比与 super_group_n_tiles，提升 A 类（中等/O_proj 重/多序列）shape 的加速比。
 
-**Architecture:** 纯 host 侧配置层 + 一处最小 kernel 改动。host 侧用 `r = 2·Σ(m_block+1)/(num_row_tiles·num_out_n_tiles)` 做分桶特征，查粗 3 桶标定表得到 `(w_fa,w_oproj,w_ar,sg)`。kernel 把固定的 `cls=bidx%6` 偏好表换成权重驱动的 role 选择，保留 fall-through，`(4,1,1)` 逐位等价旧行为。sg 通过预编译 {2,4,8} 变体分派。
+**Architecture:** 纯 host 侧配置层 + 一处最小 kernel 改动。host 侧用 `r = 2·Σ(m_block+1)/(num_row_tiles·num_out_n_tiles)` 做分桶特征，查标定表得到 `(w_fa,w_oproj,w_ar,sg)`。kernel 把固定的 `cls=bidx%6` 偏好表换成权重驱动的 role 选择，保留 fall-through，`(4,1,1)` 逐位等价旧行为。**标定结论（见 Task 5）：单切点 2 桶（r<2→(2,1,1) / r≥2→(8,1,1)）、sg 恒为 4**——初始计划的「3 桶」与「sg 预编译 {2,4,8} 变体分派」经 8×H200 sweep 后未被采用。
 
 **Tech Stack:** Python + CuTe DSL (cutlass), PyTorch, numpy, torch.distributed + symm_mem (NVLS)，8×H200。
 

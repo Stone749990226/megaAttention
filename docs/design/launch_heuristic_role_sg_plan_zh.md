@@ -79,32 +79,32 @@ k <  w_fa + w_oproj  -> 偏好 (OPROJ, AR, FA)
 只改 `schedule_pick` 的偏好选择与 kernel 入口的 `cls` 计算；try_fa / try_pop_oproj /
 try_claim_ar、队列协议、mbarrier、drain 规则全部不变。
 
-### 3.3 sg 变体选择（compile-time）
+### 3.3 sg 粒度（compile-time，标定后固定为 4）
 
-sg 是编译期常量，做法是**预编译 {2,4,8} 三个变体，host 按 shape 分派**：
+sg 是编译期常量。原计划预编译 {2,4,8} 三个变体按 shape 分派，但 §4 的 8×H200 sweep
+显示：两个 `r` 桶内的**稳健最优 sg 都是 4**（sg=2/sg=8 只有零星跨桶胜出，非桶内稳健解）。
+因此第一版**固定 sg=4**，不做多变体预编译与分派——省掉 `{sg: compiled_kernel}` 变体缓存，
+符合 YAGNI。`choose_launch_config` 仍返回 `sg` 字段（恒为 4，并夹住 `1 <= sg <= num_out`），
+保留接口以便后续若出现 sg 敏感的新 shape 再启用多变体。
 
-- `r` 小 / 平衡、O_proj 重 → sg 小（2）：O_proj 切细、AR 早发布、铺满更多 CTA。
-- `r` 大（FA 重）→ sg 大（8）：O_proj 是细尾巴，减少 AR publish / 调度开销。
-- `tp > 1` 偏向更大 sg：砍跨 rank 握手次数。
-- 夹住 `num_super_groups`（= `cdiv(num_out, sg)`）不低于下限，保证 spread。
+### 3.4 启发式本体 = `r` 粗桶查表（标定后定为 2 桶）
 
-driver 维护一个 `{sg: compiled_kernel}` 变体缓存，按 `choose_launch_config` 返回的 sg
-取用。
-
-### 3.4 启发式本体 = `r` 粗桶查表
-
-**不靠闭式公式定常数。** `r` 给分桶轴，每桶 `(w_fa, w_oproj, w_ar, sg)` 由一次性 H200
-sweep 标定后写成**粗分段表**（起步 3 档，不够再细化）：
+**不靠闭式公式定常数。** `r` 给分桶轴，每桶 `(w_fa, w_oproj, w_ar, sg)` 由一次性 8×H200
+sweep 标定。起步设 3 档，sweep 后收敛为**单切点 2 桶**（`_R_LO = 2.0`，sg 恒为 4）：
 
 ```
-# tp == 1 占位结构（具体数值由 §4 标定填入）
-r < R_LO            -> (w_fa, w_oproj, 0, sg)   # O_proj 重 / 平衡
-R_LO <= r < R_HI    -> (w_fa, w_oproj, 0, sg)   # 中间
-r >= R_HI           -> (w_fa, w_oproj, 0, sg)   # FA 重
+# 主目标 tp > 1
+r < 2.0   -> (w_fa, w_oproj, w_ar, sg) = (2, 1, 1, 4)   # 平衡 / O_proj 偏
+r >= 2.0  ->                            (8, 1, 1, 4)    # FA 偏
+
+# 非目标 tp == 1（保持函数可用，w_ar=0 镜像）
+r < 2.0   -> (2, 1, 0, 4)
+r >= 2.0  -> (8, 1, 0, 4)
 ```
 
-tp>1 单独一张表（含非零 `w_ar`，倾向更大 sg）。阈值 `R_LO/R_HI` 与每桶取值都来自标定，
-不在本文档预设具体数字。
+依据（桶内平均 ratio，tp=8）：r<2 桶 (2,1,1,4)=1.148 优于 (4,1,1,4)=1.128；r≥2 桶
+(8,1,1,4) 优于 (4,1,1,4)。该算子为 TP>1 设计，tp==1 不作性能目标，仅镜像保持接口可用。
+落地见 `src/mega_attention/metadata/launch_heuristic.py`。
 
 ### 3.5 模块与接口
 
@@ -126,6 +126,9 @@ benchmarks/bench_fused_fa_oproj_ar.py                   # 改
 ## 4. 验证与标定计划（H200 实测，已确认 8×H200）
 
 > CLAUDE.md：性能结论必须基于实际 Hopper 环境。本环境已确认 8×H200。
+>
+> **标定已完成**：sweep 结论为单切点 2 桶、sg 恒为 4（见 §3.3 / §3.4），已落地
+> `src/mega_attention/metadata/launch_heuristic.py`。下面保留原始验证/标定步骤作为过程记录。
 
 1. **管线先行（无启发式）**：实现可调 `(w_fa,w_oproj,w_ar)` + sg 变体的 host+kernel 管线，
    手动传参。先验证 `(4,1,1)+sg4` 与现有实现数值/性能等价（回归基线）。

@@ -893,26 +893,27 @@ AR owner task:
 
 每个 CTA 完成当前任务并回到全局调度循环后，按静态偏好表尝试取下一类任务。偏好只决定尝试顺序，不把 CTA 固定到某一类任务；当前优先级没有任务时，CTA 立即尝试下一类任务。
 
-使用 `cta_id % 6` 的静态偏好表：
+偏好配比由 host 侧 launch 常量 `(w_fa, w_oproj, w_ar)` 驱动，不写死在 kernel 里。设
+`w_m = w_fa + w_oproj + w_ar`，按 `cta_id % w_m` 落入的区间决定该 CTA 的偏好顺序：
 
 ```text
-class = cta_id % 6
+w_m = w_fa + w_oproj + w_ar
+k   = cta_id % w_m
 
-class 0, 1, 2, 3:
-    FA -> O_proj -> AR
-
-class 4:
-    O_proj -> AR -> FA
-
-class 5:
-    AR -> FA -> O_proj
+k <  w_fa                 -> FA -> O_proj -> AR
+w_fa <= k < w_fa+w_oproj  -> O_proj -> AR -> FA
+否则                      -> AR -> FA -> O_proj
 ```
+
+`cta_id % w_m` 天然跨 SM 交错，使三类偏好在物理 SM 上均匀分布。NVLS AR owner 由
+`ar_slot_id % tp_size` 决定，与 role 偏好正交，不受配比影响。`tp_size == 1` 时 AR 退化为
+identity，取 `w_ar = 0`，其 CTA 份额并入 FA 偏好。
 
 调度循环：
 
 ```text
 while not done:
-    order = preference_table[cta_id % 6]
+    order = preference_order(cta_id % w_m)        # 由 (w_fa, w_oproj, w_ar) 决定
 
     for source in order:
         if source == FA:
@@ -934,12 +935,23 @@ while not done:
         检查全局完成条件，或者短暂 backoff 后继续调度
 ```
 
-这样：
+因此配比只影响重叠阶段的稳态平衡与 mode 切换抖动，不影响「会不会闲置」：
 
-- `4/6` CTA 优先推进 FA，适合 prefill 早期 FA 任务最多的阶段。
-- `1/6` CTA 优先处理 O_proj，使 row ready 后能尽早启动后接 GEMM。
-- `1/6` CTA 优先处理 AR owner task，使已经完成 local partial 的 tile 能及时尝试 NVLS AllReduce。
+- `w_fa / w_m` 的 CTA 优先推进 FA，适合 prefill 早期 FA 任务最多的阶段。
+- `w_oproj / w_m` 的 CTA 优先处理 O_proj，使 row ready 后能尽早启动后接 GEMM。
+- `w_ar / w_m` 的 CTA 优先处理 AR owner task，使已经完成 local partial 的 tile 能及时尝试 NVLS AllReduce。
 - 所有 CTA 都有 fallback 顺序，所以某一类任务暂时为空时不会原地空转。
+
+`(w_fa, w_oproj, w_ar)` 的具体取值，以及 O_proj super group 粒度 `super_group_n_tiles`，
+都由 host 侧 launch 启发式按 shape 选择，不在本文档预设数值；机制与标定见子设计文档：
+
+```text
+docs/design/launch_heuristic_role_sg_plan_zh.md
+```
+
+该启发式以 FA/O_proj 的 MAC 比 `r = FA_macs / OPROJ_macs` 为分桶特征查表选配比，默认
+`(w_fa, w_oproj, w_ar) = (4, 1, 1)` 与早期固定 `cta_id % 6`（FA:O_proj:AR = 4:1:1）逐位等价，
+作为回归基线。
 
 AR owner task 的产生和领取规则：
 
@@ -965,29 +977,33 @@ O_proj CTA 完成某个 ar_tile 的本 rank partial 后:
 这里 `word_id = owner_idx / 64`，`bit = 1 << (owner_idx % 64)`。`ar_ready_bits`
 只表示某个 `ar_slot_id` 已经由最后一个完成 partial 的 rank 确认 ready，可以由
 owner rank 执行 NVLS reduce/store。调度器只从 `ar_ready_bits` 领取已经 ready 的
-AR task。CTA claim 到 AR owner task 后：
+AR task。claim 与执行分两步：**先用 atomicAnd 清掉 ready bit 完成认领**（清成功即独占该 slot），
+**reduce/store 完成之后再设 done bit 计数**：
 
 ```text
-word = acquire_load_system(ar_ready_bits[word_id])
+# 调度循环内：认领（清 ready bit 即认领成功，独占该 ar_slot_id）
+word = acquire_load(ar_ready_bits[word_id])
 bit_index = ffs(word)
 bit = 1 << bit_index
-
-old_ready = atomicAnd_acq_rel_system(ar_ready_bits[word_id], ~bit)
-
+old_ready = atomicAnd_acq_rel(ar_ready_bits[word_id], ~bit)
 if old_ready & bit == 0:
     没有成功 claim，直接返回调度循环
+owner_idx  = word_id * 64 + bit_index
+ar_slot_id = owner_idx * tp_size + my_rank
 
+# 进入 AR owner reduce mode：先做数据，再记终态
+执行 multimem.ld_reduce + multimem.st
+等待 final store 完成
 old_done = atomicOr_acq_rel(ar_done_bits[word_id], bit)
-
 if old_done & bit == 0:
-    owner_idx  = word_id * 64 + bit_index
-    ar_slot_id = owner_idx * tp_size + my_rank
-    执行 multimem.ld_reduce + multimem.st
-    等待 final store 完成
     atomicAdd(ar_done_count, 1)
-else:
-    该 ar_slot_id 已经完成，直接返回调度循环
 ```
+
+reduce 的 exactly-once 由 ready bit 的 atomicAnd claim 独占保证（一个 ready bit 只能被一个 CTA
+清成功），`ar_done_bits` 只负责让 `ar_done_count` 对同一 slot 只 +1 一次。把 done bit 推迟到
+reduce 完成之后，使 `ar_done_bits`/`ar_done_count` 的语义是「reduce 已真正落地」而非「已认领」；
+kernel 退出条件 `ar_done_count == local_owned_ar_tasks` 因此严格对应所有 multimem reduce/store
+都已完成。`tp_size == 1` 时 AR 退化为 identity，没有数据搬运，只做 done bit 终态记账。
 
 全局完成条件：
 
@@ -1018,9 +1034,9 @@ oproj_done_count:
     之后递增
 
 ar_done_count:
-    ar_ready_bits claim 成功
-    + ar_done_bits 首次置位成功
+    ar_ready_bits claim 成功（atomicAnd 清 ready bit）
     + multimem.ld_reduce / multimem.st 完成
+    + ar_done_bits 首次置位成功
     之后递增
 ```
 
@@ -1326,9 +1342,11 @@ FA 尾声：
 ```text
 WG1/WG2:
     finalize online softmax
-    rescale acc_O
-    将各自 64 行 acc_O 写入 O_scratch[fa_row_tile_id, wg_row_base : wg_row_base+64, head, :]
-    (wg_row_base = 0 for WG1, 64 for WG2; 超出 valid_fa_m 的行用 store 谓词跳过)
+    对各自 64 行无条件执行 warp_reduction_sum(row_sum)        # 见下方 hazard 说明
+    valid 行 (mask_q_off + row < q_len): rescale acc_O = acc_O / row_sum
+    invalid 行 (>= valid_fa_m):           acc_O 置零
+    将各自 64 行 acc_O 整块写入 O_scratch[fa_row_tile_id, wg_row_base : wg_row_base+64, head, :]
+    (wg_row_base = 0 for WG1, 64 for WG2；无谓词整块 store，无效行已置零)
 
 一个 elected lane (两个 WG 都写完后):
     等待 O_scratch store 真正完成
@@ -1337,6 +1355,16 @@ WG1/WG2:
         acquire 已完成所有 head 的 O_scratch 发布
         reserve/write/publish 该 fa_row_tile_id 的 O_proj queue entries
 ```
+
+无效行处理 hazard：`warp_reduction_sum` 是 warp 级 collective shuffle，**必须对每一行无条件
+调用**。如果按 `valid_fa_m` 把它放进发散分支，partial row tile（最后一块不满 128 行）会让
+warp 内 lane 发散、collective 等不齐而 hang。因此第一版的做法是：reduce 无条件执行，无效行
+acc_O 置零后随有效行一起整块 store，不使用按行 store 谓词。
+
+这样发布给 O_proj 的 O_scratch 无效行恒为 0，与下游 O_proj 只写 `m < valid_m` 的 C_sym 谓词
+形成纵深防御：即使谓词回归，最坏也只是写出 0 而非上一层残留 / 未初始化的脏值（O_scratch 是
+跨 layer 复用的本地显存，不整体清零）。O_proj 是逐行独立 GEMM，输出行 m 只依赖 A 行 m，无效
+行不会污染有效行；置零进一步消除 NaN 在未来引入跨行 epilogue 时横向扩散的风险。
 
 这里的“尾声”分两部分：
 
@@ -1921,54 +1949,66 @@ ar_done_bits[owner_words_alloc]
 ar_scan_cursor
 ```
 
-`ar_ready_bits` 里的 bit 出现时，该 owner-local slot 已经 ready。claim 顺序是先清
-ready work bit，再抢 done bit：
+`ar_ready_bits` 里的 bit 出现时，该 owner-local slot 已经 ready。第一版 owner_words_alloc
+很小（典型 ≤ 8，hidden=16384 时也只 ~32），因此 claim 直接全扫描 owner-local bitset：从共享
+cursor 起步，找到最低置位的 bit 并用 atomicAnd 清掉——**清成功即认领成功**。done bit 不在
+claim 内设置，而是在 reduce/store 完成之后再设：
 
 ```text
 try_claim_ar_owner_task():
     start = atomic_load_relaxed(ar_scan_cursor)
 
-    for probe in 0 .. max_probe_words - 1:
-        word_id = (start + probe) % owner_words_alloc
-        word = acquire_load_system(ar_ready_bits[word_id])
-
+    for i in 0 .. owner_words_alloc - 1:            # 全扫描；owner_words 很小
+        word_id = (start + i) % owner_words_alloc
+        word = acquire_load(ar_ready_bits[word_id])
         if word == 0:
             continue
 
-        bit_index = ffs(word)
-        bit = 1 << bit_index
-        old_ready = atomicAnd_acq_rel_system(ar_ready_bits[word_id], ~bit)
-
-        if old_ready & bit == 0:
-            continue
-
+        bit       = word & (-word)                  # 最低置位 bit
+        bit_index = trailing_zeros(word)
         owner_idx = word_id * 64 + bit_index
-        if owner_idx >= local_owned_ar_tasks:
+        old_ready = atomicAnd_acq_rel(ar_ready_bits[word_id], ~bit)
+
+        if old_ready & bit == 0:                     # 别人先清掉了，没抢到
+            continue
+        if owner_idx >= local_owned_ar_tasks:        # 尾部无效 slot：已清，跳过，不认领不计数
             continue
 
-        old_done = atomicOr_acq_rel(ar_done_bits[word_id], bit)
-        if old_done & bit:
-            continue
-
+        atomic_store_relaxed(ar_scan_cursor, word_id)   # 停在命中 word，下轮优先消费同 word 余 bit
         ar_slot_id = owner_idx * tp_size + my_rank
-        atomic_store_relaxed(ar_scan_cursor, (word_id + 1) % owner_words_alloc)
         return FOUND(ar_slot_id)
 
-    atomic_store_relaxed(ar_scan_cursor, (start + max_probe_words) % owner_words_alloc)
-    return EMPTY
+    return EMPTY                                     # 全扫描已覆盖所有 word，空时不动 cursor
 ```
 
-`ar_scan_cursor` 只是 owner rank 内多个 CTA 共享的扫描 hint，不参与 correctness。
-多个 CTA 可以 relaxed 读写它；ready/done 的 exactly-once 语义由 `ar_ready_bits` claim 和
-`ar_done_bits` 终态保护保证。
+认领成功后进入 AR owner reduce mode，**先 reduce/store，完成后再设 done bit 计数**：
 
-`max_probe_words` 是调度器每次尝试 AR work source 时扫描的上限。active 阶段可以取一个较小值，
-避免 CTA 在 AR bitset 上长时间空扫；当 `oproj_done_count == total_oproj_tasks` 后进入
-drain 阶段，可以允许 full scan，直到 `ar_done_count == local_owned_ar_tasks`。
+```text
+run_ar_owner(ar_slot_id):
+    执行 multimem.ld_reduce + multimem.st          # 在 C_sym multicast view 上 in-place reduce
+    等待 final store 完成
+    owner_idx = ar_slot_id / tp_size
+    word_id   = owner_idx / 64
+    bit       = 1 << (owner_idx % 64)
+    old_done  = atomicOr_acq_rel(ar_done_bits[word_id], bit)
+    if old_done & bit == 0:
+        atomicAdd(ar_done_count, 1)
+```
 
-`ar_done_bits` 是终态保护。正常情况下 last-arriver 只会投递一次 ready bit，但保留 done bit
-可以防御重复投递、调试阶段协议 bug、或者后续优化引入的重复 claim；它保证同一个
-`ar_slot_id` 只执行一次 reduce/store，`ar_done_count` 也只递增一次。
+`ar_scan_cursor` 只是 owner rank 内多个 CTA 共享的扫描 hint，不参与 correctness。多个 CTA 可以
+relaxed 读写它；reduce 的 exactly-once 由 `ar_ready_bits` 的 atomicAnd claim 独占保证，
+`ar_done_bits` 只负责让 `ar_done_count` 对同一 slot 只 +1 一次。
+
+第一版不使用有界探测（`max_probe_words` + active/drain 区分）。引入它的唯一动机是 owner_words
+很大时避免 CTA 长时间空扫，但第一版 owner_words ≤ ~32，一次全扫描只是几十次 acquire load，
+远小于一次 mode 切换的 overlay drain；而且全扫描消除了「ready bit 已置但本轮探测窗口扫不到」
+造成的认领延迟——AR 是决定 kernel 退出的末级 task，认领延迟会直接拖长尾部。owner_words 规模
+很大时可把有界探测作为后续可选优化。
+
+把 done bit 推迟到 reduce 完成之后是有意为之：`ar_done_bits`/`ar_done_count` 的语义因此是
+「reduce 已真正落地」而非「已认领」。kernel 退出条件 `ar_done_count == local_owned_ar_tasks`
+严格对应所有 multimem reduce/store 都已完成，而不是认领完成。reduce 唯一性由 ready bit claim
+保证，因此 done bit 在 reduce 期间暂为 0 不会引起重复 reduce。
 
 时间线示例：
 
