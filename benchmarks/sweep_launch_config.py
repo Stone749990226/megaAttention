@@ -41,7 +41,6 @@ def main():
     dev = torch.device(f"cuda:{lr}")
     dist.init_process_group("nccl")
     rank, ws = dist.get_rank(), dist.get_world_size()
-    enable_symm_mem_for_group(dist.group.WORLD.group_name)
 
     lines = ["| shape | r | best (w_fa,w_oproj,w_ar,sg) | best ratio |",
              "| --- | --- | --- | --- |"]
