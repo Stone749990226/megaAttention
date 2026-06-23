@@ -52,7 +52,7 @@ third_party/flash-attention
 ```
 
 开发 FA tile、CuTe DSL pipeline、persistent scheduler、varlen block info、causal mask、
-online softmax、TMA/WGMMA/mbarrier 协作时，可以参考该仓库，重点看
+online softmax、TMA/WGMMA/mbarrier 协作时，必须参考该仓库，重点看
 `flash_attn/cute/` 下的 SM90 forward 路径和公共 pipeline/helper 代码。
 
 但 FlashAttention-4 只能作为实现参考，不能覆盖本项目核心设计文档。本项目严格

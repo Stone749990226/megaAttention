@@ -36,9 +36,10 @@ third_party/flash-attention
 
 边界：
 
-- 不引入 decode、append prefill、chunked prefill。
-- 不引入 `seqlen_q != seqlen_k` 的通用尾部对齐 causal mask。
-- 不引入 paged KV、SplitKV、partial O/LSE combine、非 causal attention。
+- 只引入核心设计文档确认的 contiguous-KV chunked/append prefill 语义。
+- `seqlen_q != seqlen_k` 时采用 FA4 的 Q/K 尾部对齐 causal mask：
+  `k_index <= q_index + (seqlen_k - seqlen_q)`。
+- 不引入 decode 专用短 Q 路径、paged KV、SplitKV、partial O/LSE combine、非 causal attention。
 - 不用 Blackwell 路径覆盖本项目 Hopper SM90 第一版设计。
 
 ## DeepGEMM MegaMoE
