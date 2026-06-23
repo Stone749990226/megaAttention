@@ -16,8 +16,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL
-from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts
+from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL, NUM_SYNC
+from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts, active_counts
 from mega_attention.reference.fused import fa_reference, o_scratch_reference
 
 DT = torch.bfloat16
@@ -58,11 +58,13 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     C_sym = torch.zeros(R, 128, num_out_n_tiles, N_TILE, device=dev, dtype=DT)
 
     ctrl = _u32(NUM_CTRL, dev)
+    sync_ctrl = _u32(NUM_SYNC, dev)     # grid_sync (init/exit) + nvl counter
     head_ready = _u32(R, dev)
     oproj_queue = _u32(total_oproj, dev)
     tp_size = 1
     owner_slots = (total_oproj + tp_size - 1) // tp_size
     owner_words = (owner_slots + 63) // 64
+    actv = _i32(active_counts(R, H_local, num_super_groups, tp_size, 0), dev)
     ready_count_owner = _u32(owner_slots, dev)
     ar_ready_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
     ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
@@ -71,8 +73,8 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     fa_b = _i32(meta.batch_idx, dev)
     fa_mb = _i32(meta.m_block, dev)
 
-    cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue,
-                                                     ready_count_owner)]
+    cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, sync_ctrl, actv, head_ready,
+                                                     oproj_queue, ready_count_owner)]
     cts += [from_dlpack(t, assumed_align=8) for t in (ar_ready_bits, ar_done_bits)]
     cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o, C_sym)]
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]

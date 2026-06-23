@@ -42,7 +42,8 @@ MODE_OPROJ = 2
 MODE_AR = 3
 MODE_DONE = 4
 
-# ctrl[] scalar slots. All entries are Uint32 and zero-initialized by the host.
+# task_ctrl[] scalar slots: per-layer control state, zeroed at every kernel start
+# (host-zeroed today; the kernel-start cleaner takes over in the reuse path).
 C_FA_COUNTER = 0
 C_FA_DONE = 1
 C_OP_RESERVE = 2
@@ -51,9 +52,17 @@ C_OP_CONSUME = 4
 C_OP_DONE = 5
 C_AR_DONE = 6
 C_AR_CURSOR = 7
-C_GS_INIT = 8
-C_GS_EXIT = 9
-NUM_CTRL = 10
+NUM_CTRL = 8
+
+# sync_ctrl_local[] slots: long-lived barrier state, NEVER cleared by the
+# kernel-start cleaner. grid_sync uses the high-bit phase flip protocol and the
+# nvl barrier uses a phase/sign counter, so both survive workspace reuse without
+# being zeroed. Kept in a physically separate allocation from task_ctrl so a
+# range-based cleaner can never wipe barrier state (设计稿: task_ctrl/sync_ctrl 拆分).
+S_GS_INIT = 0
+S_GS_EXIT = 1
+S_NVL_COUNTER = 2
+NUM_SYNC = 3
 
 FINISH_TAG = 0x80000000
 
@@ -61,19 +70,24 @@ FINISH_TAG = 0x80000000
 # ============================================================================
 # Device-wide synchronization helpers
 @cute.jit
-def gsync(ctrl: cute.Tensor, idx: cutlass.Constexpr,
+def gsync(sc: cute.Tensor, idx: cutlass.Constexpr,
           num_ctas: cutlass.Constexpr, bidx, tidx):
-    """Single-kernel grid barrier using a host-zeroed ctrl[idx] word."""
+    """Single-kernel grid barrier using a sync_ctrl_local[idx] word.
+
+    Reuse-safe without zeroing: the total increment per episode is exactly
+    FINISH_TAG (low 31 bits net-zero), so only the high bit toggles and every CTA
+    waits on the toggle relative to its own pre-add `old`.
+    """
     cute.arch.sync_threads()
     if tidx == 0:
         delta = cutlass.Uint32(1)
         if bidx == 0:
             delta = cutlass.Uint32(FINISH_TAG - (num_ctas - 1))
-        old = cute.arch.atomic_add(ctrl.iterator + idx, delta,
+        old = cute.arch.atomic_add(sc.iterator + idx, delta,
                                    sem="release", scope="gpu")
         spinning = True
         while spinning:
-            cur = cute.arch.atomic_add(ctrl.iterator + idx, cutlass.Uint32(0),
+            cur = cute.arch.atomic_add(sc.iterator + idx, cutlass.Uint32(0),
                                        sem="acquire", scope="gpu")
             if ((cur ^ old) & cutlass.Uint32(FINISH_TAG)) != 0:
                 spinning = False
@@ -81,36 +95,69 @@ def gsync(ctrl: cute.Tensor, idx: cutlass.Constexpr,
 
 
 @cute.jit
-def nvl_barrier(sig_local: cute.Tensor, sig_mc: cute.Tensor, slot: cutlass.Constexpr,
-                tp_size: cutlass.Constexpr, bidx, tidx):
-    """Cross-rank NVLink barrier used around the persistent kernel body.
+def nvl_barrier(sig_local: cute.Tensor, sc: cute.Tensor,
+                gs_idx: cutlass.Constexpr, tp_size: cutlass.Constexpr,
+                sig_peer_ptrs: cutlass.Constexpr, num_ctas: cutlass.Constexpr,
+                bidx, tidx):
+    """Cross-rank NVLink barrier: phase/sign reuse protocol + trailing grid_sync.
 
-    Protocol invariant: only CTA0 participates in the cross-rank signal, while local
-    grid_sync before/after this helper keeps the rest of the rank quiesced. The
-    monotonic add-one signal needs a distinct slot for each barrier within a launch.
+    Reuse-safe without zeroing: nvl_barrier_counter (rank-local) selects phase (which of
+    the two signal slots) and sign (add up to tp_size, or back down to 0). The two slots
+    guarantee a rank that is one barrier ahead never disturbs the slot another rank still
+    waits on, so signals never need a host reset. Per-peer atomic add (each of the first
+    tp_size threads of CTA0 writes one rank's slot) supports the -1 direction that
+    multicast add-1 cannot express. The trailing grid_sync makes every CTA of this rank
+    wait for CTA0's cross-rank confirmation before leaving the barrier, so no worker can
+    touch remote control/symmetric state before all ranks have arrived.
     """
     cute.arch.sync_threads()
     if bidx == 0:
+        status = cute.arch.atomic_add(sc.iterator + S_NVL_COUNTER, cutlass.Uint32(0),
+                                      sem="relaxed", scope="gpu")
+        phase = (status & cutlass.Uint32(1)).to(cutlass.Int32)
+        sign = ((status >> cutlass.Uint32(1)) & cutlass.Uint32(1)).to(cutlass.Int32)
+        delta = cutlass.Int32(1)
+        target = cutlass.Int32(tp_size)
+        if sign != cutlass.Int32(0):
+            delta = cutlass.Int32(-1)
+            target = cutlass.Int32(0)
+        slot = phase.to(cutlass.Uint32)
+        if tidx < cutlass.Int32(tp_size):
+            for r in cutlass.range_constexpr(tp_size):
+                if tidx == cutlass.Int32(r):
+                    peer = cute.make_ptr(sig_local.element_type, sig_peer_ptrs[r],
+                                         cute.AddressSpace.gmem, assumed_align=4)
+                    cute.arch.atomic_add(peer + slot, delta, sem="release", scope="sys")
+        cute.arch.sync_threads()
         if tidx == 0:
-            cda.multimem_red_add1(sig_mc.iterator + slot, order="release", scope="sys")
-            cda.spin_lock_ld_lt_relaxed_wait(sig_local.iterator + slot,
-                                             expected_val=cutlass.Int32(tp_size), scope="sys")
-    cute.arch.sync_threads()
+            cute.arch.atomic_add(sc.iterator + S_NVL_COUNTER, cutlass.Uint32(1),
+                                 sem="relaxed", scope="gpu")
+            spinning = True
+            while spinning:
+                cur = cute.arch.atomic_add(sig_local.iterator + slot, cutlass.Int32(0),
+                                           sem="acquire", scope="sys")
+                if cur == target:
+                    spinning = False
+    gsync(sc, gs_idx, num_ctas, bidx, tidx)
 
 
 # ============================================================================
 # Work-source claim helpers
 @cute.jit
-def try_fa(ctrl: cute.Tensor, num_fa: cutlass.Constexpr):
-    """Bounded atomic claim of the next FA task. Returns (found, fa_task_id)."""
+def try_fa(ctrl: cute.Tensor, num_fa):
+    """Bounded atomic claim of the next FA task. Returns (found, fa_task_id).
+
+    num_fa is a runtime active count (this layer's num_row_tiles_active * H_local),
+    so one compiled kernel serves any active task count up to the bucket capacity.
+    """
     found = cutlass.Int32(0)
     arg = cutlass.Int32(-1)
     cnt = cute.arch.load(ctrl.iterator + C_FA_COUNTER, cutlass.Uint32,
                          sem="relaxed", scope="gpu")
-    if cnt < num_fa:                       # pre-check avoids unbounded over-claim
+    if cnt.to(cutlass.Int32) < num_fa:     # pre-check avoids unbounded over-claim
         tid = cute.arch.atomic_add(ctrl.iterator + C_FA_COUNTER, cutlass.Uint32(1),
                                    sem="relaxed", scope="gpu")
-        if tid < num_fa:
+        if tid.to(cutlass.Int32) < num_fa:
             found = cutlass.Int32(1)
             arg = tid.to(cutlass.Int32)
     return found, arg
@@ -142,9 +189,13 @@ def try_pop_oproj(ctrl: cute.Tensor, oproj_queue: cute.Tensor):
 
 @cute.jit
 def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
-                 owner_words_alloc: cutlass.Constexpr, tp_size: cutlass.Constexpr,
-                 rank: cutlass.Constexpr, local_owned_ar: cutlass.Constexpr):
+                 owner_words, tp_size: cutlass.Constexpr,
+                 rank: cutlass.Constexpr, local_owned_ar):
     """Claim one AR owner task from this rank's owner-local ready bitset.
+
+    owner_words (scan upper bound) and local_owned_ar (valid-slot tail filter) are
+    runtime active counts, so the scan never walks stale high words left by a larger
+    prior launch in the same bucket.
 
     The scan starts from a shared word cursor, finds the lowest set bit in a word,
     and clears it with atomicAnd. Clearing a set bit is the ownership claim.
@@ -162,7 +213,7 @@ def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
     start = cute.arch.load(ctrl.iterator + C_AR_CURSOR, cutlass.Uint32,
                            sem="relaxed", scope="gpu")
     i = cutlass.Uint32(0)
-    n = cutlass.Uint32(owner_words_alloc)
+    n = owner_words.to(cutlass.Uint32)
     while (i < n) and (found == 0):
         w = (start + i) % n
         word = cute.arch.load(ar_ready_bits.iterator + w, cutlass.Int64,
@@ -174,7 +225,7 @@ def try_claim_ar(ctrl: cute.Tensor, ar_ready_bits: cute.Tensor,
             old = cute.arch.atomic_and(ar_ready_bits.iterator + w, ~lowest,
                                        sem="acq_rel", scope="gpu")
             if (old & lowest) != cutlass.Int64(0):            # we cleared it -> won
-                if owner_idx < cutlass.Int32(local_owned_ar):  # valid (non-tail) slot
+                if owner_idx < local_owned_ar:                 # valid (non-tail) slot
                     found = cutlass.Int32(1)
                     found_w = w
                     arg = owner_idx * cutlass.Int32(tp_size) + cutlass.Int32(rank)
@@ -287,13 +338,14 @@ def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor,
 # CTA leader scheduler
 @cute.jit
 def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
-                  role, num_fa: cutlass.Constexpr, total_oproj: cutlass.Constexpr,
-                  owner_words_alloc: cutlass.Constexpr, tp_size: cutlass.Constexpr,
-                  rank: cutlass.Constexpr, local_owned_ar: cutlass.Constexpr):
+                  role, num_fa, total_oproj,
+                  owner_words, tp_size: cutlass.Constexpr,
+                  rank: cutlass.Constexpr, local_owned_ar):
     """Pick one task for the CTA leader and return (mode, arg).
 
     Role controls only the preferred probe order. Every CTA falls through to the other
-    work sources, so role assignment is a bias, not a static partition.
+    work sources, so role assignment is a bias, not a static partition. num_fa,
+    total_oproj, owner_words and local_owned_ar are runtime active counts.
     """
     mode = cutlass.Int32(MODE_IDLE)
     arg = cutlass.Int32(-1)
@@ -304,7 +356,9 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
                           sem="acquire", scope="gpu")
     ar_d = cute.arch.load(ctrl.iterator + C_AR_DONE, cutlass.Uint32,
                           sem="acquire", scope="gpu")
-    all_done = (fa_d >= num_fa) and (op_d >= total_oproj) and (ar_d >= local_owned_ar)
+    all_done = ((fa_d.to(cutlass.Int32) >= num_fa)
+                and (op_d.to(cutlass.Int32) >= total_oproj)
+                and (ar_d.to(cutlass.Int32) >= local_owned_ar))
 
     if all_done:
         mode = cutlass.Int32(MODE_DONE)
@@ -332,7 +386,7 @@ def schedule_pick(ctrl, oproj_queue, ar_ready_bits,
                 if src == MODE_OPROJ:
                     f, a = try_pop_oproj(ctrl, oproj_queue)
                 if src == MODE_AR:
-                    f, a = try_claim_ar(ctrl, ar_ready_bits, owner_words_alloc, tp_size,
+                    f, a = try_claim_ar(ctrl, ar_ready_bits, owner_words, tp_size,
                                         rank, local_owned_ar)
                 if f != 0:
                     found = cutlass.Int32(1)
@@ -359,14 +413,16 @@ class FusedFaOprojAr:
                  total_oproj, num_ctas, hidden, tp_size=1, rank=0, kv_stages=2,
                  q_per_kv=1,
                  N_TILE=128, super_group_n_tiles=4, K_CHUNK=64, oproj_stages=4,
-                 csym_mc_ptr=0, nvl_mc_ptr=0, nvl_local_ptr=0, rc_ptrs=(), rb_ptrs=(),
+                 csym_mc_ptr=0, nvl_mc_ptr=0, nvl_local_ptr=0, nvl_peer_ptrs=(),
+                 rc_ptrs=(), rb_ptrs=(),
                  softmax_scale=None, acc_dtype=cutlass.Float32,
                  w_fa=4, w_oproj=1, w_ar=1):
         # Multi-rank NVLS pointers are baked as closure constants. Do not move them to
         # cute.compile args: 64-bit virtual addresses would be truncated.
         self.csym_mc_ptr = csym_mc_ptr          # C_sym multicast VA (multimem reduce)
-        self.nvl_mc_ptr = nvl_mc_ptr            # nvl_barrier signal multicast VA
+        self.nvl_mc_ptr = nvl_mc_ptr            # legacy; unused by the phase/sign barrier
         self.nvl_local_ptr = nvl_local_ptr      # this rank's nvl signal VA (spin read)
+        self.nvl_peer_ptrs = tuple(nvl_peer_ptrs)  # per-rank nvl signal peer VAs (±1 add)
         self.rc_ptrs = tuple(rc_ptrs)           # per-rank ready_count_owner peer VAs
         self.rb_ptrs = tuple(rb_ptrs)           # per-rank ar_ready_bits peer VAs
         self.num_fa = num_fa
@@ -421,8 +477,8 @@ class FusedFaOprojAr:
         return cute.tile_to_shape(atom, (rows, cols, stages), order=(0, 1, 2))
 
     @cute.jit
-    def __call__(self, ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
-                 ar_done_bits,
+    def __call__(self, ctrl, sync_ctrl, actv, head_ready, oproj_queue, ready_count_owner,
+                 ar_ready_bits, ar_done_bits,
                  mQ, mK, mV, mOscr, mWo, mCsym, mCuQ, mCuK, mFaB, mFaMb,
                  stream: cuda.CUstream):
         dt = mQ.element_type
@@ -514,29 +570,29 @@ class FusedFaOprojAr:
         csym_mc = cute.make_tensor(
             cute.make_ptr(mCsym.element_type, self.csym_mc_ptr, cute.AddressSpace.gmem,
                           assumed_align=16), mCsym.layout)
-        nvl_mc = cute.make_tensor(
-            cute.make_ptr(ctrl.element_type, self.nvl_mc_ptr, cute.AddressSpace.gmem,
-                          assumed_align=4), cute.make_layout(4))
+        # This rank's nvl_barrier signal (int32, two phase slots) for the spin read.
+        # Per-peer ±1 adds use the baked self.nvl_peer_ptrs inside nvl_barrier.
         nvl_local = cute.make_tensor(
-            cute.make_ptr(ctrl.element_type, self.nvl_local_ptr, cute.AddressSpace.gmem,
-                          assumed_align=4), cute.make_layout(4))
+            cute.make_ptr(cutlass.Int32, self.nvl_local_ptr, cute.AddressSpace.gmem,
+                          assumed_align=4), cute.make_layout(2))
 
-        self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
-                    ar_done_bits,
+        self.kernel(ctrl, sync_ctrl, actv, head_ready, oproj_queue, ready_count_owner,
+                    ar_ready_bits, ar_done_bits,
                     tma_k, tK, tma_v, tV, mOscr, mOscr2d, mWo, mCsym, csym_mc,
-                    nvl_mc, nvl_local, tma_q, tQ, mCuQ, mCuK,
+                    nvl_local, tma_q, tQ, mCuQ, mCuK,
                     mFaB, mFaMb, tma_a, tA, tma_wo, tWo,
                     mma_qk, mma_pv, mma_op, sQ_l, sK_l, sV_l, sA_l, sWo_l, Smem).launch(
             grid=[self.num_ctas, 1, 1], block=[self.threads, 1, 1],
             cluster=(1, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, ctrl: cute.Tensor, head_ready: cute.Tensor,
+    def kernel(self, ctrl: cute.Tensor, sync_ctrl: cute.Tensor, actv: cute.Tensor,
+               head_ready: cute.Tensor,
                oproj_queue: cute.Tensor, ready_count_owner: cute.Tensor,
                ar_ready_bits: cute.Tensor, ar_done_bits: cute.Tensor,
                tma_k: cute.CopyAtom, mK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor,
                mOscr: cute.Tensor, mOscr2d: cute.Tensor, mWo: cute.Tensor, mCsym: cute.Tensor,
-               csym_mc: cute.Tensor, nvl_mc: cute.Tensor, nvl_local: cute.Tensor,
+               csym_mc: cute.Tensor, nvl_local: cute.Tensor,
                tma_q: cute.CopyAtom, tQ: cute.Tensor, mCuQ: cute.Tensor, mCuK: cute.Tensor,
                mFaB: cute.Tensor, mFaMb: cute.Tensor,
                tma_a: cute.CopyAtom, tA: cute.Tensor, tma_wo: cute.CopyAtom, tWo: cute.Tensor,
@@ -558,8 +614,6 @@ class FusedFaOprojAr:
         if k >= cutlass.Int32(w_fo):
             role = cutlass.Int32(2)
 
-        num_fa = cutlass.const_expr(self.num_fa)
-        total_oproj = cutlass.const_expr(self.total_oproj)
         H_local = cutlass.const_expr(self.H_local)
         num_super_groups = cutlass.const_expr(self.num_super_groups)
         tp_size = cutlass.const_expr(self.tp_size)
@@ -572,10 +626,9 @@ class FusedFaOprojAr:
         N_TILE = cutlass.const_expr(self.N_TILE)
         hidden = cutlass.const_expr(self.hidden)
         num_out_n_tiles = cutlass.const_expr(self.num_out_n_tiles)
-        # AR owner-local compile-time parameters for this rank.
+        # Owner-local rank index (compile-time). Task/owner *counts* are runtime active
+        # values loaded from `actv`; bucket capacities only size the workspace tensors.
         rank = cutlass.const_expr(self.rank)
-        owner_words_alloc = cutlass.const_expr(self.owner_words_alloc)
-        local_owned_ar = cutlass.const_expr(self.local_owned_ar_tasks)
 
         al = cutlass.utils.SmemAllocator()
         st = al.allocate(Smem)
@@ -643,9 +696,48 @@ class FusedFaOprojAr:
         # This keeps the FA/O_proj payload lifetimes explicit for future agent edits.
         lane = tidx - self.num_dma_threads
 
-        gsync(ctrl, C_GS_INIT, num_ctas, bidx, tidx)
+        # Runtime active counts (设计稿: bucket capacity + runtime active counts).
+        # One kernel compiled at bucket capacity serves any active task count <= capacity.
+        # Layout/allocation use compile-time capacity; scheduling/cleaning/claiming use
+        # these runtime values, filled by the host per launch.
+        n_fa_act = cute.arch.load(actv.iterator + 0, cutlass.Int32, sem="relaxed", scope="gpu")
+        total_op_act = cute.arch.load(actv.iterator + 1, cutlass.Int32, sem="relaxed", scope="gpu")
+        n_rows_act = cute.arch.load(actv.iterator + 2, cutlass.Int32, sem="relaxed", scope="gpu")
+        owner_slots_act = cute.arch.load(actv.iterator + 3, cutlass.Int32, sem="relaxed", scope="gpu")
+        owner_words_act = cute.arch.load(actv.iterator + 4, cutlass.Int32, sem="relaxed", scope="gpu")
+        local_owned_act = cute.arch.load(actv.iterator + 5, cutlass.Int32, sem="relaxed", scope="gpu")
+
+        # Kernel-start directed cleaner (设计稿: kernel start 定向清理).
+        # Zero this rank's active per-layer control state with plain global stores,
+        # dispatched by stride across all persistent CTAs. The init grid_sync (+ nvl
+        # init for tp>1) right after publishes these writes before any worker or remote
+        # rank reads them, so no atomic is needed. sync_ctrl barrier state is NEVER
+        # cleared. Only the active prefix is cleared; the owner-words tail word covers
+        # inactive bits in the last active word.
+        g_tid = bidx * cutlass.Int32(nthr) + tidx
+        g_str = cutlass.Int32(num_ctas) * cutlass.Int32(nthr)
+        i = g_tid
+        while i < n_rows_act:
+            head_ready[i] = cutlass.Uint32(0)
+            i = i + g_str
+        i = g_tid
+        while i < owner_slots_act:
+            ready_count_owner[i] = cutlass.Uint32(0)
+            i = i + g_str
+        i = g_tid
+        while i < owner_words_act:
+            ar_ready_bits[i] = cutlass.Int64(0)
+            ar_done_bits[i] = cutlass.Int64(0)
+            i = i + g_str
+        if bidx == 0:
+            if tidx < cutlass.Int32(NUM_CTRL):
+                ctrl[tidx] = cutlass.Uint32(0)
+
+        gsync(sync_ctrl, S_GS_INIT, num_ctas, bidx, tidx)
         if cutlass.const_expr(tp_size > 1):
-            nvl_barrier(nvl_local, nvl_mc, 0, tp_size, bidx, tidx)   # init: all ranks ready
+            # init: all ranks finished local init before any cross-rank write begins.
+            nvl_barrier(nvl_local, sync_ctrl, S_GS_INIT, tp_size, self.nvl_peer_ptrs,
+                        num_ctas, bidx, tidx)
 
         if wg_idx == 0:
             cute.arch.setmaxregister_decrease(40)
@@ -655,9 +747,9 @@ class FusedFaOprojAr:
         looping = True
         while looping:
             if tidx == 0:
-                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, role, num_fa,
-                                          total_oproj, owner_words_alloc, tp_size, rank,
-                                          local_owned_ar)
+                mode, arg = schedule_pick(ctrl, oproj_queue, ar_ready_bits, role, n_fa_act,
+                                          total_op_act, owner_words_act, tp_size, rank,
+                                          local_owned_act)
                 sma[0] = mode
                 sma[1] = arg
             cute.arch.sync_threads()
@@ -1036,6 +1128,8 @@ class FusedFaOprojAr:
                                                      sem="release", scope="gpu")
                 cute.arch.sync_threads()
 
-        gsync(ctrl, C_GS_EXIT, num_ctas, bidx, tidx)
+        gsync(sync_ctrl, S_GS_EXIT, num_ctas, bidx, tidx)
         if cutlass.const_expr(tp_size > 1):
-            nvl_barrier(nvl_local, nvl_mc, 1, tp_size, bidx, tidx)   # all ranks exited
+            # exit: all ranks finished owner AR before any rank reuses the workspace.
+            nvl_barrier(nvl_local, sync_ctrl, S_GS_EXIT, tp_size, self.nvl_peer_ptrs,
+                        num_ctas, bidx, tidx)

@@ -17,8 +17,8 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
-from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL
-from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts
+from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL, NUM_SYNC
+from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts, active_counts
 from mega_attention.reference.fused import fa_reference, oproj_reference
 
 DT = torch.bfloat16
@@ -58,15 +58,18 @@ def run_one(rank, ws, dev, gname, tag, seqlens, seqlens_k, H_local, hidden, q_pe
     hRC = symm_mem.rendezvous(rco, gname)
     rbits = symm_mem.empty(owner_words, device=dev, dtype=torch.int64); rbits.zero_()
     hRB = symm_mem.rendezvous(rbits, gname)
-    nvl = symm_mem.empty(8, device=dev, dtype=torch.uint32); nvl.zero_()
+    nvl = symm_mem.empty(2, device=dev, dtype=torch.int32); nvl.zero_()  # phase/sign signal[2]
     hN = symm_mem.rendezvous(nvl, gname)
 
     ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)  # owner-local
     ctrl = _u32(NUM_CTRL); head_ready = _u32(R); oproj_queue = _u32(total_oproj)
+    sync_ctrl = _u32(NUM_SYNC)          # grid_sync (init/exit) + nvl counter; never reset
+    actv = _i32(active_counts(R, H_local, num_super_groups, ws, rank))  # runtime active counts
     cu_q, cu_k = _i32(meta.cu_seqlens_q), _i32(meta.cu_seqlens_k)
     fa_b, fa_mb = _i32(meta.batch_idx), _i32(meta.m_block)
 
-    cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue, rco)]
+    cts = [from_dlpack(t, assumed_align=4)
+           for t in (ctrl, sync_ctrl, actv, head_ready, oproj_queue, rco)]
     cts += [from_dlpack(t, assumed_align=8) for t in (rbits, ar_done_bits)]
     cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
@@ -77,28 +80,36 @@ def run_one(rank, ws, dev, gname, tag, seqlens, seqlens_k, H_local, hidden, q_pe
         hidden=hidden, tp_size=ws, rank=rank, N_TILE=N_TILE, super_group_n_tiles=sg,
         csym_mc_ptr=hC.multicast_ptr, nvl_mc_ptr=hN.multicast_ptr,
         nvl_local_ptr=hN.buffer_ptrs[rank],
+        nvl_peer_ptrs=[hN.buffer_ptrs[r] for r in range(ws)],
         rc_ptrs=[hRC.buffer_ptrs[r] for r in range(ws)],
         rb_ptrs=[hRB.buffer_ptrs[r] for r in range(ws)])
     ts = torch.cuda.Stream(); st = cuda.CUstream(ts.cuda_stream)
     dist.barrier()
     compiled = cute.compile(ker, *cts, st)
-    with torch.cuda.stream(ts):
-        compiled(*cts, st)
-    torch.cuda.synchronize(); dist.barrier()
 
     # reference: Y_partial per rank -> all_reduce -> Y_final (same on all ranks)
     O_ref = fa_reference(Q, K, V, meta)
     Yp = oproj_reference(O_ref, W_o, meta)              # [tot, hidden] fp32
     Yf = Yp.clone(); dist.all_reduce(Yf, op=dist.ReduceOp.SUM)
-    C = C_sym.float().cpu()
+
+    # Reuse path: launch the same layer several times with NO host reset between
+    # launches. The kernel-start cleaner + phase/sign barriers must reproduce the
+    # exact same result every iteration (cross-layer workspace reuse).
+    NREUSE = 3
     err = 0.0
-    for t in range(R):
-        vm = meta.valid_m(t); qs = meta.q_tile_start(t)
-        for o in range(num_out):
-            vn = min(N_TILE, hidden - o * N_TILE)
-            got = C[t, :vm, o, :vn]
-            exp = Yf[qs:qs + vm, o * N_TILE:o * N_TILE + vn].cpu()
-            err = max(err, (got - exp).abs().max().item())
+    for _ in range(NREUSE):
+        with torch.cuda.stream(ts):
+            compiled(*cts, st)
+        torch.cuda.synchronize(); dist.barrier()
+        C = C_sym.float().cpu()
+        for t in range(R):
+            vm = meta.valid_m(t); qs = meta.q_tile_start(t)
+            for o in range(num_out):
+                vn = min(N_TILE, hidden - o * N_TILE)
+                got = C[t, :vm, o, :vn]
+                exp = Yf[qs:qs + vm, o * N_TILE:o * N_TILE + vn].cpu()
+                err = max(err, (got - exp).abs().max().item())
+        dist.barrier()
     fa_done, op_done, ar_done = int(ctrl[1]), int(ctrl[5]), int(ctrl[6])
     local_owned = (max(total_oproj - rank, 0) + ws - 1) // ws
     ok = (err < 5e-2 and fa_done == num_fa and op_done == total_oproj and ar_done == local_owned)

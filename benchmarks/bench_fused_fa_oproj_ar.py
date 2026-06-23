@@ -37,8 +37,8 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
-from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL
-from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts
+from mega_attention.kernels.sm90.fused_fa_oproj_ar import FusedFaOprojAr, NUM_CTRL, NUM_SYNC
+from mega_attention.metadata.row_desc import build_row_desc, oproj_task_counts, active_counts
 
 from flash_attn import flash_attn_varlen_func     # baseline FA: 官方包, 不接受 SDPA fallback
 
@@ -175,14 +175,19 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     hRC = symm_mem.rendezvous(rco, gname)
     rbits = symm_mem.empty(owner_words, device=dev, dtype=torch.int64); rbits.zero_()
     hRB = symm_mem.rendezvous(rbits, gname)
-    nvl = symm_mem.empty(8, device=dev, dtype=torch.uint32); nvl.zero_()
+    nvl = symm_mem.empty(2, device=dev, dtype=torch.int32); nvl.zero_()  # phase/sign signal[2]
     hN = symm_mem.rendezvous(nvl, gname)
     ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
     ctrl = _u32(NUM_CTRL); head_ready = _u32(R); oproj_queue = _u32(total_oproj)
+    # sync_ctrl_local: grid_sync (init/exit) + nvl counter. Reuse-safe phase
+    # protocols; allocated once and never reset between launches.
+    sync_ctrl = _u32(NUM_SYNC)
+    actv = _i32(active_counts(R, H_local, num_super_groups, ws, rank))  # runtime active counts
     cu_q, cu_k = _i32(meta.cu_seqlens_q), _i32(meta.cu_seqlens_k)
     fa_b, fa_mb = _i32(meta.batch_idx), _i32(meta.m_block)
 
-    cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue, rco)]
+    cts = [from_dlpack(t, assumed_align=4)
+           for t in (ctrl, sync_ctrl, actv, head_ready, oproj_queue, rco)]
     cts += [from_dlpack(t, assumed_align=8) for t in (rbits, ar_done_bits)]
     cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
@@ -193,6 +198,7 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
         hidden=hidden, tp_size=ws, rank=rank, N_TILE=N_TILE, super_group_n_tiles=sg,
         csym_mc_ptr=hC.multicast_ptr, nvl_mc_ptr=hN.multicast_ptr,
         nvl_local_ptr=hN.buffer_ptrs[rank],
+        nvl_peer_ptrs=[hN.buffer_ptrs[r] for r in range(ws)],
         rc_ptrs=[hRC.buffer_ptrs[r] for r in range(ws)],
         rb_ptrs=[hRB.buffer_ptrs[r] for r in range(ws)],
         w_fa=w_fa, w_oproj=w_oproj, w_ar=w_ar)
@@ -201,9 +207,9 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     compiled = cute.compile(ker, *cts, st)
 
     def reset_fused():
-        for t in (ctrl, head_ready, oproj_queue, rco):
-            t.zero_()
-        rbits.zero_(); ar_done_bits.zero_(); nvl.zero_()
+        # No host reset: the kernel-start directed cleaner zeros per-layer control
+        # state, and nvl/sync_ctrl are reuse-safe phase protocols. The timing loop
+        # therefore exercises the real cross-layer workspace-reuse path.
         torch.cuda.synchronize(); dist.barrier()
 
     def run_fused():

@@ -153,6 +153,27 @@ def oproj_task_counts(num_row_tiles: int, hidden: int, N_TILE: int,
     return num_out_n_tiles, num_super_groups, total_oproj_tasks
 
 
+def active_counts(num_row_tiles: int, H_local: int, num_super_groups: int,
+                  tp_size: int, rank: int):
+    """Per-launch runtime active counts for the `actv` kernel tensor.
+
+    One kernel compiled at a bucket capacity serves any active shape with
+    num_row_tiles <= max_num_row_tiles. The kernel reads these six values at start to
+    bound scheduling, the directed cleaner, AR claim scan and the done targets, while
+    workspace tensors keep their (larger) compile-time capacity. Returns an int32
+    numpy array laid out as the kernel expects:
+
+        [num_fa_active, total_oproj_active, num_row_tiles_active,
+         owner_slots_active, owner_words_active, local_owned_ar_active]
+    """
+    total_oproj = num_row_tiles * num_super_groups
+    owner_slots = cdiv(total_oproj, tp_size)
+    owner_words = cdiv(owner_slots, 64)
+    local_owned = cdiv(max(total_oproj - rank, 0), tp_size)
+    return np.array([num_row_tiles * H_local, total_oproj, num_row_tiles,
+                     owner_slots, owner_words, local_owned], dtype=np.int32)
+
+
 def decode_oproj_slot(slot_id: int, num_super_groups: int,
                       super_group_n_tiles: int, hidden: int, N_TILE: int):
     """slot_id -> (row_tile_id, n_super_group, base_out_n_tile, valid_n_tiles)."""
