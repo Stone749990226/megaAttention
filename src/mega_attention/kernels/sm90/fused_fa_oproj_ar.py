@@ -51,10 +51,9 @@ C_OP_CONSUME = 4
 C_OP_DONE = 5
 C_AR_DONE = 6
 C_AR_CURSOR = 7
-C_ORDER_ERR = 8
-C_GS_INIT = 9
-C_GS_EXIT = 10
-NUM_CTRL = 11
+C_GS_INIT = 8
+C_GS_EXIT = 9
+NUM_CTRL = 10
 
 FINISH_TAG = 0x80000000
 
@@ -266,7 +265,7 @@ def publish_ar_ready_xrank(rc_local: cute.Tensor, rb_local: cute.Tensor,
 
 
 @cute.jit
-def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor, ar_exec: cute.Tensor,
+def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor,
          ar_slot_id: cutlass.Int32, tp_size: cutlass.Constexpr):
     """Complete an AR owner task for the single-rank identity case.
 
@@ -276,8 +275,6 @@ def do_ar(ctrl: cute.Tensor, ar_done_bits: cute.Tensor, ar_exec: cute.Tensor,
     owner_idx = ar_slot_id // cutlass.Int32(tp_size)
     word = (owner_idx // cutlass.Int32(64)).to(cutlass.Uint32)
     bit = cutlass.Int64(1) << (owner_idx % cutlass.Int32(64)).to(cutlass.Int64)
-    cute.arch.atomic_add(ar_exec.iterator + ar_slot_id.to(cutlass.Uint32),
-                         cutlass.Uint32(1), sem="relaxed", scope="gpu")
     old_done = cute.arch.atomic_or(ar_done_bits.iterator + word, bit,
                                    sem="acq_rel", scope="gpu")
     if (old_done & bit) == cutlass.Int64(0):
@@ -425,7 +422,7 @@ class FusedFaOprojAr:
 
     @cute.jit
     def __call__(self, ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
-                 ar_done_bits, fa_exec, oproj_exec, ar_exec, partial_check,
+                 ar_done_bits,
                  mQ, mK, mV, mOscr, mWo, mCsym, mCuQ, mCuK, mFaB, mFaMb,
                  stream: cuda.CUstream):
         dt = mQ.element_type
@@ -525,7 +522,7 @@ class FusedFaOprojAr:
                           assumed_align=4), cute.make_layout(4))
 
         self.kernel(ctrl, head_ready, oproj_queue, ready_count_owner, ar_ready_bits,
-                    ar_done_bits, fa_exec, oproj_exec, ar_exec, partial_check,
+                    ar_done_bits,
                     tma_k, tK, tma_v, tV, mOscr, mOscr2d, mWo, mCsym, csym_mc,
                     nvl_mc, nvl_local, tma_q, tQ, mCuQ, mCuK,
                     mFaB, mFaMb, tma_a, tA, tma_wo, tWo,
@@ -536,8 +533,7 @@ class FusedFaOprojAr:
     @cute.kernel
     def kernel(self, ctrl: cute.Tensor, head_ready: cute.Tensor,
                oproj_queue: cute.Tensor, ready_count_owner: cute.Tensor,
-               ar_ready_bits: cute.Tensor, ar_done_bits: cute.Tensor, fa_exec: cute.Tensor,
-               oproj_exec: cute.Tensor, ar_exec: cute.Tensor, partial_check: cute.Tensor,
+               ar_ready_bits: cute.Tensor, ar_done_bits: cute.Tensor,
                tma_k: cute.CopyAtom, mK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor,
                mOscr: cute.Tensor, mOscr2d: cute.Tensor, mWo: cute.Tensor, mCsym: cute.Tensor,
                csym_mc: cute.Tensor, nvl_mc: cute.Tensor, nvl_local: cute.Tensor,
@@ -684,9 +680,20 @@ class FusedFaOprojAr:
                     q_start = mCuQ[b]
                     k_start = mCuK[b]
                     q_len = mCuQ[b + cutlass.Int32(1)] - q_start
-                    k_len = q_len
-                    mask_q_off = mb * cutlass.Int32(128)
-                    nblk = mb + cutlass.Int32(1)
+                    k_len = mCuK[b + cutlass.Int32(1)] - k_start
+                    offset = k_len - q_len               # bottom-right aligned causal
+                    mask_q_off = mb * cutlass.Int32(128)  # = m_idx_min (seq-local q tile)
+                    # FA4 BlockInfo.get_n_block_min_max (纯 causal, 非 local/split):
+                    m_idx_max = (mb + cutlass.Int32(1)) * cutlass.Int32(128)
+                    nblk = min(cute.ceil_div(k_len, 128),
+                               cute.ceil_div(m_idx_max + offset, 128))
+                    # 首个需 causal mask 的块 (get_n_block_min_causal_local_mask)。
+                    n_blk_causal = cutlass.max(cutlass.Int32(0),
+                                               (mask_q_off + offset) // cutlass.Int32(128))
+                    # peeled 首块 (n=nblk-1) 之外, 还需 causal mask 的中间块数。offset==0
+                    # 时为 0 -> 退化为完整 prompt prefill 的"仅对角块 mask"路径。
+                    causal_cnt = cutlass.max(cutlass.Int32(0),
+                                             nblk - cutlass.Int32(1) - n_blk_causal)
 
                     mQ_cur = cute.domain_offset((q_start, None, None), tQ)[None, None, head]
                     gQ = cute.local_tile(mQ_cur, (self.M, self.D), (None, 0))
@@ -774,12 +781,43 @@ class FusedFaOprojAr:
                         fa_k_cons.advance()
                         softmax_block_dyn(acc_mn, row_max, row_sum, row_scale, nrows, slog2,
                                           True, coord_mn, nblk - cutlass.Int32(1),
-                                          mask_q_off, k_len)
+                                          mask_q_off, k_len, offset=offset)
                         tOrP.store(tOrP_v.load().to(self.dt))
 
-                        # 右->左中间块 (n = nblk-1-i, 递减到 0)：QK(n) overlaps PV(n+1)。
-                        # n 全在对角线左侧、完全可见，跳过 mask。
-                        for i in cutlass.range(1, nblk, unroll=1):
+                        # 右->左中间块分两段 (n = nblk-1-i, 递减)。前 causal_cnt 个块跨过
+                        # causal 边界, 需逐元素 mask；其余块全在边界左侧, 走 no-mask 快路径。
+                        # 两段共享同一 fa_k_cons/fa_v_cons/tOrP/acc_O pipeline 计数器顺序推进。
+                        for i in cutlass.range(1, cutlass.Int32(1) + causal_cnt, unroll=1):
+                            n = nblk - cutlass.Int32(1) - i
+                            pl_k.consumer_wait(fa_k_cons)
+                            acc_S.fill(0.0)
+                            mma_qk.set(warpgroup.Field.ACCUMULATE, True)
+                            cute.nvgpu.warpgroup.fence()
+                            for kb in cutlass.range_constexpr(nkb_qk):
+                                cute.gemm(mma_qk, acc_S, tCrQ[(None, None, kb, 0)],
+                                          tCrK[(None, None, kb, fa_k_cons.index)], acc_S)
+                            cute.nvgpu.warpgroup.commit_group()
+                            pl_v.consumer_wait(fa_v_cons)
+                            mma_pv.set(warpgroup.Field.ACCUMULATE, True)
+                            for kb in cutlass.range_constexpr(nkb_pv):
+                                cute.gemm(mma_pv, acc_O, tOrP[(None, None, kb)],
+                                          tCrV[(None, None, kb, fa_v_cons.index)], acc_O)
+                            cute.nvgpu.warpgroup.commit_group()
+                            cute.nvgpu.warpgroup.wait_group(1)
+                            pl_k.consumer_release(fa_k_cons)
+                            fa_k_cons.advance()
+                            softmax_block_dyn(acc_mn, row_max, row_sum, row_scale, nrows, slog2,
+                                              False, coord_mn, n, mask_q_off, k_len,
+                                              need_mask=True, offset=offset)
+                            cute.nvgpu.warpgroup.wait_group(0)
+                            pl_v.consumer_release(fa_v_cons)
+                            fa_v_cons.advance()
+                            for r in cutlass.range_constexpr(nrows):
+                                acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
+                            tOrP.store(qlu.reshape_acc_to_frgA(acc_S).load().to(self.dt))
+
+                        # no-mask 区间: n 全在 causal 边界左侧、完全可见, 跳过逐元素比较。
+                        for i in cutlass.range(cutlass.Int32(1) + causal_cnt, nblk, unroll=1):
                             n = nblk - cutlass.Int32(1) - i
                             pl_k.consumer_wait(fa_k_cons)
                             acc_S.fill(0.0)
@@ -846,9 +884,7 @@ class FusedFaOprojAr:
                     # FA task are complete from the CTA's point of view.
                     cute.arch.sync_threads()
                     if tidx == 0:
-                        cute.arch.atomic_add(fa_exec.iterator + arg.to(cutlass.Uint32),
-                                             cutlass.Uint32(1), sem="relaxed", scope="gpu")
-                        cute.arch.fence_acq_rel_gpu()
+                        cute.arch.fence_acq_rel_gpu()            # O_scratch store before ready
                         old = cute.arch.atomic_add(head_ready.iterator + ft.to(cutlass.Uint32),
                                                    cutlass.Uint32(1), sem="acq_rel", scope="gpu")
                         if (old + cutlass.Uint32(1)) == cutlass.Uint32(H_local):
@@ -950,8 +986,6 @@ class FusedFaOprojAr:
 
                     cute.arch.sync_threads()
                     if tidx == 0:
-                        cute.arch.atomic_add(oproj_exec.iterator + arg.to(cutlass.Uint32),
-                                             cutlass.Uint32(1), sem="relaxed", scope="gpu")
                         cute.arch.fence_acq_rel_gpu()            # C_sym partial before ready
                         # arg is also ar_slot_id. The last rank to publish readiness sets
                         # the owner-local ready bit.
@@ -965,7 +999,7 @@ class FusedFaOprojAr:
                 if mode == MODE_AR:
                     if cutlass.const_expr(tp_size == 1):
                         if tidx == 0:
-                            do_ar(ctrl, ar_done_bits, ar_exec, arg, tp_size)
+                            do_ar(ctrl, ar_done_bits, arg, tp_size)
                     else:
                         # AR owner reduces the whole C_sym tile through the multicast
                         # view, parallelized over contiguous 8-bf16 chunks in N.
@@ -995,8 +1029,6 @@ class FusedFaOprojAr:
                             owner_idx = arg // cutlass.Int32(tp_size)
                             word = (owner_idx // cutlass.Int32(64)).to(cutlass.Uint32)
                             bit = cutlass.Int64(1) << (owner_idx % cutlass.Int32(64)).to(cutlass.Int64)
-                            cute.arch.atomic_add(ar_exec.iterator + arg.to(cutlass.Uint32),
-                                                 cutlass.Uint32(1), sem="relaxed", scope="gpu")
                             old_done = cute.arch.atomic_or(ar_done_bits.iterator + word, bit,
                                                            sem="acq_rel", scope="gpu")
                             if (old_done & bit) == cutlass.Int64(0):

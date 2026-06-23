@@ -40,16 +40,17 @@ def softmax_block_dyn(acc_mn: cute.Tensor, row_max: cute.Tensor, row_sum: cute.T
                       row_scale: cute.Tensor, nrows: cutlass.Constexpr,
                       slog2: cutlass.Constexpr, is_first: cutlass.Constexpr,
                       coord_mn: cute.Tensor, n_block, q_start, k_len,
-                      need_mask: cutlass.Constexpr = True):
+                      need_mask: cutlass.Constexpr = True, offset=0):
     """Online-softmax step with runtime causal and k_len masking.
 
     is_first remains compile-time for the prologue/middle split. n_block, q_start,
-    and k_len are runtime. A score is valid only when kv_pos <= q_pos and
-    kv_pos < k_len. row_sum stores local per-thread partial sums; the warp-quad
-    reduction is deferred to finalization.
+    k_len, and offset are runtime. bottom-right aligned causal (offset = k_len -
+    q_len): a score is valid only when kv_pos <= q_pos + offset and kv_pos < k_len.
+    offset == 0 退化为完整 prompt prefill 的标准下三角。row_sum stores local
+    per-thread partial sums; the warp-quad reduction is deferred to finalization.
 
-    need_mask is compile-time. 右->左遍历时只有对角块需要 mask；左侧全可见块传
-    need_mask=False 跳过逐元素比较（n_block 此时不参与计算）。
+    need_mask is compile-time. 右->左遍历分三段：peeled 首块与 causal 中间区间传
+    need_mask=True；causal 边界左侧全可见块传 need_mask=False 跳过逐元素比较。
     """
     for r in cutlass.range_constexpr(nrows):
         coord_row = coord_mn[r, None]
@@ -57,7 +58,7 @@ def softmax_block_dyn(acc_mn: cute.Tensor, row_max: cute.Tensor, row_sum: cute.T
             for c in cutlass.range_constexpr(cute.size(acc_mn, mode=[1])):
                 q_pos = q_start + coord_row[c][0]
                 kv_pos = n_block * 128 + coord_row[c][1]
-                if (kv_pos > q_pos) or (kv_pos >= k_len):
+                if (kv_pos > q_pos + offset) or (kv_pos >= k_len):
                     acc_mn[r, c] = -cutlass.Float32.inf
         row = acc_mn[r, None].load()
         m_old = row_max[r]
@@ -66,13 +67,21 @@ def softmax_block_dyn(acc_mn: cute.Tensor, row_max: cute.Tensor, row_sum: cute.T
         else:
             m = row.reduce(cute.ReductionOp.MAX, m_old, 0)
         m = cute.arch.warp_reduction_max(m, threads_in_group=4)
-        pexp = cute.math.exp2(row * slog2 - m * slog2, fastmath=True)
+        # bottom-right causal (offset>0) 下, peeled 首块或某些 causal 中间块可能对低 q_pos
+        # 行整行落在 causal reach 之外 -> 整行 -inf, m=-inf。此时 exp2(-inf-(-inf))=NaN。
+        # q==k 时对角元素恒可见, m 不会为 -inf, 本分支不触发, 故对回归路径零影响。
+        m_safe = m
+        if m == -cutlass.Float32.inf:
+            m_safe = cutlass.Float32(0.0)
+        pexp = cute.math.exp2(row * slog2 - m_safe * slog2, fastmath=True)
         ls = pexp.reduce(cute.ReductionOp.ADD, 0.0, 0)
         if cutlass.const_expr(is_first):
             row_scale[r] = cutlass.Float32(1.0)
             row_sum[r] = ls
         else:
-            rs = cute.math.exp2((m_old - m) * slog2, fastmath=True)
+            rs = cutlass.Float32(1.0)            # 默认: m==-inf, acc_O 仍 0, 无需 rescale
+            if m != -cutlass.Float32.inf:
+                rs = cute.math.exp2((m_old - m) * slog2, fastmath=True)
             row_scale[r] = rs
             row_sum[r] = row_sum[r] * rs + ls
         row_max[r] = m

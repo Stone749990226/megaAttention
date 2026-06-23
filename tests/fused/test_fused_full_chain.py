@@ -24,25 +24,17 @@ from mega_attention.reference.fused import fa_reference, oproj_reference
 DT = torch.bfloat16
 
 
-def main():
-    lr = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(lr)
-    dev = torch.device(f"cuda:{lr}")
-    dist.init_process_group("nccl")
-    rank, ws = dist.get_rank(), dist.get_world_size()
-    gname = dist.group.WORLD.group_name
-    symm_mem.enable_symm_mem_for_group(gname)
-
-    seqlens, H_local, D, hidden = [200, 64, 300], 4, 128, 512
-    q_per_kv = 2                                   # GQA: 4 Q head 共享 2 KV head
+def run_one(rank, ws, dev, gname, tag, seqlens, seqlens_k, H_local, hidden, q_per_kv):
+    D = 128
     H_kv = H_local // q_per_kv
     N_TILE, sg = 128, 4
-    torch.manual_seed(1000 + rank)
-    meta = build_row_desc(seqlens)
+    meta = build_row_desc(seqlens, seqlens_k=seqlens_k)
     R = meta.num_row_tiles
     K_local = H_local * D
     num_fa = R * H_local
     num_out, num_super_groups, total_oproj = oproj_task_counts(R, hidden, N_TILE, sg)
-    tot = int(sum(seqlens))
+    tot = int(sum(seqlens))                                    # tot_q
+    tot_k = int(sum(seqlens if seqlens_k is None else seqlens_k))
     hidden_pad = num_out * N_TILE
     owner_slots = (total_oproj + ws - 1) // ws
     owner_words = (owner_slots + 63) // 64
@@ -50,8 +42,8 @@ def main():
     # per-rank inputs (different seeds -> AR is a real cross-rank sum)
     g = torch.Generator(device=dev).manual_seed(1234 + rank)
     Q = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
-    K = torch.randn(tot, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
-    V = torch.randn(tot, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
+    K = torch.randn(tot_k, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
+    V = torch.randn(tot_k, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
     W_o = torch.randn(K_local, hidden, device=dev, dtype=DT, generator=g) * (K_local ** -0.5)
     W_o_pad = torch.zeros(K_local, hidden_pad, device=dev, dtype=DT); W_o_pad[:, :hidden] = W_o
     Oscr = torch.zeros(R, 128, H_local, D, device=dev, dtype=DT)
@@ -71,14 +63,11 @@ def main():
 
     ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)  # owner-local
     ctrl = _u32(NUM_CTRL); head_ready = _u32(R); oproj_queue = _u32(total_oproj)
-    fa_exec = _u32(num_fa); oproj_exec = _u32(total_oproj); ar_exec = _u32(total_oproj)
-    partial_check = _u32(total_oproj)
     cu_q, cu_k = _i32(meta.cu_seqlens_q), _i32(meta.cu_seqlens_k)
     fa_b, fa_mb = _i32(meta.batch_idx), _i32(meta.m_block)
 
     cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue, rco)]
     cts += [from_dlpack(t, assumed_align=8) for t in (rbits, ar_done_bits)]
-    cts += [from_dlpack(t, assumed_align=4) for t in (fa_exec, oproj_exec, ar_exec, partial_check)]
     cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
 
@@ -113,9 +102,33 @@ def main():
     fa_done, op_done, ar_done = int(ctrl[1]), int(ctrl[5]), int(ctrl[6])
     local_owned = (max(total_oproj - rank, 0) + ws - 1) // ws
     ok = (err < 5e-2 and fa_done == num_fa and op_done == total_oproj and ar_done == local_owned)
-    print(f"[rank{rank}] err={err:.4g} fa={fa_done}/{num_fa} op={op_done}/{total_oproj} "
+    print(f"[rank{rank}][{tag}] err={err:.4g} fa={fa_done}/{num_fa} op={op_done}/{total_oproj} "
           f"ar={ar_done}/{local_owned} {'OK' if ok else 'FAIL'}", flush=True)
+    dist.barrier()
+    return ok
+
+
+def main():
+    lr = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(lr)
+    dev = torch.device(f"cuda:{lr}")
+    dist.init_process_group("nccl")
+    rank, ws = dist.get_rank(), dist.get_world_size()
+    gname = dist.group.WORLD.group_name
+    symm_mem.enable_symm_mem_for_group(gname)
+    torch.manual_seed(1000 + rank)
+
+    # (tag, seqlens_q, seqlens_k, H_local, hidden, q_per_kv)
+    configs = [
+        # q==k 完整 prompt prefill 回归 (offset=0, GQA q_per_kv=2)
+        ("qk_eq",  [200, 64, 300], None,           4, 512, 2),
+        # q<k contiguous-KV chunked/append prefill: 混合 offset 对齐/不对齐 + tail + GQA
+        ("chunk",  [200, 64, 300], [512, 64, 460], 4, 512, 2),
+    ]
+    allok = True
+    for tag, sq, sk, H, hidden, qpk in configs:
+        allok = run_one(rank, ws, dev, gname, tag, sq, sk, H, hidden, qpk) and allok
     dist.barrier(); dist.destroy_process_group()
+    return allok
 
 
 if __name__ == "__main__":

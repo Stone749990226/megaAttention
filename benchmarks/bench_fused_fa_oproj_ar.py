@@ -99,9 +99,17 @@ def bench_kineto(body, iters, warmup, barrier=False, align=False, flush_l2=True,
 
 
 # ── theoretical FLOP / byte counts (per rank) ────────────────────────────────
-def fa_flops(seqlens, H_local, D):
-    """causal full-prefill (q==k): per seq per head = 2*M*avg*(d+dv), avg=M/2, dv=d=D."""
-    return float(sum(H_local * 2 * s * (s / 2) * (2 * D) for s in seqlens))
+def fa_flops(seqlens_q, H_local, D, seqlens_k=None):
+    """bottom-right causal QK^T+PV FLOP。per seq per head = 2 * pairs * (2*D),
+    pairs = sum_{i=0..lq-1} (i + offset + 1), offset = lk - lq (>=0)。
+    q==k 时 pairs = lq*(lq+1)/2, 退化为原完整 prefill 公式。seqlens_k=None -> q==k。"""
+    sk = seqlens_q if seqlens_k is None else seqlens_k
+    total = 0.0
+    for lq, lk in zip(seqlens_q, sk):
+        off = lk - lq
+        pairs = lq * off + lq * (lq + 1) / 2
+        total += H_local * 2 * pairs * (2 * D)
+    return float(total)
 
 
 def oproj_flops(tot, K_local, hidden):
@@ -128,30 +136,32 @@ def shape_label(seqlens, H_local, hidden, q_per_kv=1):
 
 
 def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
-              ws, rank, dev, iters, warmup, dump=False, q_per_kv=1):
+              ws, rank, dev, iters, warmup, dump=False, q_per_kv=1, seqlens_k=None):
     """Build buffers, compile fused kernel, time fused + 3 baseline segments, return row dict.
 
     q_per_kv: 标准 GQA 分组比 (per rank)。K/V 用 H_kv_local = H_local // q_per_kv 个 head；
     q_per_kv == 1 即 MHA。baseline flash_attn_varlen_func 原生支持 GQA。
+    seqlens_k: q_len<k_len contiguous-KV chunked/append prefill 的 KV 长度 (None -> q==k)。
     """
     gname = dist.group.WORLD.group_name
 
     D, N_TILE = 128, 128
     assert H_local % q_per_kv == 0, (H_local, q_per_kv)
     H_kv = H_local // q_per_kv
-    meta = build_row_desc(seqlens)
+    meta = build_row_desc(seqlens, seqlens_k=seqlens_k)
     R = meta.num_row_tiles
     K_local = H_local * D
     num_fa = R * H_local
     num_out, num_super_groups, total_oproj = oproj_task_counts(R, hidden, N_TILE, sg)
     tot = int(sum(seqlens)); hidden_pad = num_out * N_TILE
+    tot_k = int(sum(seqlens if seqlens_k is None else seqlens_k))
     owner_slots = (total_oproj + ws - 1) // ws
     owner_words = (owner_slots + 63) // 64
 
     g = torch.Generator(device=dev).manual_seed(1234 + rank)
     Q = torch.randn(tot, H_local, D, device=dev, dtype=DT, generator=g) * 0.2
-    K = torch.randn(tot, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
-    V = torch.randn(tot, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
+    K = torch.randn(tot_k, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
+    V = torch.randn(tot_k, H_kv, D, device=dev, dtype=DT, generator=g) * 0.2
     W_o = torch.randn(K_local, hidden, device=dev, dtype=DT, generator=g) * (K_local ** -0.5)
     W_o_pad = torch.zeros(K_local, hidden_pad, device=dev, dtype=DT); W_o_pad[:, :hidden] = W_o
     Oscr = torch.zeros(R, 128, H_local, D, device=dev, dtype=DT)
@@ -169,14 +179,11 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     hN = symm_mem.rendezvous(nvl, gname)
     ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
     ctrl = _u32(NUM_CTRL); head_ready = _u32(R); oproj_queue = _u32(total_oproj)
-    fa_exec = _u32(num_fa); oproj_exec = _u32(total_oproj); ar_exec = _u32(total_oproj)
-    partial_check = _u32(total_oproj)
     cu_q, cu_k = _i32(meta.cu_seqlens_q), _i32(meta.cu_seqlens_k)
     fa_b, fa_mb = _i32(meta.batch_idx), _i32(meta.m_block)
 
     cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue, rco)]
     cts += [from_dlpack(t, assumed_align=8) for t in (rbits, ar_done_bits)]
-    cts += [from_dlpack(t, assumed_align=4) for t in (fa_exec, oproj_exec, ar_exec, partial_check)]
     cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
 
@@ -194,8 +201,7 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     compiled = cute.compile(ker, *cts, st)
 
     def reset_fused():
-        for t in (ctrl, head_ready, oproj_queue, rco, fa_exec, oproj_exec, ar_exec,
-                  partial_check):
+        for t in (ctrl, head_ready, oproj_queue, rco):
             t.zero_()
         rbits.zero_(); ar_done_bits.zero_(); nvl.zero_()
         torch.cuda.synchronize(); dist.barrier()
@@ -207,11 +213,12 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     Y_sym = symm_mem.empty(tot, hidden, device=dev, dtype=DT)
     symm_mem.rendezvous(Y_sym, gname)
     cu = cu_q.to(torch.int32); max_s = max(seqlens)
+    cuk = cu_k.to(torch.int32); max_sk = max(seqlens if seqlens_k is None else seqlens_k)
     O_buf = torch.empty(tot, H_local, D, device=dev, dtype=DT)
 
     def run_fa():
         nonlocal O_buf
-        O_buf = flash_attn_varlen_func(Q, K, V, cu, cu, max_s, max_s, causal=True)
+        O_buf = flash_attn_varlen_func(Q, K, V, cu, cuk, max_s, max_sk, causal=True)
 
     def run_oproj():
         torch.matmul(O_buf.reshape(tot, K_local), W_o, out=Y_sym)
@@ -250,7 +257,7 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     denom = t_base - t_ideal
     overlap_pct = (t_base - t_fused) / denom * 100.0 if denom > 1e-9 else float("nan")
 
-    flop = fa_flops(seqlens, H_local, D) + oproj_flops(tot, K_local, hidden)
+    flop = fa_flops(seqlens, H_local, D, seqlens_k=seqlens_k) + oproj_flops(tot, K_local, hidden)
     tflops = flop / 1e12 / (t_fused / 1e3)
     s_bytes = ar_bytes(tot, hidden)
     bus_factor = 2.0 * (ws - 1) / ws
@@ -324,6 +331,14 @@ README_CASES = [
     (_CHUNK_SMALL, 16, 8192, 8),
 ]
 
+# ---- q_len < k_len 比例扫描: 固定 Q chunk, 扫 k_len/q_len ∈ {1,2,4} (offset=0/q/3q) ----
+# 5-tuple: (seqlens_q, H_local, hidden, q_per_kv, seqlens_k)。ratio=1 即 q==k 回归基准。
+RATIO_CASES = [
+    (_CHUNK_SMALL, 8, 4096, 8, [s * 1 for s in _CHUNK_SMALL]),   # ratio 1x: offset=0
+    (_CHUNK_SMALL, 8, 4096, 8, [s * 2 for s in _CHUNK_SMALL]),   # ratio 2x: KV 前缀=2x chunk
+    (_CHUNK_SMALL, 8, 4096, 8, [s * 4 for s in _CHUNK_SMALL]),   # ratio 4x: KV 前缀=4x chunk
+]
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -341,7 +356,7 @@ def main():
     ap.add_argument("--auto", action="store_true",
                     help="用 choose_launch_config 自动选 (w_fa,w_oproj,w_ar,sg)")
     ap.add_argument("--cases", type=str, default="",
-                    help="'readme' 跑内置全表; 留空跑单 --seqlens")
+                    help="'readme' 跑内置全表; 'ratio' 跑 q<k 比例扫描; 留空跑单 --seqlens")
     ap.add_argument("--json", type=str, default="", help="把行结果写入该 JSON 路径")
     ap.add_argument("--dump-kernels", action="store_true",
                     help="打印每段 profiler kernel 表 (校验名字匹配)")
@@ -352,17 +367,20 @@ def main():
     dist.init_process_group("nccl")
     rank, ws = dist.get_rank(), dist.get_world_size()
     gname = dist.group.WORLD.group_name
-    symm_mem.enable_symm_mem_for_group(gname)
 
     if args.cases == "readme":
         cases = README_CASES
+    elif args.cases == "ratio":
+        cases = RATIO_CASES
     else:
         cases = [([int(x) for x in args.seqlens.split(",")], args.h_local, args.hidden,
                   args.q_per_kv)]
 
     rows = []
-    for seqlens, H_local, hidden, q_per_kv in cases:
-        meta = build_row_desc(seqlens)
+    for case in cases:
+        seqlens, H_local, hidden, q_per_kv = case[0], case[1], case[2], case[3]
+        seqlens_k = case[4] if len(case) > 4 else None
+        meta = build_row_desc(seqlens, seqlens_k=seqlens_k)
         if args.auto:
             from mega_attention.metadata.launch_heuristic import choose_launch_config
             cfg = choose_launch_config(meta, hidden, tp_size=ws)
@@ -371,7 +389,7 @@ def main():
             w_fa, w_oproj, w_ar, sg = args.w_fa, args.w_oproj, args.w_ar, args.sg
         row = bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
                         ws, rank, dev, args.iters, args.warmup, dump=args.dump_kernels,
-                        q_per_kv=q_per_kv)
+                        q_per_kv=q_per_kv, seqlens_k=seqlens_k)
         rows.append(row)
         dist.barrier()
 

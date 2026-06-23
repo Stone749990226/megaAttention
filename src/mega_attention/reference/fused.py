@@ -103,8 +103,16 @@ def fa_reference(Q, K, V, meta: RowDescMeta, softmax_scale=None):
         if q_per_kv > 1:
             k = k.repeat_interleave(q_per_kv, dim=0)
             v = v.repeat_interleave(q_per_kv, dim=0)
-        # causal mask aligned to the bottom-right (seqlen_q may != seqlen_k).
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+        # bottom-right aligned causal (offset = k_len - q_len): row i 可见 col j<=i+offset。
+        # 注意 torch SDPA 的 is_causal=True 是 top-left 对齐 (q_len!=k_len 时不符), 必须显式
+        # 构造 bottom-right mask, 与 FA4 / 本项目 kernel 语义一致。
+        lq = qe - qs
+        lk = ke - ks
+        off = lk - lq
+        qpos = torch.arange(lq, device=q.device).unsqueeze(1)
+        kpos = torch.arange(lk, device=q.device).unsqueeze(0)
+        attn_mask = (kpos <= qpos + off)            # [Lq, Lk] bool, True=keep
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale)
         O[qs:qe] = o.transpose(0, 1)
     return O
 

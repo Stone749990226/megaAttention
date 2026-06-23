@@ -124,14 +124,11 @@ def main():
     hN = symm_mem.rendezvous(nvl, gname)
     ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
     ctrl = _u32(NUM_CTRL); head_ready = _u32(R); oproj_queue = _u32(total_oproj)
-    fa_exec = _u32(num_fa); oproj_exec = _u32(total_oproj); ar_exec = _u32(total_oproj)
-    partial_check = _u32(total_oproj)
     cu_q, cu_k = _i32(meta.cu_seqlens_q), _i32(meta.cu_seqlens_k)
     fa_b, fa_mb = _i32(meta.batch_idx), _i32(meta.m_block)
 
     cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue, rco)]
     cts += [from_dlpack(t, assumed_align=8) for t in (rbits, ar_done_bits)]
-    cts += [from_dlpack(t, assumed_align=4) for t in (fa_exec, oproj_exec, ar_exec, partial_check)]
     cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
 
@@ -154,8 +151,7 @@ def main():
     compiled = cute.compile(ker, *cts, st)
 
     def reset_fused():
-        for t in (ctrl, head_ready, oproj_queue, rco, fa_exec, oproj_exec, ar_exec,
-                  partial_check):
+        for t in (ctrl, head_ready, oproj_queue, rco):
             t.zero_()
         rbits.zero_(); ar_done_bits.zero_(); nvl.zero_()
         torch.cuda.synchronize(); dist.barrier()

@@ -38,7 +38,6 @@ docs/design/causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md
 
 当前范围之外、尚未实现，按需推进：
 
-- chunked prefill。
 - paged KV、SplitKV、partial O/LSE combine、非 causal attention。
 - FA per-tile pipeline 进一步优化（长单序列 compute-bound 场景）。
 - AR comm/compute overlap 优化（大 hidden 下 AR 占比偏高）。

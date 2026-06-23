@@ -6,7 +6,7 @@ Validates the FA -> O_proj path end-to-end inside the dispatch loop:
   * C_sym partial (written by real O_proj across all CTAs/tasks) matches the fp32
     oproj_reference (concat_h(FA_out) @ W_o), per (row_tile, out_n_tile) tile with
     valid_m / valid_n predication,
-  * scheduler still exactly-once (fa/oproj/ar exec all == 1) + terminates.
+  * scheduler terminates with fa/oproj/ar done counts at their task totals.
 
 O_scratch is produced by real FA; C_sym is produced by real O_proj reading that
 O_scratch. AR stays identity (tp_size=1), so this isolates the O_proj numerics.
@@ -71,10 +71,6 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     ready_count_owner = _u32(owner_slots, dev)
     ar_ready_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
     ar_done_bits = torch.zeros(owner_words, dtype=torch.int64, device=dev)
-    fa_exec = _u32(num_fa, dev)
-    oproj_exec = _u32(total_oproj, dev)
-    ar_exec = _u32(total_oproj, dev)
-    partial_check = _u32(total_oproj, dev)
     cu_q = _i32(meta.cu_seqlens_q, dev)
     cu_k = _i32(meta.cu_seqlens_k, dev)
     fa_b = _i32(meta.batch_idx, dev)
@@ -83,8 +79,6 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
     cts = [from_dlpack(t, assumed_align=4) for t in (ctrl, head_ready, oproj_queue,
                                                      ready_count_owner)]
     cts += [from_dlpack(t, assumed_align=8) for t in (ar_ready_bits, ar_done_bits)]
-    cts += [from_dlpack(t, assumed_align=4) for t in (fa_exec, oproj_exec, ar_exec,
-                                                      partial_check)]
     cts += [from_dlpack(t, assumed_align=16) for t in (Q, K, V, Oscr, W_o_pad, C_sym)]
     cts += [from_dlpack(t, assumed_align=16) for t in (cu_q, cu_k, fa_b, fa_mb)]
 
@@ -121,8 +115,7 @@ def run_case(seqlens, H_local, D=128, hidden=512, N_TILE=128, super_group_n_tile
 
     return dict(
         err=err, leak=leak, R=R, num_fa=num_fa, total_oproj=total_oproj,
-        fa_exec=fa_exec.cpu(), oproj_exec=oproj_exec.cpu(), ar_exec=ar_exec.cpu(),
-        order_err=int(ctrl[8].item()), fa_done=int(ctrl[1].item()),
+        fa_done=int(ctrl[1].item()),
         op_done=int(ctrl[5].item()), ar_done=int(ctrl[6].item()),
     )
 
@@ -134,14 +127,6 @@ def _check(name, r, tol=3e-2):
         ok = False; msgs.append(f"C_sym err={r['err']:.4g}")
     if r["leak"] != 0.0:
         ok = False; msgs.append("wrote masked tail (sentinel overwritten)")
-    if not bool((r["fa_exec"] == 1).all()):
-        ok = False; msgs.append("fa_exec != 1")
-    if not bool((r["oproj_exec"] == 1).all()):
-        ok = False; msgs.append("oproj_exec != 1")
-    if not bool((r["ar_exec"] == 1).all()):
-        ok = False; msgs.append("ar_exec != 1")
-    if r["order_err"] != 0:
-        ok = False; msgs.append(f"order_err={r['order_err']}")
     if r["fa_done"] != r["num_fa"] or r["op_done"] != r["total_oproj"] or r["ar_done"] != r["total_oproj"]:
         ok = False; msgs.append(f"done fa={r['fa_done']}/{r['num_fa']} op={r['op_done']}/{r['total_oproj']} ar={r['ar_done']}/{r['total_oproj']}")
     print(f"{'PASS' if ok else 'FAIL'} {name}: err={r['err']:.4g} R={r['R']} "

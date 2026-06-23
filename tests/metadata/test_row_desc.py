@@ -82,10 +82,15 @@ def test_valid_m_tiny_and_exact():
 
 
 def test_q_len_k_len_precondition():
-    # equal k is fine
+    # equal k is fine (full prompt prefill, offset == 0)
     m = build_row_desc([200, 64], seqlens_k=[200, 64])
     assert (m.cu_seqlens_q == m.cu_seqlens_k).all()
-    # unequal k violates the complete-prompt-prefill precondition
+    # k_len > q_len is allowed (contiguous-KV chunked/append prefill)
+    m = build_row_desc([200, 64], seqlens_k=[200, 128])
+    assert m.k_len(0) == 200 and m.q_len(0) == 200
+    # row tiles still keyed on q only; k_len read independently from cu_seqlens_k
+    assert m.num_row_tiles == build_row_desc([200, 64]).num_row_tiles
+    # k_len < q_len violates the bottom-right aligned causal precondition
     with pytest.raises(AssertionError):
         build_row_desc([200, 64], seqlens_k=[200, 32])
 

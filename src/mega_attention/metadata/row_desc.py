@@ -108,22 +108,25 @@ class RowDescMeta:
 def build_row_desc(seqlens_q, M_TILE: int = ROW_M_TILE, seqlens_k=None) -> RowDescMeta:
     """Build unified 128-row schedule metadata from per-sequence lengths.
 
-    First version is complete prompt prefill: when `seqlens_k` is supplied it
-    must equal `seqlens_q` (q_len == k_len precondition); otherwise k defaults
-    to q.
+    contiguous-KV prefill: 前置条件 `0 < q_len <= k_len`。`q_len == k_len` 是完整
+    prompt prefill 的退化情形；`q_len < k_len` 表示当前 Q chunk 关注同一 sequence 的
+    完整连续 KV 前缀（bottom-right aligned causal, offset = k_len - q_len）。row tile
+    调度与 O_scratch/C_sym 容量只按 Q token 计量，与 k_len 无关。当未提供 `seqlens_k`
+    时默认 k == q（完整 prompt prefill）。
     """
     assert int(M_TILE) == ROW_M_TILE, (
         "first version requires unified 128-row tiles "
         "(FA_M_TILE == OPROJ_M_TILE == AR_M_TILE == 128)")
     seqlens_q = np.asarray(seqlens_q, dtype=np.int64)
     assert seqlens_q.ndim == 1 and seqlens_q.shape[0] > 0
-    assert (seqlens_q >= 0).all()
+    assert (seqlens_q > 0).all(), "contiguous-KV prefill requires q_len > 0"
     if seqlens_k is None:
         seqlens_k = seqlens_q
     seqlens_k = np.asarray(seqlens_k, dtype=np.int64)
     assert seqlens_k.shape == seqlens_q.shape
-    assert (seqlens_k == seqlens_q).all(), (
-        "first version requires q_len == k_len (complete prompt prefill)")
+    assert (seqlens_k >= seqlens_q).all(), (
+        "contiguous-KV prefill requires 0 < q_len <= k_len "
+        "(bottom-right aligned causal); q_len > k_len is not supported")
 
     cu, b, mb = _build_tile_desc(seqlens_q, M_TILE)
     return RowDescMeta(
