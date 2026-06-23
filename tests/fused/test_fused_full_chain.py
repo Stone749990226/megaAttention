@@ -95,6 +95,10 @@ def run_one(rank, ws, dev, gname, tag, seqlens, seqlens_k, H_local, hidden, q_pe
     # Reuse path: launch the same layer several times with NO host reset between
     # launches. The kernel-start cleaner + phase/sign barriers must reproduce the
     # exact same result every iteration (cross-layer workspace reuse).
+    # First-layer bootstrap: the kernel has no start cleaner / init barrier, so all
+    # ranks' buffer zeroing must be complete and cross-rank visible before the first
+    # launch issues a remote control write (mirrors workspace.create's barrier).
+    torch.cuda.synchronize(); dist.barrier()
     NREUSE = 3
     err = 0.0
     for _ in range(NREUSE):
@@ -112,9 +116,10 @@ def run_one(rank, ws, dev, gname, tag, seqlens, seqlens_k, H_local, hidden, q_pe
         dist.barrier()
     fa_done, op_done, ar_done = int(ctrl[1]), int(ctrl[5]), int(ctrl[6])
     local_owned = (max(total_oproj - rank, 0) + ws - 1) // ws
-    ok = (err < 5e-2 and fa_done == num_fa and op_done == total_oproj and ar_done == local_owned)
-    print(f"[rank{rank}][{tag}] err={err:.4g} fa={fa_done}/{num_fa} op={op_done}/{total_oproj} "
-          f"ar={ar_done}/{local_owned} {'OK' if ok else 'FAIL'}", flush=True)
+    # exit cleaner zeroes task_ctrl on the way out; reaching it (all_done) leaves 0.
+    ok = (err < 5e-2 and fa_done == 0 and op_done == 0 and ar_done == 0)
+    print(f"[rank{rank}][{tag}] err={err:.4g} done(fa,op,ar)=({fa_done},{op_done},{ar_done}) "
+          f"[exit-clean->0] local_owned={local_owned} {'OK' if ok else 'FAIL'}", flush=True)
     dist.barrier()
     return ok
 

@@ -114,8 +114,10 @@ def _check(name, r, tol=2e-2):
         ok = False; msgs.append(f"O_scratch err={r['err']:.4g}")
     if r["tail"] != 0.0:
         ok = False; msgs.append(f"tail={r['tail']:.4g}")
-    if r["fa_done"] != r["num_fa"] or r["op_done"] != r["total_oproj"] or r["ar_done"] != r["total_oproj"]:
-        ok = False; msgs.append(f"done fa={r['fa_done']}/{r['num_fa']} op={r['op_done']}/{r['total_oproj']} ar={r['ar_done']}/{r['total_oproj']}")
+    # Exit cleaner zeroes task_ctrl on the way out, so reaching it (all_done observed)
+    # leaves the done counters at 0. Non-zero here means the scheduler never completed.
+    if r["fa_done"] != 0 or r["op_done"] != 0 or r["ar_done"] != 0:
+        ok = False; msgs.append(f"exit-clean expected 0 done, got fa={r['fa_done']} op={r['op_done']} ar={r['ar_done']}")
     print(f"{'PASS' if ok else 'FAIL'} {name}: err={r['err']:.4g} R={r['R']} "
           f"fa={r['num_fa']} op={r['total_oproj']}" + ("" if ok else "  ||  " + "; ".join(msgs)),
           flush=True)

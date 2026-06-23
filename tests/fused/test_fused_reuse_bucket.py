@@ -118,12 +118,12 @@ def main():
                 exp = Y_ref[qs:qs + vm, o * N_TILE:o * N_TILE + vn].cpu()
                 err = max(err, (got - exp).abs().max().item())
         fa_d, op_d, ar_d = int(ctrl[1]), int(ctrl[5]), int(ctrl[6])
-        exp_fa, exp_op = R * H_local, R * num_super_groups
-        ok = (err < 2e-2 and fa_d == exp_fa and op_d == exp_op and ar_d == exp_op)
+        # exit cleaner zeroes task_ctrl; reaching it (all_done) leaves done counters at 0.
+        ok = (err < 2e-2 and fa_d == 0 and op_d == 0 and ar_d == 0)
         if not ok:
             failed += 1
         print(f"{'PASS' if ok else 'FAIL'} {name}: err={err:.4g} R={R}/{MAX_RT} "
-              f"fa={fa_d}/{exp_fa} op={op_d}/{exp_op} ar={ar_d}/{exp_op}", flush=True)
+              f"done(fa,op,ar)=({fa_d},{op_d},{ar_d}) [exit-clean->0]", flush=True)
 
     print(f"\n{'ALL PASS' if failed == 0 else f'{failed} FAILED'}")
     return failed

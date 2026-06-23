@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
@@ -92,7 +93,7 @@ class FusedFaOprojArWorkspace:
             csym_mc_ptr = 0; nvl_local_ptr = 0
             nvl_peer_ptrs = []; rc_ptrs = []; rb_ptrs = []
 
-        return cls(
+        ws = cls(
             dev=dev, dtype=dtype, tp_size=tp_size, rank=rank,
             H_local=H_local, H_kv=H_kv, D=D, K_local=K_local, hidden=hidden,
             hidden_pad=hidden_pad, N_TILE=N_TILE, super_group_n_tiles=super_group_n_tiles,
@@ -118,6 +119,13 @@ class FusedFaOprojArWorkspace:
             csym_mc_ptr=csym_mc_ptr, nvl_local_ptr=nvl_local_ptr,
             nvl_peer_ptrs=nvl_peer_ptrs, rc_ptrs=rc_ptrs, rb_ptrs=rb_ptrs,
         )
+        # One-time global zero barrier: the kernel has no start cleaner / init barrier,
+        # so the first layer relies on this full zero being complete and cross-rank
+        # visible before any rank issues a remote control write.
+        torch.cuda.synchronize()
+        if tp_size > 1 and dist.is_initialized():
+            dist.barrier()
+        return ws
 
     # ---------------------------------------------------------------- compile
     def _cts(self):

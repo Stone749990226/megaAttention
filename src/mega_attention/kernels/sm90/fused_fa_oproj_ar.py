@@ -54,13 +54,15 @@ C_AR_DONE = 6
 C_AR_CURSOR = 7
 NUM_CTRL = 8
 
-# sync_ctrl_local[] slots: long-lived barrier state, NEVER cleared by the
-# kernel-start cleaner. grid_sync uses the high-bit phase flip protocol and the
-# nvl barrier uses a phase/sign counter, so both survive workspace reuse without
-# being zeroed. Kept in a physically separate allocation from task_ctrl so a
-# range-based cleaner can never wipe barrier state (设计稿: task_ctrl/sync_ctrl 拆分).
-S_GS_INIT = 0
-S_GS_EXIT = 1
+# sync_ctrl_local[] slots: long-lived barrier state, NEVER cleared by the exit cleaner.
+# grid_sync uses the high-bit phase flip protocol and the nvl barrier uses a phase/sign
+# counter, so both survive workspace reuse without being zeroed. Kept in a physically
+# separate allocation from task_ctrl so a range cleaner can never wipe barrier state
+# (设计稿: task_ctrl/sync_ctrl 拆分). The two grid counters are the two exit-path barrier
+# points: quiesce (scheduler drained) and clean-done (control cleared, before the single
+# cross-rank exit barrier). There is no kernel-start / init barrier.
+S_GS_QUIESCE = 0
+S_GS_CLEANDONE = 1
 S_NVL_COUNTER = 2
 NUM_SYNC = 3
 
@@ -96,19 +98,19 @@ def gsync(sc: cute.Tensor, idx: cutlass.Constexpr,
 
 @cute.jit
 def nvl_barrier(sig_local: cute.Tensor, sc: cute.Tensor,
-                gs_idx: cutlass.Constexpr, tp_size: cutlass.Constexpr,
-                sig_peer_ptrs: cutlass.Constexpr, num_ctas: cutlass.Constexpr,
+                tp_size: cutlass.Constexpr, sig_peer_ptrs: cutlass.Constexpr,
                 bidx, tidx):
-    """Cross-rank NVLink barrier: phase/sign reuse protocol + trailing grid_sync.
+    """Cross-rank NVLink barrier: phase/sign reuse protocol. Called ONCE per layer at
+    kernel exit (after the clean-done grid_sync), and doubles as the next layer's init.
 
     Reuse-safe without zeroing: nvl_barrier_counter (rank-local) selects phase (which of
     the two signal slots) and sign (add up to tp_size, or back down to 0). The two slots
     guarantee a rank that is one barrier ahead never disturbs the slot another rank still
     waits on, so signals never need a host reset. Per-peer atomic add (each of the first
     tp_size threads of CTA0 writes one rank's slot) supports the -1 direction that
-    multicast add-1 cannot express. The trailing grid_sync makes every CTA of this rank
-    wait for CTA0's cross-rank confirmation before leaving the barrier, so no worker can
-    touch remote control/symmetric state before all ranks have arrived.
+    multicast add-1 cannot express. No trailing grid_sync is needed: only `return`
+    follows, and the kernel-launch boundary (the next layer waits for every CTA, incl.
+    CTA0, to return) orders cross-layer reuse after CTA0 observed all ranks arrived.
     """
     cute.arch.sync_threads()
     if bidx == 0:
@@ -138,7 +140,7 @@ def nvl_barrier(sig_local: cute.Tensor, sc: cute.Tensor,
                                            sem="acquire", scope="sys")
                 if cur == target:
                     spinning = False
-    gsync(sc, gs_idx, num_ctas, bidx, tidx)
+    cute.arch.sync_threads()
 
 
 # ============================================================================
@@ -627,8 +629,12 @@ class FusedFaOprojAr:
         hidden = cutlass.const_expr(self.hidden)
         num_out_n_tiles = cutlass.const_expr(self.num_out_n_tiles)
         # Owner-local rank index (compile-time). Task/owner *counts* are runtime active
-        # values loaded from `actv`; bucket capacities only size the workspace tensors.
+        # values loaded from `actv`; bucket capacities only size the workspace tensors
+        # and bound the kernel-exit cleaner (which clears full capacity).
         rank = cutlass.const_expr(self.rank)
+        cap_row_tiles = cutlass.const_expr(self.num_row_tiles)
+        cap_owner_slots = cutlass.const_expr(self.owner_slots_alloc)
+        cap_owner_words = cutlass.const_expr(self.owner_words_alloc)
 
         al = cutlass.utils.SmemAllocator()
         st = al.allocate(Smem)
@@ -702,43 +708,13 @@ class FusedFaOprojAr:
         # these runtime values, filled by the host per launch.
         n_fa_act = cute.arch.load(actv.iterator + 0, cutlass.Int32, sem="relaxed", scope="gpu")
         total_op_act = cute.arch.load(actv.iterator + 1, cutlass.Int32, sem="relaxed", scope="gpu")
-        n_rows_act = cute.arch.load(actv.iterator + 2, cutlass.Int32, sem="relaxed", scope="gpu")
-        owner_slots_act = cute.arch.load(actv.iterator + 3, cutlass.Int32, sem="relaxed", scope="gpu")
         owner_words_act = cute.arch.load(actv.iterator + 4, cutlass.Int32, sem="relaxed", scope="gpu")
         local_owned_act = cute.arch.load(actv.iterator + 5, cutlass.Int32, sem="relaxed", scope="gpu")
 
-        # Kernel-start directed cleaner (设计稿: kernel start 定向清理).
-        # Zero this rank's active per-layer control state with plain global stores,
-        # dispatched by stride across all persistent CTAs. The init grid_sync (+ nvl
-        # init for tp>1) right after publishes these writes before any worker or remote
-        # rank reads them, so no atomic is needed. sync_ctrl barrier state is NEVER
-        # cleared. Only the active prefix is cleared; the owner-words tail word covers
-        # inactive bits in the last active word.
-        g_tid = bidx * cutlass.Int32(nthr) + tidx
-        g_str = cutlass.Int32(num_ctas) * cutlass.Int32(nthr)
-        i = g_tid
-        while i < n_rows_act:
-            head_ready[i] = cutlass.Uint32(0)
-            i = i + g_str
-        i = g_tid
-        while i < owner_slots_act:
-            ready_count_owner[i] = cutlass.Uint32(0)
-            i = i + g_str
-        i = g_tid
-        while i < owner_words_act:
-            ar_ready_bits[i] = cutlass.Int64(0)
-            ar_done_bits[i] = cutlass.Int64(0)
-            i = i + g_str
-        if bidx == 0:
-            if tidx < cutlass.Int32(NUM_CTRL):
-                ctrl[tidx] = cutlass.Uint32(0)
-
-        gsync(sync_ctrl, S_GS_INIT, num_ctas, bidx, tidx)
-        if cutlass.const_expr(tp_size > 1):
-            # init: all ranks finished local init before any cross-rank write begins.
-            nvl_barrier(nvl_local, sync_ctrl, S_GS_INIT, tp_size, self.nvl_peer_ptrs,
-                        num_ctas, bidx, tidx)
-
+        # No kernel-start cleaner and no init barrier: the previous layer's kernel-exit
+        # cleaner already zeroed this rank's full-capacity control state, and its exit
+        # nvl_barrier synced that across ranks; the first layer is covered by workspace
+        # create's full zero + barrier. CTAs enter the scheduler directly.
         if wg_idx == 0:
             cute.arch.setmaxregister_decrease(40)
         else:
@@ -1128,8 +1104,36 @@ class FusedFaOprojAr:
                                                      sem="release", scope="gpu")
                 cute.arch.sync_threads()
 
-        gsync(sync_ctrl, S_GS_EXIT, num_ctas, bidx, tidx)
+        # Kernel-exit directed cleaner (设计稿: kernel exit 定向清理).
+        # local_done guarantees this rank's owner control has no in-flight remote write
+        # (ar_done_count == local_owned => every owned tile reached ready_count==tp_size
+        # => all ranks already pushed). The quiesce grid_sync ensures no CTA still reads
+        # task_ctrl; then all CTAs zero this rank's FULL-CAPACITY control with plain
+        # stores (cheap, hidden behind the straggler wait), preparing any next-layer
+        # active range. The clean-done grid_sync publishes the clears to CTA0, and the
+        # single exit nvl_barrier publishes them across ranks AND serves as the next
+        # layer's init barrier. sync_ctrl barrier state is never cleared.
+        gsync(sync_ctrl, S_GS_QUIESCE, num_ctas, bidx, tidx)
+        g_tid = bidx * cutlass.Int32(nthr) + tidx
+        g_str = cutlass.Int32(num_ctas) * cutlass.Int32(nthr)
+        i = g_tid
+        while i < cutlass.Int32(cap_row_tiles):
+            head_ready[i] = cutlass.Uint32(0)
+            i = i + g_str
+        i = g_tid
+        while i < cutlass.Int32(cap_owner_slots):
+            ready_count_owner[i] = cutlass.Uint32(0)
+            i = i + g_str
+        i = g_tid
+        while i < cutlass.Int32(cap_owner_words):
+            ar_ready_bits[i] = cutlass.Int64(0)
+            ar_done_bits[i] = cutlass.Int64(0)
+            i = i + g_str
+        if bidx == 0:
+            if tidx < cutlass.Int32(NUM_CTRL):
+                ctrl[tidx] = cutlass.Uint32(0)
+        gsync(sync_ctrl, S_GS_CLEANDONE, num_ctas, bidx, tidx)
         if cutlass.const_expr(tp_size > 1):
-            # exit: all ranks finished owner AR before any rank reuses the workspace.
-            nvl_barrier(nvl_local, sync_ctrl, S_GS_EXIT, tp_size, self.nvl_peer_ptrs,
-                        num_ctas, bidx, tidx)
+            # single cross-rank barrier per layer: all ranks finished owner AR + cleanup
+            # before any rank reuses the workspace; doubles as the next layer's init.
+            nvl_barrier(nvl_local, sync_ctrl, tp_size, self.nvl_peer_ptrs, bidx, tidx)
