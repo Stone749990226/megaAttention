@@ -48,27 +48,34 @@ docs/design/causal_varlen_prefill_persistent_fa_oproj_ar_plan_zh.md
 8×H200，`benchmarks/bench_fused_fa_oproj_ar.py --cases readme --auto`，fused（单 persistent
 kernel）vs 非融合 best-of-breed 基线（官方 `flash_attn_varlen_func` + cuBLAS GEMM + NVLS
 `multimem_all_reduce_`）。锚定大模型 TP8 per-rank 形状 + 多段不规整 varlen，kineto self
-device time（30 iters / 10 warmup）：
+device time（30 iters / 10 warmup）。下表为 `--cases readme` 的原始输出（`print_table` 全列）。
 
-| 模型 (per-rank @ TP8) | batch (tot tokens) | fused ms | overlap% | TFLOPS (util) | NVLink GB/s | ratio | err_rel |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B hid4096 | varlen B8 ~22.6K | 1.262 | 64% | 340 (34%) | 263 | **1.37×** | 7.1e-4 |
-| Qwen3-235B-A22B hid4096 | varlen B6 ~13.4K | 0.787 | 68% | 310 (31%) | 251 | **1.37×** | 8.2e-4 |
-| Qwen3-Coder-480B hid6144 | varlen B8 ~22.6K | 2.257 | 40% | 350 (35%) | 221 | **1.19×** | 8.5e-4 |
-| Qwen3-Coder-480B hid6144 | varlen B6 ~13.4K | 1.355 | 43% | 334 (34%) | 218 | **1.20×** | 7.7e-4 |
-| GLM-4.6 hid5120 | varlen B8 ~22.6K | 2.006 | 44% | 357 (36%) | 207 | **1.19×** | 8.1e-4 |
-| GLM-4.6 hid5120 | varlen B6 ~13.4K | 1.216 | 48% | 337 (34%) | 203 | **1.21×** | 9.3e-4 |
-| Llama-3.1-405B hid16384 | varlen B8 ~22.6K | 5.165 | 34% | 392 (40%) | 257 | **1.18×** | 1.3e-3 |
-| Llama-3.1-405B hid16384 | varlen B6 ~13.4K | 3.063 | 36% | 385 (39%) | 258 | **1.20×** | 1.5e-3 |
-| 合成 stress hid8192 | varlen B8 ~22.6K | 2.868 | 63% | 435 (44%) | 232 | **1.31×** | 1.5e-3 |
-| 合成 stress hid8192 | varlen B6 ~13.4K | 1.698 | 66% | 423 (43%) | 232 | **1.32×** | 8.7e-4 |
-| Qwen3-235B q<k hid4096 | B6 k=2×q | 1.250 | 132% | 401 (41%) | 158 | **1.45×** | 7.8e-3 |
-| Qwen3-235B q<k hid4096 | B6 k=4×q | 2.239 | 248% | 453 (46%) | 88 | **1.47×** | 6.1e-3 |
+shape 列即 per-rank 形状，按 `H<q_head>/kv<kv_head> hid<hidden>` 对应模型：`H8/kv1 hid4096`
+= Qwen3-235B-A22B；`H12/kv1 hid6144` = Qwen3-Coder-480B；`H12/kv1 hid5120` = GLM-4.6；
+`H16/kv1 hid16384` = Llama-3.1-405B；`H16/kv2 hid8192` = 合成 GQA stress；末两行 `q:... k=N×q`
+= Qwen3-235B 的 q&lt;k contiguous-KV chunked/append prefill（KV 前缀 = N× Q chunk）。
 
-fused 相对 best-of-breed 串行基线全面 **1.18–1.47×**；大 hidden（如 Llama hid16384）下 AR
-comm 占比高、overlap 偏低，是已知瓶颈。末两行为 q&lt;k contiguous-KV chunked/append prefill
-（KV 前缀 = 2×/4× Q chunk）：FA 计算随 KV 增长而占比变大、AR/O_proj 相对下降，overlap% 可超
-100%（即融合连完美重叠的最强基线都打赢，口径见 bench docstring）。完整用例集见
+| shape | tp | fused | FA | O_proj | AR | serial | ideal | overlap% | TFLOPS | NVLink | ratio | err_rel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| varlen(B=8,tot=22.6K,max=7.5K) H8/kv1 hid4096 | 8 | 1.262 | 0.755 | 0.251 | 0.716 | 1.723 | 1.006 | 64% | 340 (34%) | 263 (29%) | 1.37x | 7.1e-04 |
+| varlen(B=6,tot=13.4K,max=6.8K) H8/kv1 hid4096 | 8 | 0.787 | 0.487 | 0.161 | 0.428 | 1.076 | 0.648 | 68% | 310 (31%) | 251 (28%) | 1.37x | 8.2e-04 |
+| varlen(B=8,tot=22.6K,max=7.5K) H12/kv1 hid6144 | 8 | 2.257 | 1.055 | 0.567 | 1.054 | 2.675 | 1.621 | 40% | 350 (35%) | 221 (25%) | 1.19x | 8.5e-04 |
+| varlen(B=6,tot=13.4K,max=6.8K) H12/kv1 hid6144 | 8 | 1.355 | 0.652 | 0.340 | 0.636 | 1.628 | 0.992 | 43% | 334 (34%) | 218 (24%) | 1.20x | 7.7e-04 |
+| varlen(B=8,tot=22.6K,max=7.5K) H12/kv1 hid5120 | 8 | 2.006 | 1.061 | 0.444 | 0.889 | 2.393 | 1.505 | 44% | 357 (36%) | 207 (23%) | 1.19x | 8.1e-04 |
+| varlen(B=6,tot=13.4K,max=6.8K) H12/kv1 hid5120 | 8 | 1.216 | 0.654 | 0.285 | 0.528 | 1.467 | 0.939 | 48% | 337 (34%) | 203 (23%) | 1.21x | 9.3e-04 |
+| varlen(B=8,tot=22.6K,max=7.5K) H16/kv1 hid16384 | 8 | 5.165 | 1.355 | 1.981 | 2.779 | 6.115 | 3.336 | 34% | 392 (40%) | 257 (29%) | 1.18x | 1.3e-03 |
+| varlen(B=6,tot=13.4K,max=6.8K) H16/kv1 hid16384 | 8 | 3.063 | 0.826 | 1.177 | 1.659 | 3.663 | 2.004 | 36% | 385 (39%) | 258 (29%) | 1.20x | 1.5e-03 |
+| varlen(B=8,tot=22.6K,max=7.5K) H16/kv2 hid8192 | 8 | 2.868 | 1.354 | 0.992 | 1.398 | 3.743 | 2.345 | 63% | 435 (44%) | 232 (26%) | 1.31x | 1.5e-03 |
+| varlen(B=6,tot=13.4K,max=6.8K) H16/kv2 hid8192 | 8 | 1.698 | 0.821 | 0.592 | 0.835 | 2.248 | 1.413 | 66% | 423 (43%) | 232 (26%) | 1.32x | 8.7e-04 |
+| q:varlen(B=6,tot=13.4K,max=6.8K) k=2xq H8/kv1 hid4096 | 8 | 1.250 | 1.226 | 0.161 | 0.425 | 1.812 | 1.387 | 132% | 401 (41%) | 158 (18%) | 1.45x | 7.8e-03 |
+| q:varlen(B=6,tot=13.4K,max=6.8K) k=4xq H8/kv1 hid4096 | 8 | 2.239 | 2.711 | 0.161 | 0.428 | 3.299 | 2.871 | 248% | 453 (46%) | 88 (10%) | 1.47x | 6.1e-03 |
+
+时间单位 ms；`serial = FA+O_proj+AR`（best-of-breed 分段串行下界），`ideal = max(FA+O_proj, AR)`
+（完美重叠下界），`overlap% = (serial-fused)/(serial-ideal)`。`TFLOPS`/`NVLink` 均除以 fused
+墙钟（NVLink 为 bus BW=2(n-1)/n 口径），括号内为对 H200 峰值的 util。fused 相对串行基线
+全面 **1.18–1.47×（ratio 列）**；大 hidden（Llama hid16384）下 AR comm 占比高、overlap 偏低，
+是已知瓶颈。q&lt;k 两行 FA 计算随 KV 增长占比变大、AR/O_proj 相对下降，overlap% 可超 100%
+（即融合连完美重叠的最强基线都打赢，口径见 bench docstring）。完整用例集见
 `bench_fused_fa_oproj_ar.py` 的 `README_CASES`。
 
 ## 目录结构
