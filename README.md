@@ -99,7 +99,7 @@ tests/
 benchmarks/       # benchmark driver、launch-config sweep
 scripts/          # profiling、对比、smoke 脚本
 docs/             # 设计、状态、外部参考阅读笔记、profiling 文档
-third_party/      # 外部参考（flash-attention / DeepGEMM submodule，非运行时依赖）
+third_party/      # 外部参考（flash-attention / flashinfer / DeepGEMM submodule，非运行时依赖）
 ```
 
 ## 安装

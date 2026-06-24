@@ -42,6 +42,33 @@ third_party/flash-attention
 - 不引入 decode 专用短 Q 路径、paged KV、SplitKV、partial O/LSE combine、非 causal attention。
 - 不用 Blackwell 路径覆盖本项目 Hopper SM90 第一版设计。
 
+## FlashInfer
+
+源码位置：
+
+```text
+third_party/flashinfer
+```
+
+适合参考：
+
+- Hopper SM90 prefill attention 的 CUTLASS/CuTe C++ 实现。
+- host-side prefill plan、work list 和 per-CTA work range 分配。
+- GQA head 到 KV head 的映射。
+- TMA Q/K/V、K/V 分离 pipeline、WGMMA QK/PV overlap。
+- bottom-right aligned causal mask 和 varlen ragged prefill 的边界处理。
+- FP8 prefill 和 TensorRT-LLM 通信/GEMM 辅助代码的局部实现方式。
+
+边界：
+
+- FlashInfer 是通用 serving attention / kernel collection，不是本项目 fused
+  FA + O_proj + NVLS AR persistent kernel 的设计来源。
+- 只能参考 Hopper attention 局部机制；不得引入 paged KV、decode、SplitKV、
+  non-causal、多后端包装、Blackwell/SM120 或通用 public API 范围。
+- FlashInfer 的 host-side work plan 不包含本项目的 FA -> O_proj ready queue、
+  O_proj -> AR owner readiness、NVLS in-place reduce/store 和 workspace exit
+  cleaner 协议；这些仍以核心设计文档为准。
+
 ## DeepGEMM MegaMoE
 
 源码位置：
