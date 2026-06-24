@@ -52,17 +52,24 @@ device time（30 iters / 10 warmup）：
 
 | 模型 (per-rank @ TP8) | batch (tot tokens) | fused ms | overlap% | TFLOPS (util) | NVLink GB/s | ratio | err_rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B hid4096 | varlen B8 ~22.6K | 1.261 | 68% | 340 (34%) | 263 | **1.43×** | 7.1e-4 |
-| Qwen3-235B-A22B hid4096 | varlen B6 ~13.4K | 0.775 | 73% | 315 (32%) | 254 | **1.43×** | 8.2e-4 |
-| Qwen3-Coder-480B hid6144 | varlen B8 ~22.6K | 2.190 | 50% | 360 (36%) | 227 | **1.26×** | 8.5e-4 |
-| GLM-4.6 hid5120 | varlen B8 ~22.6K | 1.936 | 50% | 370 (37%) | 214 | **1.23×** | 8.1e-4 |
-| Llama-3.1-405B hid16384 | varlen B8 ~22.6K | 5.124 | 36% | 395 (40%) | 259 | **1.19×** | 1.3e-3 |
-| Llama-3.1-405B hid16384 | varlen B6 ~13.4K | 3.038 | 37% | 388 (39%) | 260 | **1.20×** | 1.5e-3 |
-| 合成 stress hid8192 | varlen B8 ~22.6K | 2.844 | 64% | 438 (44%) | 234 | **1.32×** | 1.5e-3 |
+| Qwen3-235B-A22B hid4096 | varlen B8 ~22.6K | 1.262 | 64% | 340 (34%) | 263 | **1.37×** | 7.1e-4 |
+| Qwen3-235B-A22B hid4096 | varlen B6 ~13.4K | 0.787 | 68% | 310 (31%) | 251 | **1.37×** | 8.2e-4 |
+| Qwen3-Coder-480B hid6144 | varlen B8 ~22.6K | 2.257 | 40% | 350 (35%) | 221 | **1.19×** | 8.5e-4 |
+| Qwen3-Coder-480B hid6144 | varlen B6 ~13.4K | 1.355 | 43% | 334 (34%) | 218 | **1.20×** | 7.7e-4 |
+| GLM-4.6 hid5120 | varlen B8 ~22.6K | 2.006 | 44% | 357 (36%) | 207 | **1.19×** | 8.1e-4 |
+| GLM-4.6 hid5120 | varlen B6 ~13.4K | 1.216 | 48% | 337 (34%) | 203 | **1.21×** | 9.3e-4 |
+| Llama-3.1-405B hid16384 | varlen B8 ~22.6K | 5.165 | 34% | 392 (40%) | 257 | **1.18×** | 1.3e-3 |
+| Llama-3.1-405B hid16384 | varlen B6 ~13.4K | 3.063 | 36% | 385 (39%) | 258 | **1.20×** | 1.5e-3 |
+| 合成 stress hid8192 | varlen B8 ~22.6K | 2.868 | 63% | 435 (44%) | 232 | **1.31×** | 1.5e-3 |
+| 合成 stress hid8192 | varlen B6 ~13.4K | 1.698 | 66% | 423 (43%) | 232 | **1.32×** | 8.7e-4 |
+| Qwen3-235B q<k hid4096 | B6 k=2×q | 1.250 | 132% | 401 (41%) | 158 | **1.45×** | 7.8e-3 |
+| Qwen3-235B q<k hid4096 | B6 k=4×q | 2.239 | 248% | 453 (46%) | 88 | **1.47×** | 6.1e-3 |
 
-fused 相对 best-of-breed 串行基线全面 **1.19–1.43×**；大 hidden（如 Llama hid16384）下 AR
-comm 占比高、overlap 偏低，是已知瓶颈。完整用例集见 `bench_fused_fa_oproj_ar.py` 的
-`README_CASES`。
+fused 相对 best-of-breed 串行基线全面 **1.18–1.47×**；大 hidden（如 Llama hid16384）下 AR
+comm 占比高、overlap 偏低，是已知瓶颈。末两行为 q&lt;k contiguous-KV chunked/append prefill
+（KV 前缀 = 2×/4× Q chunk）：FA 计算随 KV 增长而占比变大、AR/O_proj 相对下降，overlap% 可超
+100%（即融合连完美重叠的最强基线都打赢，口径见 bench docstring）。完整用例集见
+`bench_fused_fa_oproj_ar.py` 的 `README_CASES`。
 
 ## 目录结构
 

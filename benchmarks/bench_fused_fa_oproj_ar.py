@@ -53,6 +53,17 @@ H200_NVLINK_GBPS = 900.0          # NVLink4 单卡双向聚合
 # (FusedFaOprojAr / flash_fwd_kernel / nvjet gemm / multimem_all_reduce) 都不含这些子串。
 _NOISE = ("nccl", "fill", "elementwise", "memset", "memcpy", "copy_", "sleep", "spin")
 
+_L2_FLUSH = None
+
+
+def _l2_flush_buffer():
+    """8GB scratch (> L2) reused across all bench_kineto calls to evict L2 between
+    timed bodies。只分配一次, 避免每段计时各自申请 8GB。"""
+    global _L2_FLUSH
+    if _L2_FLUSH is None:
+        _L2_FLUSH = torch.empty(int(8e9 // 4), dtype=torch.int, device="cuda")
+    return _L2_FLUSH
+
 
 def _self_dev_us(e):
     for attr in ("self_device_time_total", "self_cuda_time_total"):
@@ -70,7 +81,7 @@ def bench_kineto(body, iters, warmup, barrier=False, align=False, flush_l2=True,
     自旋时间, 故 align=True 时每次 launch 前用 `_sleep + barrier` 把各 rank 起点对齐
     (MegaMoE 同款), 让 in-kernel barrier 不空转。
     """
-    flush = torch.empty(int(8e9 // 4), dtype=torch.int, device="cuda") if flush_l2 else None
+    flush = _l2_flush_buffer() if flush_l2 else None
 
     def _pre():
         if flush is not None: flush.zero_()
@@ -91,8 +102,8 @@ def bench_kineto(body, iters, warmup, barrier=False, align=False, flush_l2=True,
     evts = prof.key_averages()
     if dump and dist.get_rank() == 0:
         print(f"\n----- kineto dump [{tag}] -----", flush=True)
-        print(prof.key_averages().table(sort_by="self_cuda_time_total",
-                                         max_name_column_width=80, row_limit=10), flush=True)
+        print(evts.table(sort_by="self_cuda_time_total",
+                         max_name_column_width=80, row_limit=10), flush=True)
     total_us = sum(_self_dev_us(e) for e in evts
                    if not any(n in e.key.lower() for n in _NOISE))
     return total_us / iters / 1e3     # ms/iter
@@ -124,15 +135,24 @@ def _tok(n):
     return f"{n/1024:.1f}K".replace(".0K", "K") if n >= 1024 else str(n)
 
 
-def shape_label(seqlens, H_local, hidden, q_per_kv=1):
-    if len(seqlens) == 1:
-        body = f"[{_tok(seqlens[0])}]"
-    elif len(set(seqlens)) == 1:
-        body = f"[{_tok(seqlens[0])}]x{len(seqlens)}"
-    else:                                    # 混合长尾 varlen: 紧凑摘要, 完整 seqlens 进 JSON
-        body = f"varlen(B={len(seqlens)},tot={_tok(sum(seqlens))},max={_tok(max(seqlens))})"
+def shape_label(seqlens, H_local, hidden, q_per_kv=1, seqlens_k=None):
+    def _body(sq):
+        if len(sq) == 1:
+            return f"[{_tok(sq[0])}]"
+        if len(set(sq)) == 1:                    # 等长多序列
+            return f"[{_tok(sq[0])}]x{len(sq)}"
+        return f"varlen(B={len(sq)},tot={_tok(sum(sq))},max={_tok(max(sq))})"
     hd = f"H{H_local}" if q_per_kv == 1 else f"H{H_local}/kv{H_local // q_per_kv}"
-    return f"{body} {hd} hid{hidden}"
+    if seqlens_k is None or list(seqlens_k) == list(seqlens):
+        return f"{_body(seqlens)} {hd} hid{hidden}"   # q==k 完整 prefill
+    # q < k: contiguous-KV chunked/append prefill, 标注 q 与 KV 两段长度。
+    ratios = {k / q for q, k in zip(seqlens, seqlens_k)}
+    only = next(iter(ratios))
+    if len(ratios) == 1 and float(only).is_integer():
+        kpart = f"k={int(only)}xq"                # 均匀 ratio: 紧凑成 k=Nxq
+    else:
+        kpart = f"k:varlen(tot={_tok(sum(seqlens_k))},max={_tok(max(seqlens_k))})"
+    return f"q:{_body(seqlens)} {kpart} {hd} hid{hidden}"
 
 
 def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
@@ -206,14 +226,14 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     dist.barrier()
     compiled = cute.compile(ker, *cts, st)
 
-    def reset_fused():
-        # No host reset: the kernel-start directed cleaner zeros per-layer control
-        # state, and nvl/sync_ctrl are reuse-safe phase protocols. The timing loop
-        # therefore exercises the real cross-layer workspace-reuse path.
-        torch.cuda.synchronize(); dist.barrier()
-
     def run_fused():
-        reset_fused(); compiled(*cts, st)
+        # No host reset: the kernel-start directed cleaner zeros per-layer control
+        # state, and nvl/sync_ctrl are reuse-safe phase protocols, so back-to-back
+        # launches exercise the real cross-layer workspace-reuse path. The leading
+        # barrier只用于 correctness 比对里跨 rank 分隔本次 launch。计时路径不走这里:
+        # rank-start 对齐全交给 bench_kineto._pre 的 sleep+barrier, 且它必须紧贴 kernel,
+        # 故 t_fused 直接发 bare kernel, 不能让 synchronize drain 掉那段 sleep。
+        dist.barrier(); compiled(*cts, st)
 
     # ---- best-of-breed non-fused baseline: FlashAttention + GEMM + NVLS AllReduce ----
     Y_sym = symm_mem.empty(tot, hidden, device=dev, dtype=DT)
@@ -236,7 +256,7 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
         run_fa(); run_oproj(); run_ar(); return Y_sym
 
     # ---- correctness cross-check: fused C_sym vs baseline ----
-    reset_fused(); run_fused(); torch.cuda.synchronize(); dist.barrier()
+    run_fused(); torch.cuda.synchronize(); dist.barrier()
     Cf = C_sym.float().cpu()
     Yb = run_baseline().float().cpu(); torch.cuda.synchronize(); dist.barrier()
     err_abs, ref_max = 0.0, 0.0
@@ -250,7 +270,9 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     err_rel = err_abs / max(ref_max, 1e-6)
 
     # ---- timing (kineto) ----
-    t_fused = bench_kineto(run_fused, iters, warmup, align=True, dump=dump, tag="fused")
+    # bare kernel as body: alignment (sleep+barrier) lives in _pre, directly before launch.
+    t_fused = bench_kineto(lambda: compiled(*cts, st), iters, warmup, align=True,
+                           dump=dump, tag="fused")
     t_fa = bench_kineto(run_fa, iters, warmup, dump=dump, tag="fa")
     run_fa()  # ensure O_buf valid for oproj timing
     t_oproj = bench_kineto(run_oproj, iters, warmup, dump=dump, tag="oproj")
@@ -271,7 +293,8 @@ def bench_one(seqlens, H_local, hidden, w_fa, w_oproj, w_ar, sg,
     nvl_algbw = s_bytes / 1e9 / (t_fused / 1e3)
 
     row = dict(
-        shape=shape_label(seqlens, H_local, hidden, q_per_kv), seqlens=seqlens, H_local=H_local,
+        shape=shape_label(seqlens, H_local, hidden, q_per_kv, seqlens_k=seqlens_k),
+        seqlens=seqlens, seqlens_k=seqlens_k, H_local=H_local,
         hidden=hidden, tp=ws, tot=tot, q_per_kv=q_per_kv, H_kv_local=H_kv,
         fused_ms=t_fused, t_fa=t_fa, t_oproj=t_oproj, t_ar=t_ar,
         serial_ms=t_base, ideal_ms=t_ideal, overlap_pct=overlap_pct,
@@ -307,19 +330,19 @@ def print_table(rows):
           ">100% 表示融合优于完美重叠的最强基线。", flush=True)
 
 
-# 真实大模型 (8 卡 TP, head_dim=128) + 一个合成 GQA stress 配置, 锚定 chunk-prefill 场景。
-# kernel 支持标准 GQA: K/V 按 kv_head = q_head // q_per_kv 复用。每个 case 是
-# (seqlens, H_local, hidden, q_per_kv), 均为 per-rank (TP8) 值。
+# 真实大模型 (8 卡 TP, head_dim=128) + 合成 GQA stress, 锚定 chunk-prefill 场景。
+# 每个 case 是 (seqlens_q, H_local, hidden, q_per_kv[, seqlens_k]), 均为 per-rank (TP8) 值。
+# seqlens_k 省略 -> q==k 完整 prefill; 给出 -> q<k contiguous-KV chunked/append prefill。
 #
 # 旗舰 GQA 模型 num_kv_heads<=8, TP8 下每 rank 只剩 1 个 KV head (kv<8 跨 rank 复制),
 # 即 per-rank MQA (H_kv_local=1, q_per_kv=H_local) —— 这是真实部署形态。
-# 额外加一个合成 num_kv_heads=16 配置: TP8 下每 rank=2 个 KV head (H_kv_local=2),
-# 真正压多-KV-head 寻址路径 (kv_head = head // q_per_kv 取到 0/1)。
+# 末尾合成 num_kv_heads=16 配置: TP8 下每 rank=2 个 KV head, 压多-KV-head 寻址路径。
 #
 # chunk-prefill: 不对超长单序列一次 prefill。用多段不规整 varlen, 每段<=8K, 总量中等批。
 _CHUNK_BIG = [7680, 5376, 3968, 2560, 1664, 1024, 640, 256]    # ~23.2K tokens, 8 段不规整
 _CHUNK_SMALL = [6912, 3200, 1792, 1088, 512, 256]             # ~13.8K tokens, 6 段不规整
 README_CASES = [
+    # ---- q==k 完整 prefill: 各旗舰模型 per-rank 形态 (big/small chunk 两档) ----
     # Qwen3-235B-A22B: q64/kv4/hidden4096 -> TP8 H_local=8, kv->1, q_per_kv=8
     (_CHUNK_BIG, 8, 4096, 8),
     (_CHUNK_SMALL, 8, 4096, 8),
@@ -335,14 +358,10 @@ README_CASES = [
     # 合成 GQA stress: q128/kv16/hidden8192 -> TP8 H_local=16, H_kv_local=2, q_per_kv=8
     (_CHUNK_BIG, 16, 8192, 8),
     (_CHUNK_SMALL, 16, 8192, 8),
-]
-
-# ---- q_len < k_len 比例扫描: 固定 Q chunk, 扫 k_len/q_len ∈ {1,2,4} (offset=0/q/3q) ----
-# 5-tuple: (seqlens_q, H_local, hidden, q_per_kv, seqlens_k)。ratio=1 即 q==k 回归基准。
-RATIO_CASES = [
-    (_CHUNK_SMALL, 8, 4096, 8, [s * 1 for s in _CHUNK_SMALL]),   # ratio 1x: offset=0
-    (_CHUNK_SMALL, 8, 4096, 8, [s * 2 for s in _CHUNK_SMALL]),   # ratio 2x: KV 前缀=2x chunk
-    (_CHUNK_SMALL, 8, 4096, 8, [s * 4 for s in _CHUNK_SMALL]),   # ratio 4x: KV 前缀=4x chunk
+    # ---- q<k 比例扫描: 固定 Q chunk (=_CHUNK_SMALL,8,4096,8 那行即 ratio 1x 基准),
+    #      扫 k_len/q_len = 2,4 (KV 前缀 = 2x/4x chunk), 压 contiguous-KV chunked prefill ----
+    (_CHUNK_SMALL, 8, 4096, 8, [s * 2 for s in _CHUNK_SMALL]),
+    (_CHUNK_SMALL, 8, 4096, 8, [s * 4 for s in _CHUNK_SMALL]),
 ]
 
 
@@ -362,7 +381,7 @@ def main():
     ap.add_argument("--auto", action="store_true",
                     help="用 choose_launch_config 自动选 (w_fa,w_oproj,w_ar,sg)")
     ap.add_argument("--cases", type=str, default="",
-                    help="'readme' 跑内置全表; 'ratio' 跑 q<k 比例扫描; 留空跑单 --seqlens")
+                    help="'readme' 跑内置全表 (q==k 各模型 + q<k 比例扫描); 留空跑单 --seqlens")
     ap.add_argument("--json", type=str, default="", help="把行结果写入该 JSON 路径")
     ap.add_argument("--dump-kernels", action="store_true",
                     help="打印每段 profiler kernel 表 (校验名字匹配)")
@@ -376,8 +395,6 @@ def main():
 
     if args.cases == "readme":
         cases = README_CASES
-    elif args.cases == "ratio":
-        cases = RATIO_CASES
     else:
         cases = [([int(x) for x in args.seqlens.split(",")], args.h_local, args.hidden,
                   args.q_per_kv)]
@@ -386,9 +403,10 @@ def main():
     for case in cases:
         seqlens, H_local, hidden, q_per_kv = case[0], case[1], case[2], case[3]
         seqlens_k = case[4] if len(case) > 4 else None
-        meta = build_row_desc(seqlens, seqlens_k=seqlens_k)
         if args.auto:
+            # meta 只有 --auto 的 heuristic 需要; bench_one 内部会自行 build_row_desc。
             from mega_attention.metadata.launch_heuristic import choose_launch_config
+            meta = build_row_desc(seqlens, seqlens_k=seqlens_k)
             cfg = choose_launch_config(meta, hidden, tp_size=ws)
             w_fa, w_oproj, w_ar, sg = cfg.w_fa, cfg.w_oproj, cfg.w_ar, cfg.sg
         else:

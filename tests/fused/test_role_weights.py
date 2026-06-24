@@ -1,4 +1,4 @@
-"""role 权重只影响调度/性能, 不影响 FA 数值与调度 invariant (tp=1, 单序列)."""
+"""role 权重只影响调度/性能, 不影响 FA/O_proj 数值与调度 invariant (tp=1, 单序列)."""
 import os
 import sys
 
@@ -6,7 +6,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_fused_fa_path import run_case, _check   # noqa: E402
+from test_fused_single_card import run_case, _check   # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs H200")
 
