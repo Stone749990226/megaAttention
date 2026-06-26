@@ -418,7 +418,15 @@ class FusedFaOprojAr:
                  csym_mc_ptr=0, nvl_mc_ptr=0, nvl_local_ptr=0, nvl_peer_ptrs=(),
                  rc_ptrs=(), rb_ptrs=(),
                  softmax_scale=None, acc_dtype=cutlass.Float32,
-                 w_fa=4, w_oproj=1, w_ar=1):
+                 w_fa=4, w_oproj=1, w_ar=1, paged=False, page_size=None):
+        # paged-KV TMA-128 variant: K/V live in [num_pages, 128, H_kv, D] caches and the
+        # FA n_block -> physical page mapping comes from page_table. This is a compile-time
+        # specialization (const_expr self.paged); only the FA K/V load address mapping and
+        # the k_len source differ from contiguous. Everything downstream is unchanged.
+        self.paged = paged
+        if paged:
+            assert page_size == N_TILE == 128, (page_size, N_TILE)
+        self.page_size = page_size
         # Multi-rank NVLS pointers are baked as closure constants. Do not move them to
         # cute.compile args: 64-bit virtual addresses would be truncated.
         self.csym_mc_ptr = csym_mc_ptr          # C_sym multicast VA (multimem reduce)
@@ -482,7 +490,7 @@ class FusedFaOprojAr:
     def __call__(self, ctrl, sync_ctrl, actv, head_ready, oproj_queue, ready_count_owner,
                  ar_ready_bits, ar_done_bits,
                  mQ, mK, mV, mOscr, mWo, mCsym, mCuQ, mCuK, mFaB, mFaMb,
-                 stream: cuda.CUstream):
+                 stream: cuda.CUstream, mPageTable=None, mCacheSeqlens=None):
         dt = mQ.element_type
         self.dt = dt
         sQ_l = self._smem(dt, self.M, self.D, 1)
@@ -493,10 +501,19 @@ class FusedFaOprojAr:
         sWo_l = self._smem(dt, self.K_CHUNK, self.N_TILE, self.oproj_stages)
 
         op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
-        # Packed-varlen K/V are viewed as head-last [tot, D, H] so the TMA atom
-        # copies a contiguous (token, D) tile for the selected head.
-        mK_v = qlu.select(mK, [0, 2, 1])
-        mV_v = qlu.select(mV, [0, 2, 1])
+        # K/V TMA source view. The TMA box is (N_TILE, D) over the first two modes; the
+        # trailing modes are TMA coordinate dims selected at load time.
+        if cutlass.const_expr(self.paged):
+            # paged K_cache/V_cache: [num_pages, 128, H_kv, D] -> [128, D, H_kv, num_pages].
+            # head selected per task, num_pages stays as the TMA page coordinate (physical
+            # page from page_table). Mirrors contiguous's head-last view, page replacing token.
+            mK_v = qlu.select(mK, [1, 3, 2, 0])
+            mV_v = qlu.select(mV, [1, 3, 2, 0])
+        else:
+            # Packed-varlen K/V are viewed as head-last [tot, D, H] so the TMA atom
+            # copies a contiguous (token, D) tile for the selected head.
+            mK_v = qlu.select(mK, [0, 2, 1])
+            mV_v = qlu.select(mV, [0, 2, 1])
         # Q uses the same head-last packed-varlen view and a one-stage TMA pipeline.
         mQ_v = qlu.select(mQ, [0, 2, 1])
         tma_q, tQ = cute.nvgpu.cpasync.make_tiled_tma_atom(
@@ -583,7 +600,8 @@ class FusedFaOprojAr:
                     tma_k, tK, tma_v, tV, mOscr, mOscr2d, mWo, mCsym, csym_mc,
                     nvl_local, tma_q, tQ, mCuQ, mCuK,
                     mFaB, mFaMb, tma_a, tA, tma_wo, tWo,
-                    mma_qk, mma_pv, mma_op, sQ_l, sK_l, sV_l, sA_l, sWo_l, Smem).launch(
+                    mma_qk, mma_pv, mma_op, sQ_l, sK_l, sV_l, sA_l, sWo_l,
+                    mPageTable, mCacheSeqlens, Smem).launch(
             grid=[self.num_ctas, 1, 1], block=[self.threads, 1, 1],
             cluster=(1, 1, 1), stream=stream)
 
@@ -601,7 +619,8 @@ class FusedFaOprojAr:
                mma_qk: cute.TiledMma, mma_pv: cute.TiledMma, mma_op: cute.TiledMma,
                sQ_l: cute.ComposedLayout, sK_l: cute.ComposedLayout,
                sV_l: cute.ComposedLayout, sA_l: cute.ComposedLayout,
-               sWo_l: cute.ComposedLayout, Smem: cutlass.Constexpr):
+               sWo_l: cute.ComposedLayout,
+               mPageTable, mCacheSeqlens, Smem: cutlass.Constexpr):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -746,9 +765,14 @@ class FusedFaOprojAr:
                     b = mFaB[ft]
                     mb = mFaMb[ft]
                     q_start = mCuQ[b]
-                    k_start = mCuK[b]
                     q_len = mCuQ[b + cutlass.Int32(1)] - q_start
-                    k_len = mCuK[b + cutlass.Int32(1)] - k_start
+                    if cutlass.const_expr(self.paged):
+                        # paged-KV TMA-128: real KV prefix length is cache_seqlens[b].
+                        # No token base offset; page lookup happens per n_block at load.
+                        k_len = mCacheSeqlens[b]
+                    else:
+                        k_start = mCuK[b]
+                        k_len = mCuK[b + cutlass.Int32(1)] - k_start
                     offset = k_len - q_len               # bottom-right aligned causal
                     mask_q_off = mb * cutlass.Int32(128)  # = m_idx_min (seq-local q tile)
                     # FA4 BlockInfo.get_n_block_min_max (纯 causal, 非 local/split):
@@ -765,10 +789,18 @@ class FusedFaOprojAr:
 
                     mQ_cur = cute.domain_offset((q_start, None, None), tQ)[None, None, head]
                     gQ = cute.local_tile(mQ_cur, (self.M, self.D), (None, 0))
-                    mK_cur = cute.domain_offset((k_start, None, None), mK)[None, None, kv_head]
-                    mV_cur = cute.domain_offset((k_start, None, None), mV)[None, None, kv_head]
-                    gK = cute.local_tile(mK_cur, (self.N, self.D), (None, 0))
-                    gV = cute.local_tile(mV_cur, (self.N, self.D), (None, 0))
+                    if cutlass.const_expr(self.paged):
+                        # [128, D, H_kv, num_pages] -> fix head -> [128, D, num_pages];
+                        # the page dim stays as the TMA coordinate (indexed by page_table).
+                        mK_cur = mK[None, None, kv_head, None]
+                        mV_cur = mV[None, None, kv_head, None]
+                        gK = cute.local_tile(mK_cur, (self.N, self.D), (0, 0, None))
+                        gV = cute.local_tile(mV_cur, (self.N, self.D), (0, 0, None))
+                    else:
+                        mK_cur = cute.domain_offset((k_start, None, None), mK)[None, None, kv_head]
+                        mV_cur = cute.domain_offset((k_start, None, None), mV)[None, None, kv_head]
+                        gK = cute.local_tile(mK_cur, (self.N, self.D), (None, 0))
+                        gV = cute.local_tile(mV_cur, (self.N, self.D), (None, 0))
                     tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(
                         tma_q, 0, cute.make_layout(1),
                         cute.group_modes(sQ, 0, cute.rank(sQ) - 1),
@@ -796,13 +828,19 @@ class FusedFaOprojAr:
                             fa_q_prod.advance()
                             for i in cutlass.range(nblk, unroll=1):
                                 j = nblk - cutlass.Int32(1) - i      # 右->左：对角块先 load
+                                # paged: logical n_block -> physical page via page_table.
+                                # contiguous: n_block is itself the token-tile coordinate.
+                                if cutlass.const_expr(self.paged):
+                                    kc = mPageTable[b, j]
+                                else:
+                                    kc = j
                                 pl_k.producer_acquire(fa_k_prod)
-                                cute.copy(tma_k, tKgK[(None, j)], tKsK[(None, fa_k_prod.index)],
+                                cute.copy(tma_k, tKgK[(None, kc)], tKsK[(None, fa_k_prod.index)],
                                           tma_bar_ptr=pl_k.producer_get_barrier(fa_k_prod))
                                 pl_k.producer_commit(fa_k_prod)
                                 fa_k_prod.advance()
                                 pl_v.producer_acquire(fa_v_prod)
-                                cute.copy(tma_v, tVgV[(None, j)], tVsV[(None, fa_v_prod.index)],
+                                cute.copy(tma_v, tVgV[(None, kc)], tVsV[(None, fa_v_prod.index)],
                                           tma_bar_ptr=pl_v.producer_get_barrier(fa_v_prod))
                                 pl_v.producer_commit(fa_v_prod)
                                 fa_v_prod.advance()

@@ -117,6 +117,64 @@ def fa_reference(Q, K, V, meta: RowDescMeta, softmax_scale=None):
     return O
 
 
+# ------------------------------------------------------ paged-KV TMA-128 ----
+def make_paged_kv(K, V, seqlens_k, page_size=128, num_pages=None, shuffle=True,
+                  seed=0):
+    """Pack logical contiguous K/V into a paged cache with a (shuffled) page table.
+
+    Mirrors the design §19 paged-KV TMA-128 layout. K/V are the logical varlen-packed
+    [tot_k, H_kv, D] tensors (the same ground truth fed to `fa_reference`); this scatters
+    them into physical pages and returns the kernel-side inputs.
+
+    Returns
+    -------
+    K_cache, V_cache : [num_pages, page_size, H_kv, D]，与 K/V 同 dtype/device。
+        非 valid 的 page 槽 (尾 page 的越界 token、未用 physical page) 预填随机值，
+        以验证 kernel 的 k_len mask 真的屏蔽了越界列 (整页 TMA load)。
+    page_table   : [B, max_num_pages_per_seq] int32，logical block -> physical page。
+    cache_seqlens: [B] int32，每条 sequence 的有效 KV 前缀长度 (== seqlens_k)。
+    """
+    assert page_size == 128, page_size
+    seqlens_k = [int(x) for x in seqlens_k]
+    B = len(seqlens_k)
+    H_kv, D = K.shape[1], K.shape[2]
+    dev, dt = K.device, K.dtype
+    pages_per_seq = [(s + page_size - 1) // page_size for s in seqlens_k]
+    total_logical_pages = int(sum(pages_per_seq))
+    max_pps = max(pages_per_seq) if B else 0
+    if num_pages is None:
+        num_pages = total_logical_pages
+    assert num_pages >= total_logical_pages, (num_pages, total_logical_pages)
+
+    # Physical page assignment: a permutation of [0, num_pages) so the page table is
+    # genuinely non-contiguous / out-of-order (设计 §18 验证项)。
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    perm = (torch.randperm(num_pages, generator=g).tolist() if shuffle
+            else list(range(num_pages)))
+
+    # Padding slots get finite garbage so masking (not zero-init) is what protects us.
+    gk = torch.Generator(device=dev).manual_seed(seed + 11)
+    K_cache = torch.randn(num_pages, page_size, H_kv, D, device=dev, dtype=dt, generator=gk) * 0.2
+    V_cache = torch.randn(num_pages, page_size, H_kv, D, device=dev, dtype=dt, generator=gk) * 0.2
+    page_table = torch.zeros(B, max(max_pps, 1), dtype=torch.int32, device=dev)
+
+    next_phys = 0
+    k_off = 0
+    for b in range(B):
+        kl = seqlens_k[b]
+        for i in range(pages_per_seq[b]):
+            phys = perm[next_phys]; next_phys += 1
+            page_table[b, i] = phys
+            lo = i * page_size
+            hi = min(lo + page_size, kl)
+            n = hi - lo
+            K_cache[phys, :n] = K[k_off + lo: k_off + hi]
+            V_cache[phys, :n] = V[k_off + lo: k_off + hi]
+        k_off += kl
+    cache_seqlens = torch.tensor(seqlens_k, dtype=torch.int32, device=dev)
+    return K_cache, V_cache, page_table, cache_seqlens
+
+
 def o_scratch_reference(O, meta: RowDescMeta):
     """Pack FA output O [tot_q, H, D] into O_scratch [num_row_tiles, M_TILE, H, D].
 

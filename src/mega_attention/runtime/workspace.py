@@ -46,7 +46,9 @@ class FusedFaOprojArWorkspace:
     @classmethod
     def create(cls, group_name, max_num_row_tiles, hidden, H_local, D,
                tp_size=1, rank=0, N_TILE=128, super_group_n_tiles=4, q_per_kv=1,
-               max_num_batch=None, max_tot_k=None, dtype=torch.bfloat16, device=None):
+               max_num_batch=None, max_tot_k=None, dtype=torch.bfloat16, device=None,
+               paged=False, page_size=128, max_num_pages=None,
+               max_num_pages_per_seq=None):
         dev = torch.device(device if device is not None
                            else f"cuda:{torch.cuda.current_device()}")
         assert H_local % q_per_kv == 0
@@ -62,6 +64,14 @@ class FusedFaOprojArWorkspace:
         # and T_k only sizes the FA K/V read, not O_scratch/C_sym (设计稿: 容量估算).
         if max_tot_k is None:
             max_tot_k = tot_cap
+        # paged-KV TMA-128: K/V live in [num_pages, 128, H_kv, D] caches addressed by a
+        # page_table; page_size must equal FA_N_TILE == 128 (设计 §3/§19)。
+        if paged:
+            assert page_size == N_TILE == 128, (page_size, N_TILE)
+            if max_num_pages is None:
+                max_num_pages = (max_tot_k + 127) // 128
+            if max_num_pages_per_seq is None:
+                max_num_pages_per_seq = (max_tot_k + 127) // 128
         max_owner_slots = (max_total_oproj + tp_size - 1) // tp_size
         max_owner_words = (max_owner_slots + 63) // 64
 
@@ -100,6 +110,8 @@ class FusedFaOprojArWorkspace:
             q_per_kv=q_per_kv, num_out=num_out, num_super_groups=num_super_groups,
             max_num_row_tiles=max_num_row_tiles, max_num_batch=max_num_batch,
             max_total_oproj=max_total_oproj, tot_cap=tot_cap, max_tot_k=max_tot_k,
+            paged=paged, page_size=page_size,
+            max_num_pages=max_num_pages, max_num_pages_per_seq=max_num_pages_per_seq,
             # local control + metadata (all capacity-shaped; active fills prefixes)
             ctrl=_u32(NUM_CTRL), sync_ctrl=_u32(NUM_SYNC),
             actv=torch.zeros(6, dtype=torch.int32, device=dev),
@@ -109,10 +121,20 @@ class FusedFaOprojArWorkspace:
             cu_k=torch.zeros(max_num_batch + 1, dtype=torch.int32, device=dev),
             fa_b=torch.zeros(max_num_row_tiles, dtype=torch.int32, device=dev),
             fa_mb=torch.zeros(max_num_row_tiles, dtype=torch.int32, device=dev),
-            # input activation buffers (capacity-shaped; fixed shape across layers)
+            # input activation buffers (capacity-shaped; fixed shape across layers).
+            # contiguous: K/V are [max_tot_k, H_kv, D]. paged: K/V are None and the cache
+            # tensors below carry K/V (设计 §14: paged K/V input capacity 按 page 管理)。
             Q=torch.zeros(tot_cap, H_local, D, device=dev, dtype=dtype),
-            K=torch.zeros(max_tot_k, H_kv, D, device=dev, dtype=dtype),
-            V=torch.zeros(max_tot_k, H_kv, D, device=dev, dtype=dtype),
+            K=(None if paged else torch.zeros(max_tot_k, H_kv, D, device=dev, dtype=dtype)),
+            V=(None if paged else torch.zeros(max_tot_k, H_kv, D, device=dev, dtype=dtype)),
+            K_cache=(torch.zeros(max_num_pages, 128, H_kv, D, device=dev, dtype=dtype)
+                     if paged else None),
+            V_cache=(torch.zeros(max_num_pages, 128, H_kv, D, device=dev, dtype=dtype)
+                     if paged else None),
+            page_table=(torch.zeros(max_num_batch, max_num_pages_per_seq,
+                                    dtype=torch.int32, device=dev) if paged else None),
+            cache_seqlens=(torch.zeros(max_num_batch, dtype=torch.int32, device=dev)
+                           if paged else None),
             W_o=torch.zeros(K_local, hidden_pad, device=dev, dtype=dtype),
             Oscr=torch.zeros(max_num_row_tiles, 128, H_local, D, device=dev, dtype=dtype),
             csym=csym, rco=rco, rbits=rbits, nvl=nvl,
@@ -132,12 +154,22 @@ class FusedFaOprojArWorkspace:
         a4 = (self.ctrl, self.sync_ctrl, self.actv, self.head_ready,
               self.oproj_queue, self.rco)
         a8 = (self.rbits, self.ar_done_bits)
-        a16 = (self.Q, self.K, self.V, self.Oscr, self.W_o, self.csym,
+        # mK/mV positions carry the paged caches when paged; cu_k is a placeholder the
+        # paged kernel ignores (k_len comes from cache_seqlens).
+        kv = (self.K_cache, self.V_cache) if self.paged else (self.K, self.V)
+        a16 = (self.Q, kv[0], kv[1], self.Oscr, self.W_o, self.csym,
                self.cu_q, self.cu_k, self.fa_b, self.fa_mb)
         cts = [from_dlpack(t, assumed_align=4) for t in a4]
         cts += [from_dlpack(t, assumed_align=8) for t in a8]
         cts += [from_dlpack(t, assumed_align=16) for t in a16]
         return cts
+
+    def _paged_cts(self):
+        """Trailing (page_table, cache_seqlens) cute tensors for the paged variant."""
+        if not self.paged:
+            return ()
+        return (from_dlpack(self.page_table, assumed_align=4),
+                from_dlpack(self.cache_seqlens, assumed_align=4))
 
     def compile(self, w_fa=4, w_oproj=1, w_ar=1, num_ctas=132, kv_stages=2,
                 K_CHUNK=64, oproj_stages=4, softmax_scale=None):
@@ -151,30 +183,50 @@ class FusedFaOprojArWorkspace:
             K_CHUNK=K_CHUNK, oproj_stages=oproj_stages,
             csym_mc_ptr=self.csym_mc_ptr, nvl_local_ptr=self.nvl_local_ptr,
             nvl_peer_ptrs=self.nvl_peer_ptrs, rc_ptrs=self.rc_ptrs, rb_ptrs=self.rb_ptrs,
-            softmax_scale=softmax_scale, w_fa=w_fa, w_oproj=w_oproj, w_ar=w_ar)
+            softmax_scale=softmax_scale, w_fa=w_fa, w_oproj=w_oproj, w_ar=w_ar,
+            paged=self.paged, page_size=(self.page_size if self.paged else None))
         self._ts = torch.cuda.current_stream()
         self._st = cuda.CUstream(self._ts.cuda_stream)
         self._cts_cache = self._cts()
-        self._compiled = cute.compile(ker, *self._cts_cache, self._st)
+        self._paged_cts_cache = self._paged_cts()
+        self._compiled = cute.compile(
+            ker, *self._cts_cache, self._st, *self._paged_cts_cache)
         return self
 
     # ---------------------------------------------------------------- per layer
-    def set_layer(self, meta, Q, K, V, W_o):
+    def set_layer(self, meta, Q, K, V, W_o, page_table=None, cache_seqlens=None):
         """Fill active input prefixes + varlen metadata + runtime active counts.
 
-        Q:[tot_q,H_local,D]  K/V:[tot_k,H_kv,D]  W_o:[K_local,hidden]. Everything is
-        copied into the capacity buffers' active prefix; the rest is stale but unread.
+        contiguous: Q:[tot_q,H_local,D]  K/V:[tot_k,H_kv,D]  W_o:[K_local,hidden].
+        paged: K/V 是 [num_pages,128,H_kv,D] 的 paged cache, 额外传 page_table:[B,pps] int32
+        和 cache_seqlens:[B] int32 (设计 §16 paged host metadata)。所有内容只拷进 capacity
+        buffer 的 active prefix。
         """
         R = meta.num_row_tiles
         nb = meta.num_batch
         assert R <= self.max_num_row_tiles and nb <= self.max_num_batch
-        tq, tk = Q.shape[0], K.shape[0]
-        assert tq <= self.tot_cap and tk <= self.max_tot_k
-        self.Q[:tq].copy_(Q); self.K[:tk].copy_(K); self.V[:tk].copy_(V)
+        tq = Q.shape[0]
+        assert tq <= self.tot_cap
+        self.Q[:tq].copy_(Q)
         self.W_o[:, :self.hidden].copy_(W_o)
         d = self.dev
+        if self.paged:
+            assert page_table is not None and cache_seqlens is not None
+            npg, pps = K.shape[0], page_table.shape[1]
+            assert npg <= self.max_num_pages and pps <= self.max_num_pages_per_seq, (
+                npg, self.max_num_pages, pps, self.max_num_pages_per_seq)
+            self.K_cache[:npg].copy_(K); self.V_cache[:npg].copy_(V)
+            self.page_table[:nb, :pps].copy_(
+                torch.as_tensor(page_table, device=d, dtype=torch.int32))
+            self.cache_seqlens[:nb].copy_(
+                torch.as_tensor(cache_seqlens, device=d, dtype=torch.int32))
+        else:
+            tk = K.shape[0]
+            assert tk <= self.max_tot_k
+            self.K[:tk].copy_(K); self.V[:tk].copy_(V)
+            self.cu_k[:nb + 1].copy_(
+                torch.as_tensor(meta.cu_seqlens_k, device=d, dtype=torch.int32))
         self.cu_q[:nb + 1].copy_(torch.as_tensor(meta.cu_seqlens_q, device=d, dtype=torch.int32))
-        self.cu_k[:nb + 1].copy_(torch.as_tensor(meta.cu_seqlens_k, device=d, dtype=torch.int32))
         self.fa_b[:R].copy_(torch.as_tensor(meta.batch_idx, device=d, dtype=torch.int32))
         self.fa_mb[:R].copy_(torch.as_tensor(meta.m_block, device=d, dtype=torch.int32))
         self.actv.copy_(torch.as_tensor(
@@ -185,7 +237,7 @@ class FusedFaOprojArWorkspace:
     def launch(self):
         assert self._compiled is not None, "call compile() first"
         with torch.cuda.stream(self._ts):
-            self._compiled(*self._cts_cache, self._st)
+            self._compiled(*self._cts_cache, self._st, *self._paged_cts_cache)
 
     # ---------------------------------------------------------------- debug
     def debug_zero_all(self):

@@ -1,697 +1,413 @@
-# Causal Varlen Prefill FlashAttention + O_proj + NVLS AllReduce 设计稿
+# Causal Varlen Prefill FA + O_proj + NVLS AR Fused Kernel 设计
 
-将Attention和O_proj和NVLS ALlReduce融合成为一个算子
-
-FlashAttention-4 官方实现作为外部参考固定在仓库 submodule：
+本文是 `megaAttention` fused persistent kernel 的主设计文档。它同时描述两部分内容：
 
 ```text
-third_party/flash-attention
+1. 当前已经实现并由测试覆盖的 contiguous-KV 主线。
+2. 当前已经实现并由测试覆盖的 paged-KV TMA-128 路径。
 ```
 
-该外部仓库用于参考 CuTe DSL、SM90 persistent attention pipeline、varlen block info、
-causal mask、online softmax、TMA/WGMMA/mbarrier 协作等实现细节。尤其当
-`seqlen_q != seqlen_k` 时，本文采用 FA4 的 Q/K 尾部对齐 causal 语义。FA4 不能覆盖
-本文的当前范围和 invariant；如果 FA4 通用路径与本文冲突，以本文设计为准，先讨论再修改。
+两条路径共享同一条下游数据流：
 
-## 目标范围
+```text
+causal varlen prefill FlashAttention
+    -> O_proj
+    -> tensor-parallel NVLS AllReduce
+```
 
-本文讨论范围：
+Paged KV 已经作为 compile-time variant 进入 `src/mega_attention/kernels/sm90/fused_fa_oproj_ar.py`
+（构造参数 `paged=True, page_size=128`）。其设计以本文 paged TMA-128 章节为准；旧的补充文档
+`docs/design/paged_kv_prefill_tma_128_design_zh.md` 只作为来源记录。
+
+## 1. 范围
+
+当前 kernel 固定服务于一个目标：在 Hopper SM90 上把 causal varlen prefill 的
+FA、O_proj 和 TP NVLS AllReduce 串进同一个 persistent kernel。
+
+支持范围：
 
 - Hopper SM90。
 - causal attention。
-- varlen prefill。
-- Q token 数量较多。
-- decoder-only serving 中的 prompt / chunked prefill 阶段。
-- contiguous-KV prefill：每个 sequence 满足 `0 < q_len <= k_len`。`q_len == k_len`
-  是完整 prompt prefill 的退化情形；`q_len < k_len` 表示当前 Q chunk 关注同一
-  sequence 的完整连续 KV 前缀。
-- attention head 支持 MHA 与标准 GQA：Q head 数 `H_local`，K/V head 数 `H_kv_local`，
-  分组比 `q_per_kv = H_local / H_kv_local`（`q_per_kv == 1` 即退化为 MHA）。这里只做
-  标准 GQA（kernel 内按 `kv_head = q_head / q_per_kv` 复用 K/V head），不做 pack_gqa
-  把 group 维折进 M 的优化。
-- FlashAttention 后接 O_proj。
-- O_proj 后接 tensor-parallel NVLS AllReduce。
-- 使用一个 persistent kernel，把 FA、O_proj、AllReduce 串在同一个 kernel 内。
-- 使用python + CudaDSL 进行实现
+- contiguous-KV varlen prefill。
+- paged-KV varlen prefill TMA-128。
+- 完整 prompt prefill：`q_len == k_len`。
+- chunked / append prefill：`0 < q_len < k_len`，Q chunk 对齐到 KV 前缀尾部。
+- MHA 与标准 GQA。
+- FA 后接 O_proj。
+- O_proj partial 后接 TP NVLS AllReduce。
+- Python + CuTe DSL 实现。
 
-这里的 chunked/append prefill 只覆盖 **contiguous KV** 形态：K/V 已经按 sequence
-连续存放在 `K : [tot_k, H_kv_local, D]`、`V : [tot_k, H_kv_local, D]` 中，kernel 通过
-`cu_seqlens_k` 找到当前 sequence 的连续 KV 前缀。不覆盖 paged KV、KV split、partial
-O/LSE combine，也不覆盖 decode 专用短 Q 路径。decode 通常 `seqlen_q = 1`，Q row
-很少，主要并行度来自 head、KV split 或 paged cache；这些机制不进入 fused
-O_proj/AR 验证路径。
+不在本文主线中展开：
 
-## 基本计算
+- `page_size != 128` 的 paged cp.async gather。
+- decode。
+- SplitKV。
+- partial O / LSE combine。
+- non-causal attention。
+- block sparsity。
+- pack_gqa 优化。
+- 独立 comm warp group。
+- SM90 以外架构。
 
-FlashAttention 计算：
+## 2. 端到端数据流
+
+设计中的 fused kernel 数据流固定为：
 
 ```text
-O = softmax(QK^T) V
+Q/K/V 或 Q + K_cache/V_cache
+  -> FA task:      (fa_row_tile_id, q_head)
+  -> O_scratch:    [row_tile_id, 128, H_local, D]
+  -> O_proj task:  slot_id = row_tile_id * num_super_groups + n_super_group
+  -> C_sym:        [row_tile_id, 128, out_n_tile, N_TILE]
+  -> AR owner:     ar_slot_id == slot_id
+  -> C_sym final:  in-place NVLS reduce/store result
 ```
 
-当前设计支持完整 prompt prefill 和 Q rows 较多的 contiguous-KV chunked/append prefill。
-对 varlen batch 中的每个 sequence：
+`row_tile_id` 是全链路的 row identity。FA、O_proj 和 AR 都以同一个 128 行 row tile
+为基本单位：
 
 ```text
-0 < seqlen_q <= seqlen_k
-Q rows 很多
-causal = True
+FA_M_TILE = OPROJ_M_TILE = AR_M_TILE = 128
 ```
 
-causal mask 采用 FA4 的 Q/K 尾部对齐语义。令：
+核心 buffer：
 
 ```text
-offset = seqlen_k - seqlen_q
+O_scratch_local:
+    普通本地显存。
+    保存本 rank FA 输出，供本 rank O_proj 读取。
+
+C_sym:
+    symmetric buffer。
+    先保存本 rank O_proj partial。
+    AR owner 完成 NVLS reduce 后，把 final output 写回同一物理位置。
+
+control workspace:
+    task_ctrl、head_ready、oproj_queue、ready_count_owner、ar_ready_bits、
+    ar_done_bits、sync_ctrl 等调度和同步状态。
 ```
 
-则 Q chunk 内局部行 `q_index` 可见的 K/V 局部列满足：
+contiguous 和 paged TMA-128 只影响 FA 读取 K/V 的地址映射。FA 输出不直接进入
+symmetric buffer。只有 O_proj partial / final activation 使用 `C_sym` 的 symmetric
+allocation。
+
+## 3. Shape、Tile 与 Head 约定
+
+contiguous-KV 输入：
 
 ```text
-k_index <= q_index + (seqlen_k - seqlen_q)
-k_index < seqlen_k
-q_index < seqlen_q
-```
-
-当 `seqlen_q == seqlen_k` 时，`offset = 0`，退化为完整 prompt prefill 的标准下三角：
-
-```text
-k_index <= q_index
-```
-
-本文不支持 `seqlen_q > seqlen_k`。append/chunked prefill 语义只要求当前 Q chunk
-对齐到 KV 前缀的尾部，不引入 paged KV、SplitKV 或 partial O/LSE combine。
-
-### Q/K/V head 模型与 GQA
-
-当前设计同时支持 MHA 和标准 GQA。每个 TP rank 上：
-
-```text
-Q : [tot_q, H_local,    D]      # H_local    = 本 rank 上的 Q head 数
-K : [tot_k, H_kv_local, D]      # H_kv_local = 本 rank 上的 K/V head 数
+Q : [tot_q, H_local,    D]
+K : [tot_k, H_kv_local, D]
 V : [tot_k, H_kv_local, D]
-q_per_kv = H_local / H_kv_local # 连续分组比，H_local % q_per_kv == 0
+W_o_local : [H_local * D, hidden]
 ```
 
-GQA 语义：连续 `q_per_kv` 个 Q head 共享同一个 K/V head：
+paged-KV TMA-128 输入：
 
 ```text
-O[t, h] = softmax(Q[t, h] @ K[h / q_per_kv]^T * scale) @ V[h / q_per_kv]
-kv_head = q_head / q_per_kv           # 整数除，head 连续分组
+Q       : [tot_q, H_local,    D]
+K_cache : [num_pages, 128, H_kv_local, D]
+V_cache : [num_pages, 128, H_kv_local, D]
+page_table    : [batch, max_num_pages_per_seq] int32
+cache_seqlens : [batch] int32
+W_o_local     : [H_local * D, hidden]
 ```
 
-关键不变量：**attention 输出仍是每个 Q head 一份**，所以 `H_local`（Q head 数）才是
-O_scratch、head_ready、O_proj、AR 各级 layout 与计数的依据；GQA 只改变 K/V 的 head 寻址，
-不改变下游任何 layout、task 计数或 ready/count/owner 协议。`q_per_kv == 1` 时本节退化为 MHA，
-必须与原 MHA 路径逐元素等价。
-
-TP 约束：全局 `H_kv` 需能被 TP 整除，每 rank 的 `q_per_kv = H_local / H_kv_local`
-与全局 `H_q / H_kv` 一致。
-
-### Tile 尺寸约定
-
-当前设计让 FA、O_proj 和 AR 使用同一个 128 行 row tile。Hopper WGMMA 的 M atom
-以 64 行为基本单位；当 tile M 为 128 时，一个 CTA 内的两个 consumer warp group
-可以沿 M 维各处理 64 行：
+Paged KV 的 page size 必须等于 FA 的 N tile：
 
 ```text
-ROW_M_TILE   = 128
-FA_M_TILE    = ROW_M_TILE
-OPROJ_M_TILE = ROW_M_TILE
-AR_M_TILE    = ROW_M_TILE
+page_size == FA_N_TILE == 128
 ```
 
-FA mode 用满 12 warps（WG0 producer + WG1/WG2 consumers）：WG1 处理 FA tile 的
-rows 0..63，WG2 处理 rows 64..127。**softmax 规约只在各自 owned 的 64 行内完成，
-不跨 WG 合并**。
+当 `page_size == 128` 时，一个 logical K block 正好对应一个 page。kernel 对每个
+logical `n_block` 只查一次 page table，然后用 TMA 加载完整 `[128, D]` K/V tile。
+当 `page_size != 128` 时，一个 128 行 K/V tile 会跨多个 physical pages，需要 row gather
+和 cp.async 路径；这不属于本文第一阶段。
 
-O_proj/AR mode 也使用同一个 128 行 row tile。对一个 `out_n_tile`，WG1 负责
-rows 0..63，WG2 负责 rows 64..127。两个 WG 处理的是同一个 N tile 的不同行，
-不需要跨 WG 合并 accumulator。
+其中 `H_local` 是当前 TP rank 的 local Q head 数，`H_kv_local` 是当前 rank 暴露给
+kernel 的 local K/V head 数。
 
-### FA task 与 O_scratch
-
-FlashAttention 的 FA tile 取 `FA_M_TILE = 128`：
+标准 GQA 约束：
 
 ```text
-FA task = (fa_row_key, head)
-        = (batch_idx, fa_m_block, head)
+H_kv_local >= 1
+H_local % H_kv_local == 0
+q_per_kv = H_local / H_kv_local
+kv_head = q_head / q_per_kv
 ```
 
-一个 FA task 产出该 head 在整个 128 行 FA tile 上的 attention 输出：
+GQA 只改变 K/V head 寻址，不改变 FA task 数、O_scratch layout、O_proj K 维或 AR
+task identity。O_proj 的 K 维始终按 Q head 展开：
 
 ```text
-O_scratch[fa_row_tile_id, m, head, d]      # m = 0 .. 127
+K_local = H_local * D
 ```
 
-这里：
+默认 tile 参数：
 
 ```text
-fa_row_key : 一个 varlen sequence 内的一组 128 个 Q rows，逻辑上 (batch_idx, fa_m_block)
-batch_idx  : 当前 serving batch 中的序列编号
-fa_m_block : 当前 sequence 内的 128 行 Q tile 编号，不跨 sequence 递增
-head       : 当前 TP rank 上的 local attention head（Q head，范围 0 .. H_local-1）
-m          : FA tile 内的行位置 (0 .. FA_M_TILE-1)
-d          : head_dim 维度
+ROW_M_TILE = 128
+N_TILE = 128
+D = 128
+K_CHUNK = 64
+kv_stages = 2
+oproj_stages = 4
+super_group_n_tiles = 4
 ```
 
-GQA 下 `head` 是 Q head，K/V 的 head 在 kernel 内按 `kv_head = head / q_per_kv` 派生
-（见“Q/K/V head 模型与 GQA”）。FA task 仍以 Q head 为粒度，task 数 `num_fa_row_tiles * H_local`
-不变，O_scratch 仍按 Q head 数 `H_local` 组织。
+`super_group_n_tiles` 表示一个 O_proj task 覆盖几个连续 output N tile。它降低 O_proj
+task 数和 AR ready 粒度，但仍保留 N 维并行度。
 
-物理存储使用压平后的 FA row tile id：
+## 4. Varlen Row Tile Metadata
 
-```text
-fa_row_tile_id   = cu_fa_m_blocks[batch_idx] + fa_m_block
-cu_fa_m_blocks[b] = sum_{i < b} ceil(seqlen_q[i] / FA_M_TILE)
-num_fa_row_tiles = cu_fa_m_blocks[num_batch]
-
-O_scratch physical layout = [fa_row_tile_id, FA_M_TILE, head, d]
-```
-
-所有依赖关系都按逻辑 `fa_row_key = (batch_idx, fa_m_block)` 理解。这样 causal mask、
-最后一个 partial Q tile、不同 sequence 边界都不会被全局 row tile 混在一起。
-
-### O_proj row tile
-
-O_proj/AR 的 row tile 与 FA tile 对齐。某个 FA tile 的所有 local heads 写完后，
-O_proj 直接读取该 128 行 tile 的 `O_scratch`，把所有 local heads 拼成 GEMM 的 K 维：
+host 侧 metadata 由 `src/mega_attention/metadata/row_desc.py` 生成。它只保存从压平
+row tile 到 varlen 坐标的最小映射：
 
 ```text
-O_row_tile_local = view O_scratch[fa_row_tile_id, :, :, :]
-                 = [OPROJ_M_TILE, H_local * D]
-```
-
-因此 `O_scratch` 物理 layout 固定为 `[fa_row_tile_id, 128, head, d]`；O_proj
-把 `(head, d)` 视为连续 K 维。
-
-例如：
-
-```text
-H_local = 4
-D       = 128
-OPROJ_M_TILE = 128
-Hidden  = 4096
-N_TILE  = 128
-
-O_row_tile_local : [128, 4 * 128] = [128, 512]
-W_o_local        : [512, 4096]
-Y_partial        : [128, 4096]
-```
-
-按 output hidden 维切 tile 后：
-
-```text
-O_proj task = (fa_row_key, out_n_tile)
-            = (batch_idx, fa_m_block, out_n_tile)
-
-[OPROJ_M_TILE, H_local * D] @ [H_local * D, N_TILE]
-    -> [OPROJ_M_TILE, N_TILE]
-```
-
-当前设计实现中，调度任务把连续的 output N tile 组成一个 super group：
-
-```text
-n_super_group       : 一组连续 out_n_tile
-super_group_n_tiles : 每个 super group 包含的 out_n_tile 数量，当前 baseline = 4
-O_proj CTA task     = (fa_row_tile_id, n_super_group)
-```
-
-一个 CTA 领取一个 `n_super_group`。CTA 内按 `out_n_tile` 逐个推进 super group：
-每一轮 WG1/WG2 共同计算同一个 `out_n_tile` 的不同行，WG1 负责 rows 0..63，
-WG2 负责 rows 64..127。这样一个 output tile 的 M 维由两个 consumer WG 分担，
-同时把 O_proj task 数量和 AR ready 同步粒度降低到单个 out_n_tile 粒度的
-`1 / super_group_n_tiles`。当前设计中一个 super group 对应一次 AR ready 发布。
-
-所以 FA 的计算粒度是 `(fa_row_key, head)`（128 行），但 O_proj 的启动条件按 FA tile 触发：
-
-```text
-同一个 fa_row_key 的所有 local heads 都已经写入 O_scratch
-    -> 发布该 fa_row_tile_id 的所有 O_proj super group task
-```
-
-## Persistent Kernel 总体结构
-
-整个设计是一个 kernel launch。kernel 内每个常驻 CTA 都是 worker。
-
-每个 CTA 在循环中动态选择任务：
-
-```text
-while not done:
-    如果有合适的 FA task:
-        进入 FA mode
-    否则如果有 O_proj task:
-        进入 O_proj mode，计算 local partial 并发布 AR owner task
-    否则如果有 AR owner task:
-        进入 AR owner reduce mode，执行 NVLS AllReduce
-    否则检查是否所有任务完成
-```
-
-FA task 队列在 kernel 启动时天然存在（以 FA tile = 128 行为单位）。workspace
-按 bucket 最大容量分配，但调度器只使用本次 launch 的 active row tile 数：
-
-```text
-num_fa_row_tiles_active = cu_fa_m_blocks[num_batch]
-num_fa_tasks_active     = num_fa_row_tiles_active * H_local
-```
-
-一维 task id 先拆成压平 FA row tile 和 head：
-
-```text
-fa_task_id  = fa_row_tile * H_local + head
-
-fa_row_tile = fa_task_id / H_local
-head        = fa_task_id % H_local
-```
-
-然后通过预生成的 FA row descriptor 映射到 varlen 坐标：
-
-```text
-fa_row_key = fa_row_desc[fa_row_tile]
-           = (batch_idx, fa_m_block)
-```
-
-`fa_row_desc[fa_row_tile]` 是 host 侧生成的固定元数据表，只保存压平 FA row tile 到
-varlen 逻辑坐标的最小映射：
-
-```text
-fa_row_desc[fa_row_tile] = {
+cu_m_blocks[b] = sum_{i < b} ceil(seqlens_q[i] / 128)
+row_desc[t] = {
     batch_idx : int32,
-    fa_m_block: int32,
+    m_block   : int32,
 }
+num_row_tiles = cu_m_blocks[num_batch]
 ```
 
-主 persistent kernel 不在热路径里按 `cu_seqlens_q` 反复做 prefix-sum 查找。CTA 领取到
-`fa_task_id` 后，只需要一次读取 `fa_row_desc[fa_row_tile]`，就能得到该 tile 属于哪个
-sequence、以及是 sequence 内第几个 128 行 Q tile。其它派生信息仍从
-`cu_seqlens_q/cu_seqlens_k` 计算。当前设计要求 host 或 wrapper 在 launch 前保证每个
-sequence 的 `0 < q_len <= k_len`：
+FA task id 和 O_proj / AR slot 都基于同一个 `row_tile_id`：
 
 ```text
-q_start      = cu_seqlens_q[batch_idx]
-q_len        = cu_seqlens_q[batch_idx + 1] - q_start
-k_start      = cu_seqlens_k[batch_idx]
-k_len        = cu_seqlens_k[batch_idx + 1] - k_start
+fa_task_id = row_tile_id * H_local + q_head
 
-assert 0 < q_len <= k_len    # contiguous-KV prefill 前置条件
-
-q_tile_start = q_start + fa_m_block * FA_M_TILE
-valid_fa_m   = min(FA_M_TILE, q_len - fa_m_block * FA_M_TILE)
+slot_id = row_tile_id * num_super_groups + n_super_group
+ar_slot_id = slot_id
 ```
 
-这样 `fa_row_desc` 只负责调度 id 到 varlen 坐标的还原，不缓存 q/k start、length、
-`valid_fa_m` 等可由 `cu_seqlens` 直接推出的信息。由于当前设计支持 `q_len < k_len`，
-FA block range 和 causal mask 必须显式使用 `offset = k_len - q_len` 的尾部对齐语义；
-不能再用 `nblk = fa_m_block + 1` 或只 mask 对角块的完整 prompt 简化。
-
-CTA 通过 atomic counter 动态领取 FA task：
+contiguous-KV 的 shape 信息从 `cu_seqlens_q` / `cu_seqlens_k` 动态派生：
 
 ```text
-fa_task_id = atomicAdd(fa_task_counter, 1)
+b = row_desc[row_tile_id].batch_idx
+m_block = row_desc[row_tile_id].m_block
+
+q_start = cu_seqlens_q[b]
+q_len   = cu_seqlens_q[b + 1] - q_start
+k_start = cu_seqlens_k[b]
+k_len   = cu_seqlens_k[b + 1] - k_start
+
+valid_m = min(128, q_len - m_block * 128)
 ```
 
-这不是让某个 SM 顺序做所有 task。所有常驻 CTA 都在竞争同一个 counter，返回值天然不同。谁先完成，谁继续领下一个 task，有利于缓解 causal prefill 中前轻后重的负载不均衡。
-
-O_proj task 不是一开始全部生成。某个 `fa_row_key` 的所有 heads 完成后，最后完成的
-FA CTA 将该 FA tile 对应的所有 O_proj super group task 写入 ready queue：
+paged-KV TMA-128 不传 `cu_seqlens_k`。它用 `cache_seqlens` 表示每条 sequence 的有效
+KV 前缀长度：
 
 ```text
-if fa_m_block * FA_M_TILE < q_len:
-    publish (fa_row_tile_id, n_super_group = 0 .. num_super_groups - 1)
+b = row_desc[row_tile_id].batch_idx
+m_block = row_desc[row_tile_id].m_block
+
+q_start = cu_seqlens_q[b]
+q_len   = cu_seqlens_q[b + 1] - q_start
+k_len   = cache_seqlens[b]
+
+valid_m = min(128, q_len - m_block * 128)
 ```
 
-这样 O_proj CTA 不需要自旋等待 `row_ready`。只要某个 task 的 queue entry 已经通过
-`oproj_publish_tail` release 发布，就说明对应 FA row tile 的 `O_scratch` 已经可以读取。
-
-### Runtime task descriptor 与动态 varlen payload
-
-最终 fused persistent kernel 是面向整个 varlen batch 的单次 kernel launch，而不是为每个
-sequence、row tile 或 hidden super group 生成独立 kernel。CTA 每次从调度器领取的 task
-可能来自不同 sequence、不同 row tile 和不同 hidden super group，因此 `q_start`、
-`valid_m`、`k_len`、`base_out_n_tile` 等 task 形状与边界必须由 runtime descriptor 描述，
-不能作为 task 级 compile-time constant 固化在 kernel 中。
-
-当前设计 fused kernel 的编译期 specialization 只覆盖有限 kernel variant：
+两种 KV layout 的共同前置条件：
 
 ```text
-compile-time:
-    arch = SM90
-    dtype = fp16/bf16
-    causal = True
-    FA_M_TILE = OPROJ_M_TILE = 128
-    N_TILE = 128
-    D = Dv = 128
-    kv_stages = 2
-    K_CHUNK = 64
-    oproj_stages = 4
-    H_local / K_local / hidden tile 参数按 launch variant 固定
-    q_per_kv / H_kv_local 按 launch variant 固定（MHA 时 q_per_kv = 1）
+0 < q_len <= k_len
 ```
 
-每个 task 的 varlen 坐标、有效行数、KV block 范围、O_proj tail 范围在 runtime 解码：
+paged-KV TMA-128 使用相同前置条件。`cache_seqlens[b]` 表示本次 attention 可以读取的
+完整有效 KV 前缀长度，单位是 token。进入 fused kernel 前，框架或前置 kernel 必须已经：
 
 ```text
-runtime:
-    batch_idx
-    fa_m_block
-    q_start / k_start
-    q_len / k_len
-    valid_m
-    n_block_min / n_block_max
-    slot_id / n_super_group / base_out_n_tile / valid_n_tiles
+hidden_states @ Wk/Wv
+写入 K_cache/V_cache 的 physical page 和 page offset
+填好 page_table
+填好 cache_seqlens
 ```
 
-这与 FA4 的 persistent/runtime varlen 路径一致：kernel variant 固定 tile/stage/head_dim，
-但每个 work tile 在 loop 内根据 `batch_idx` 构造 seqlen/offset 信息，再由 block-info 逻辑
-计算当前 tile 的 K block 范围，并用 dynamic loop 处理不同长度的 sequence。
+如果当前 chunk 的新 K/V 还没有写入 paged cache，就不能把这些 token 计入
+`cache_seqlens[b]`。
 
-FA task 的 runtime descriptor：
+`q_len == k_len` 是完整 prompt prefill。`q_len < k_len` 是 chunked / append prefill，
+当前 Q chunk 关注同一 sequence 的完整 KV 前缀，并采用 bottom-right aligned causal 语义：
 
 ```text
-fa_task_id = atomicAdd(fa_task_counter, 1)
-
-fa_row_tile_id = fa_task_id / H_local
-head           = fa_task_id % H_local     # Q head
-kv_head        = head / q_per_kv          # 标准 GQA：连续 q_per_kv 个 Q head 共享一个 K/V head
-
-row_desc       = fa_row_desc[fa_row_tile_id]
-batch_idx      = row_desc.batch_idx
-fa_m_block     = row_desc.fa_m_block
-
-q_start        = cu_seqlens_q[batch_idx]
-k_start        = cu_seqlens_k[batch_idx]
-q_len          = cu_seqlens_q[batch_idx + 1] - q_start
-k_len          = cu_seqlens_k[batch_idx + 1] - k_start
-
-assert 0 < q_len <= k_len    # contiguous-KV prefill 前置条件
-
-q_tile_start   = q_start + fa_m_block * FA_M_TILE
-valid_m        = min(FA_M_TILE, q_len - fa_m_block * FA_M_TILE)
+offset = k_len - q_len
+kv_local <= q_local + offset
 ```
 
-当前设计 causal block range 采用 FA4 `BlockInfo.get_n_block_min_max` 的同构公式。
-对纯 causal、非 local、非 SplitKV 情况：
+row tile 数和 workspace 容量只按 Q token 计，不按 K token 计。`k_len` 只影响 FA 的
+K/V block loop 与 mask。
+
+## 5. FlashAttention Task
+
+FA task identity：
 
 ```text
-offset       = k_len - q_len
-num_k_blocks = ceil_div(k_len, N_TILE)
+fa_task_id -> (row_tile_id, q_head)
+row_tile_id -> (batch_idx, m_block)
+kv_head = q_head / q_per_kv
+```
+
+FA mode 中：
+
+```text
+Q tile = Q[q_start + m_block * 128 : ..., q_head, :]
+
+contiguous-KV:
+    K/V tile = K/V[k_start + n_block * 128 : ..., kv_head, :]
+
+paged-KV TMA-128:
+    physical_page = page_table[batch_idx, n_block]
+    K tile = K_cache[physical_page, :, kv_head, :]
+    V tile = V_cache[physical_page, :, kv_head, :]
+```
+
+pure causal、non-local、non-SplitKV 的 logical K block range：
+
+```text
+m_idx_min = m_block * 128
+m_idx_max = (m_block + 1) * 128
+offset = k_len - q_len
 
 n_block_min = 0
+n_block_max = min(ceil_div(k_len, 128),
+                  ceil_div(m_idx_max + offset, 128))
 
-m_idx_max   = (fa_m_block + 1) * FA_M_TILE
-n_idx_right = m_idx_max + offset
-n_block_max = min(ceil_div(k_len, N_TILE), ceil_div(n_idx_right, N_TILE))
+n_block_min_causal_mask =
+    max(n_block_min, (m_idx_min + offset) / 128)
 ```
 
-`n_block_max` 是右开边界。若 `n_block_min == n_block_max`，该 Q tile 没有可见 KV block，
-这在合法 `q_len <= k_len`、正常 row desc 下通常不会发生；实现仍应防御空范围，避免
-pipeline 进入无效 TMA load。`q_len == k_len` 时 `offset = 0`，上述公式退化为完整
-prompt prefill 的 `n_block_max = fa_m_block + 1`（再受 `k_len` tail 限制）。
-
-FA 的 KV block loop 使用 runtime 计数，不使用 `range_constexpr(nblk)`。当前设计固定
-从最右侧可见 K block 向左处理：
+元素级可见性：
 
 ```text
-if n_block_min < n_block_max:
-    first = n_block_max - 1
-    load K(first)
-    load Q current tile
-    load V(first)
+q_local  = m_block * 128 + row
+kv_local = n_block * 128 + col
 
-    for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-        n_block = n_block_max - 2 - i
-        load/consume K(n_block), V(n_block)
+valid = (row < valid_m)
+     && (kv_local < k_len)
+     && (kv_local <= q_local + offset)
 ```
 
-从右向左不是数学必需条件；online softmax 可以按任意 block 顺序处理。这里采用右到左，
-是因为 causal 的右边界和 `k_len` 尾部边界都位于可见范围右侧。最右侧 block 必须带
-`k_index < k_len` residual mask；右边界附近的一个或多个 block 还可能需要 causal mask。
-更左侧的历史 K block 往往整块可见，可以走更简单的 no-mask 主路径。
+current implementation 从右向左处理 K/V blocks。最右侧 block 必须做 residual mask，
+中间靠右 block 可能需要 causal mask，左侧完整可见 block 走 no-mask 快路径。
+
+对 paged-KV TMA-128，`n_block` 仍然是 sequence-local logical K block id。`physical_page`
+只参与 K/V load 地址映射，不参与 causal 坐标计算。最后一个不满 page 的 block 仍然整页
+TMA load，未使用列由 `kv_local < k_len` mask 屏蔽。
+
+FA 输出写入：
 
 ```text
-q_len=512, k_len=700, offset=188, Q rows 384..511:
-    K block 640..767  # 最右侧 block，需要 causal + k_len mask
-    K block 512..639  # offset 未按 128 对齐时，仍可能需要 causal mask
-    K block 384..511  # 整块可见
-    K block 256..383  # 整块可见
-    K block 128..255  # 整块可见
-    K block 0..127    # 整块可见
+O_scratch[row_tile_id, m, q_head, d]
 ```
 
-O_proj task 的 runtime descriptor：
+最后一个 Q tile 的无效行在 FA 尾声中置零。`warp_reduction_sum(row_sum)` 是 warp 级
+collective，必须对每一行无条件执行，不能把 collective 放进 `row < valid_m` 的发散分支。
+
+## 6. FA 到 O_proj 的 Handoff
+
+`O_scratch` 物理 layout 固定为：
 
 ```text
-slot_id = pop(oproj_ready_queue)
-
-fa_row_tile_id   = slot_id / num_super_groups
-n_super_group    = slot_id % num_super_groups
-base_out_n_tile  = n_super_group * super_group_n_tiles
-
-row_desc         = fa_row_desc[fa_row_tile_id]
-batch_idx        = row_desc.batch_idx
-fa_m_block       = row_desc.fa_m_block
-q_start          = cu_seqlens_q[batch_idx]
-q_len            = cu_seqlens_q[batch_idx + 1] - q_start
-valid_m          = min(OPROJ_M_TILE, q_len - fa_m_block * OPROJ_M_TILE)
-
-num_out_n_tiles  = ceil_div(hidden, N_TILE)
-valid_n_tiles    = min(super_group_n_tiles, num_out_n_tiles - base_out_n_tile)
+O_scratch[row_tile_id, 128, H_local, D]
 ```
 
-O_proj 的 K loop 仍可保持 compile-time，因为当前设计 `K_local = H_local * D` 和
-`K_CHUNK` 由 kernel variant 固定：
+O_proj 读取时把 `(H_local, D)` flatten 成 GEMM K 维：
 
 ```text
-for k_chunk in range_constexpr(K_local / K_CHUNK):
-    load A_chunk + W_o_chunk
-    WGMMA accumulate
+A = O_scratch[row_tile_id, :, :, :]
+  = [128, H_local * D]
 ```
 
-super group 内的 N tile 循环使用固定上限加 runtime predicate，而不是为 tail
-重新生成 kernel：
+每个 FA task 只写一个 Q head。一个 row tile 的所有 local Q heads 都完成后，才能发布该
+row tile 的 O_proj tasks。同步点是：
 
 ```text
-for sg_tile in range_constexpr(super_group_n_tiles):
-    if sg_tile < valid_n_tiles:
-        out_n_tile = base_out_n_tile + sg_tile
-        valid_n = min(N_TILE, hidden - out_n_tile * N_TILE)
-        compute/store with (m < valid_m and n < valid_n)
+head_ready[row_tile_id]
 ```
 
-runtime descriptor 的解码可以由各 WG 根据同一个 `(mode, arg)` 独立完成。当前设计不要求
-leader 把完整 descriptor 写入 shared memory 再广播；`fa_row_desc` 和 `cu_seqlens` 的读取量
-很小，重复读取比引入新的 CTA-local descriptor 协议更容易验证。后续如果 profiling 证明
-descriptor 读取成为瓶颈，再考虑由 leader 解码并通过 shared memory 广播。
-
-### O_proj 规模估算
-
-一个 O_proj `row_tile` 最多包含 `OPROJ_M_TILE` 个 token。当前设计按：
+FA task 完成顺序：
 
 ```text
-OPROJ_M_TILE = 128
-N_TILE       = 128
+1. 等待 FA mode 内所有 WGMMA / TMA 读完成。
+2. 写 O_scratch[row_tile_id, :, q_head, :]。
+3. device-scope fence。
+4. atomicAdd_acq_rel(head_ready[row_tile_id], 1)。
+5. 如果 old + 1 == H_local：
+       publish_oproj(row_tile_id)
+6. atomicAdd_release(C_FA_DONE, 1)。
 ```
 
-估算（`num_fa_row_tiles = sum ceil(q_len / 128) ≈ total_q_tokens / 128`）：
+最后一个 head 的 `atomicAdd_acq_rel` 同时承担 release 和 acquire：它发布自己的
+O_scratch 写入，也获取其它 heads 已发布的 O_scratch 写入。随后它才能把 O_proj task
+放入 ready queue。
+
+完整 happens-before 链：
 
 ```text
-B=1,  q_len=32k  -> total_q_tokens=32k  -> row_tiles=256
-B=4,  q_len=16k  -> total_q_tokens=64k  -> row_tiles=512
-B=8,  q_len=8k   -> total_q_tokens=64k  -> row_tiles=512
-B=16, q_len=4k   -> total_q_tokens=64k  -> row_tiles=512
+FA head 写 O_scratch
+  -> head_ready atomicAdd_acq_rel
+  -> 最后一个 head 观察到 H_local
+  -> 写 oproj_queue entries
+  -> release publish_tail
+  -> O_proj consumer acquire publish_tail
+  -> O_proj 读取 O_scratch
 ```
 
-O_proj 的 N 维 tile 数：
+## 7. O_proj Task
+
+O_proj task identity：
 
 ```text
-num_out_n_tiles = ceil_div(hidden, N_TILE)
+slot_id = row_tile_id * num_super_groups + n_super_group
 
-hidden=4096   -> num_out_n_tiles=32
-hidden=8192   -> num_out_n_tiles=64
-hidden=12288  -> num_out_n_tiles=96
-hidden=16384  -> num_out_n_tiles=128
-```
-
-如果每个 task 只覆盖单个 `out_n_tile`，每个 row 产生：
-
-```text
-hidden=4096   -> 32 个 O_proj task / AR tile
-hidden=8192   -> 64 个 O_proj task / AR tile
-hidden=16384  -> 128 个 O_proj task / AR tile
-```
-
-这会带来较多 O_proj 调度任务和 push-to-owner AR ready atomic。反过来，如果让一个 CTA
-负责整个 row 的完整 hidden，任务和同步数量最少，但会把 N 维并行度砍得太狠：
-
-```text
-hidden=4096   -> 一个 CTA 串行处理 32 个 N tile
-hidden=8192   -> 一个 CTA 串行处理 64 个 N tile
-hidden=16384  -> 一个 CTA 串行处理 128 个 N tile
-```
-
-长 prefill 不一定 batch 很大，`B=1, L=4k` 时只有 32 个 row tiles。整行 CTA 最多只有 32 个 O_proj tasks，可能连 SM 都喂不满，而且 AR 要等整行 hidden 都写完才开始。当前设计不采用整行 CTA。
-
-折中采用 super group：
-
-```text
-super_group_n_tiles = 4
-num_super_groups    = ceil_div(num_out_n_tiles, super_group_n_tiles)
-total_oproj_tasks_active = num_fa_row_tiles_active * num_super_groups
-```
-
-例如 hidden=4096：
-
-```text
-super_group_n_tiles=2 -> 每 row_tile 16 个 O_proj task / AR tile
-super_group_n_tiles=4 -> 每 row_tile 8 个 O_proj task / AR tile
-```
-
-这样可以把调度和 AR 同步数量降低 2x 到 4x，同时保留 N 维并行度和 O_proj/AR overlap。
-
-### O_proj task identity
-
-O_proj task 空间是规则的，task identity 使用一个 `slot_id` 表示，不需要完整 descriptor。
-下标空间直接使用 FA row tile（128 行）：
-
-```text
-slot_id = fa_row_tile_id * num_super_groups + n_super_group
-
-fa_row_tile_id = slot_id / num_super_groups
-n_super_group  = slot_id % num_super_groups
+row_tile_id = slot_id / num_super_groups
+n_super_group = slot_id % num_super_groups
 base_out_n_tile = n_super_group * super_group_n_tiles
-valid_n_tiles  = min(super_group_n_tiles, num_out_n_tiles - base_out_n_tile)
-
-batch_idx  = fa_row_desc[fa_row_tile_id].batch_idx
-fa_m_block = fa_row_desc[fa_row_tile_id].fa_m_block
-q_len      = cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx]
-m_start    = fa_m_block * FA_M_TILE
-valid_m    = min(OPROJ_M_TILE, q_len - m_start)
-
-# A 矩阵 = O_scratch 的完整 128 行 FA tile：
-A = O_scratch[fa_row_tile_id, :, :, :]   # [128, H_local*D]
-
-for sg_tile in 0 .. valid_n_tiles - 1:
-    out_n_tile = base_out_n_tile + sg_tile
-    valid_n    = min(N_TILE, hidden - out_n_tile * N_TILE)
+valid_n_tiles = min(super_group_n_tiles,
+                    num_out_n_tiles - base_out_n_tile)
 ```
 
-`valid_m` 和 `valid_n` 只影响 O_proj partial store、最终输出消费和 reference
-校验的有效范围，不改变调度和 ready 粒度：
+每个 O_proj task 处理一个 row tile 和一组连续 output N tile：
 
 ```text
-O_proj:
-    只对 m < valid_m 且 n < valid_n 的元素写 symmetric partial buffer
-
-NVLS AR reduce:
-    对 valid_n_tiles 内的物理 C_sym tile 执行 in-place multimem reduce/store
-    覆盖 128 行和每个 out_n_tile 的完整 N_TILE 列
-
-final output / reference check:
-    只读取或比较 m < valid_m 且 n < valid_n 的元素
-
-ready_count:
-    仍然按 ar_slot_id = (fa_row_tile_id, n_super_group) 每 rank 加一次
+A = O_scratch[row_tile_id, :, :, :]     # [128, H_local * D]
+B = W_o_local[:, out_n_tile]            # [H_local * D, 128]
+C = C_sym[row_tile_id, :, out_n_tile, :] # [128, 128]
 ```
 
-最后一个 partial row tile 不要求清零无效 `m` 行；最后一个 hidden tile 不要求
-`hidden` 被 `N_TILE` 整除。O_proj partial store 只写有效 `m/n`，因此 `C_sym`
-padding 区保存上一层或本层其它无效写回后的任意值。AR owner 为保持实现简单和
-vectorized multimem 路径，对 `valid_n_tiles` 内的完整物理 tile 做 reduce/store，
-padding 区也会被 in-place 写回。该 padding 区不属于语义输出，后续 consumer、debug
-检查和 reference compare 都必须按 `valid_m/valid_n` 忽略它。
-
-### 方案 A: 64-bit ready bitset 评估
-
-方案 A 使用 `uint64_t` bitset 表示 O_proj task ready 状态：
+WG1/WG2 沿 M 维分工：
 
 ```text
-oproj_ready_bits[num_oproj_words]  # uint64_t bitset
-
-num_oproj_words_active = ceil_div(total_oproj_tasks_active, 64)
+WG1 -> rows 0..63
+WG2 -> rows 64..127
 ```
 
-其中：
+两个 consumer WG 都执行完整 K loop，但 accumulator 行互不重叠，不需要跨 WG 合并。
+
+store predicate：
 
 ```text
-num_super_groups  = ceil_div(num_out_n_tiles, super_group_n_tiles)
-total_oproj_tasks_active = num_fa_row_tiles_active * num_super_groups
-num_oproj_words_active   = ceil_div(total_oproj_tasks_active, 64)
+m < valid_m
+n < valid_n(out_n_tile)
 ```
 
-一般 prefill 下的 ready words 数量大致如下。假设：
+O_proj 只写有效 `m/n` 元素。`C_sym` padding 区不要求清零，测试用 sentinel 验证
+O_proj 不会覆盖 masked tail。AR 阶段可能覆盖 valid super group 内的完整物理 tile；
+padding 区不属于语义输出，reference 和 consumer 都必须按 `valid_m/valid_n` 忽略。
+
+## 8. O_proj Ready Queue
+
+O_proj 使用 ready queue，不使用 ready bitset。
+
+相关状态位于 `task_ctrl` 和 `oproj_queue`：
 
 ```text
-OPROJ_M_TILE = 128
-N_TILE = 128
-total_q_tokens = 64k
-num_fa_row_tiles_active = total_q_tokens / OPROJ_M_TILE = 512
-super_group_n_tiles = 4
-```
-
-则：
-
-```text
-hidden=4096,  super_group=4:
-num_out_n_tiles=32,  num_super_groups=8
-total_oproj_tasks_active=4096
-num_ready_words_active=64
-
-hidden=8192,  super_group=4:
-num_super_groups=16
-total_oproj_tasks_active=8192
-num_ready_words_active=128
-
-hidden=16384, super_group=4:
-num_super_groups=32
-total_oproj_tasks_active=16384
-num_ready_words_active=256
-```
-
-bitset 方案的 producer 很便宜。某个 FA row tile ready 后，producer 通常只需要一次 `atomicOr_release` 就能发布该 row 的所有 O_proj tasks：
-
-```text
-base_slot = fa_row_tile_id * num_super_groups
-mask      = 该 O_proj row 在 64-bit word 内对应的 n_super_group bits
-
-atomicOr_release(oproj_ready_bits[word_id], mask)
-```
-
-问题在 consumer。consumer 必须轮询 ready words 才能找到可执行 task：
-
-```text
-word = acquire_load(oproj_ready_bits[word_id])
-
-if word != 0:
-    bit = ffs(word)
-    old = atomicAnd_acq_rel(oproj_ready_bits[word_id], ~bit)
-    if old & bit:
-        slot_id = word_id * 64 + bit
-        执行 O_proj(slot_id)
-```
-
-如果朴素地从 word 0 开始扫描，执行到一半时前面的 ready words 大多已经被清空。例如 `num_ready_words = 512` 时，如果前 256 个 words 已经空了，每个 consumer 尝试 O_proj 都可能先做 256 次无效 acquire load。这会浪费 L2 带宽和 CTA 调度周期。
-
-可以用 global circular scan cursor、chunk 分片、frontier hint 等方法降低空轮询，但这些方法会引入额外策略问题：
-
-```text
-1. cursor 如果用 atomicAdd 分配 chunk，早期会很快扫到后面尚未 ready 的空区域。
-2. cursor 如果作为 low-watermark，只有 chunk 全空才推进，则要处理多个 CTA 挤在同一 chunk 的竞争。
-3. causal prefill 下 row 大体前面先 ready、后面后 ready，但动态 FA 调度、不同 sequence 长度和 head 完成时间会打乱严格顺序。
-4. active 阶段不能空扫太多，drain 阶段又必须兜底扫完所有迟到 ready bits。
-```
-
-因此方案 A 的 producer 成本最低，但 consumer 侧需要较复杂的 bounded probing 策略才能避免无效轮询。
-
-### 方案 B: O_proj ready queue
-
-当前采用方案 B：ready queue。FA producer 不再设置 `oproj_ready_bits`，而是把 ready 的 O_proj task 写入一个队列。队列 entry 只存 `slot_id`：
-
-```text
-oproj_queue[max_total_oproj_tasks_bucket]  # uint32 slot_id
-
-oproj_reserve_tail              # producer 预留写入区间
-oproj_publish_tail              # 连续已写完、consumer 可见的尾指针
-oproj_consume_head              # consumer 已领取到的位置
-oproj_done_count                # 已完成 O_proj task 数
+C_OP_RESERVE
+C_OP_PUBLISH
+C_OP_CONSUME
+oproj_queue[total_oproj_tasks_capacity]  # uint32 slot_id
 ```
 
 队列区间语义：
@@ -699,2110 +415,896 @@ oproj_done_count                # 已完成 O_proj task 数
 ```text
 [0, consume_head)              已被 consumer 领取
 [consume_head, publish_tail)   已发布，可被 consumer 领取
-[publish_tail, reserve_tail)   已预留，但不保证都写完，不可消费
-[reserve_tail, total_oproj_tasks_active)    未预留
+[publish_tail, reserve_tail)   已预留，但还不能消费
+[reserve_tail, capacity)       未预留
 ```
 
-ASCII 示意：
+producer 是最后完成某个 row tile 所有 heads 的 FA CTA。它一次发布该 row tile 的所有
+`num_super_groups` 个 O_proj tasks：
 
 ```text
-0                                                        total_tasks
-|----------------|-------------------|-------------------|
- consumed         published-ready     reserved-unpublished
-                  可消费              不可消费，可能有洞
-
-^                ^                   ^
-consume_head     publish_tail         reserve_tail
-```
-
-#### Producer reserve / write / ordered publish
-
-某个 `fa_row_key` 的所有 heads 完成后，最后完成的 FA CTA 作为 O_proj task producer。
-它一次性发布该 FA row tile 的所有 `num_super_groups` 个 O_proj tasks：
-
-```text
-publish_oproj_tasks(fa_row_tile_id):
+publish_oproj(row_tile_id):
     n = num_super_groups
-    start = atomicAdd(oproj_reserve_tail, n)
-    end = start + n
+    start = atomicAdd(C_OP_RESERVE, n)
+    base = row_tile_id * n
 
     for i in 0 .. n - 1:
-        slot_id = fa_row_tile_id * num_super_groups + i
-        oproj_queue[start + i] = slot_id
+        oproj_queue[start + i] = base + i
 
-    threadfence_release()
+    fence
 
-    while acquire_load(oproj_publish_tail) != start:
-        backoff
+    while acquire_load(C_OP_PUBLISH) != start:
+        wait
 
-    release_store(oproj_publish_tail, end)
+    atomicAdd_release(C_OP_PUBLISH, n)
 ```
 
-`oproj_reserve_tail` 允许多个 producer 并发预留不重叠区间；`oproj_publish_tail` 只允许按 reservation 顺序推进，保证 consumer 可见区间连续无洞。
+`C_OP_RESERVE` 允许多个 producer 并发预留不重叠区间。`C_OP_PUBLISH` 按 reservation
+顺序推进，保证 consumer 只能看到连续、无洞、已写完的 queue entries。
 
-并发写入示意。初始状态：
+consumer 领取：
 
 ```text
-consume_head = 80
-publish_tail = 100
-reserve_tail = 100
-num_super_groups = 8
+try_pop_oproj():
+    head = load(C_OP_CONSUME)
+    tail = acquire_load(C_OP_PUBLISH)
 
-idx:     80              100
-         | ready tasks   | free ...
-         ^               ^
-         consume_head    publish_tail/reserve_tail
+    if head < tail:
+        old = atomicCAS(C_OP_CONSUME, head, head + 1)
+        if old == head:
+            slot_id = oproj_queue[head]
+            return FOUND(slot_id)
 ```
 
-Producer A 和 B 并发 reserve：
+这里 `publish_tail acquire` 保证 queue entry 对 consumer 可见；`consume_head CAS`
+保证一个 queue entry 只被一个 CTA 领取。
 
-```text
-A_start = atomicAdd(reserve_tail, 8)  # 100
-A_end   = 108
-
-B_start = atomicAdd(reserve_tail, 8)  # 108
-B_end   = 116
-```
-
-reserve 后：
-
-```text
-idx:     80              100        108        116
-         | ready tasks   | A reserved | B reserved | free
-         ^               ^                        ^
-         consume_head    publish_tail              reserve_tail
-```
-
-如果 B 先写完，而 A 还没写完：
-
-```text
-idx:     100        108        116
-         | A ?????? | B done   |
-         ^          ^          ^
-         publish    B_start    reserve_tail
-```
-
-B 不能发布到 116，因为 `[100,108)` 还可能没有写完。B 必须等待：
-
-```text
-while acquire_load(oproj_publish_tail) != B_start:
-    wait
-```
-
-此时 `publish_tail = 100`，`B_start = 108`，所以 B 等待。A 写完后：
-
-```text
-idx:     100        108        116
-         | A done   | B done   |
-         ^          ^          ^
-         publish    B_start    reserve_tail
-```
-
-A 看到 `publish_tail == A_start == 100`，执行：
-
-```text
-release_store(oproj_publish_tail, A_end)  # publish_tail = 108
-```
-
-B 随后看到 `publish_tail == B_start == 108`，执行：
-
-```text
-release_store(oproj_publish_tail, B_end)  # publish_tail = 116
-```
-
-最终：
-
-```text
-idx:     80              100        108        116
-         | old ready     | A ready  | B ready  | free
-         ^                                      ^
-         consume_head                            publish_tail/reserve_tail
-```
-
-这样 reserve/write 可以并发，但 publish 必须按 reservation 顺序前进。consumer 只读取 `[consume_head, publish_tail)`，因此永远不会读到未初始化 descriptor。
-
-#### Consumer pop
-
-consumer 不使用 `atomicAdd(oproj_consume_head, 1)` 直接领取，因为如果抢早了发现 `consume_head >= publish_tail`，已经前移的 `consume_head` 会造成任务丢失。当前设计使用 CAS：
-
-```text
-try_pop_oproj_task():
-    while true:
-        head = relaxed_load(oproj_consume_head)
-        tail = acquire_load(oproj_publish_tail)
-
-        if head >= tail:
-            return EMPTY
-
-        if atomicCAS(oproj_consume_head, head, head + 1) == head:
-            slot_id = acquire_load(oproj_queue[head])
-            return slot_id
-```
-
-多个 consumer 并发时：
-
-```text
-idx:     80        81        82                 116
-         | ready   | ready   | ready ...        |
-         ^                                      ^
-         consume_head=80                        publish_tail=116
-
-C0 CAS 80->81 成功，领取 idx 80
-C1 同时 CAS 80->81 失败，重读 head=81
-C1 CAS 81->82 成功，领取 idx 81
-```
-
-因此每个 O_proj task 只会被一个 CTA 领取。
-
-#### 方案 B 取舍
-
-方案 B 的 producer 成本高于 bitset：
-
-```text
-每个 ready row:
-    1 次 atomicAdd reserve_tail
-    num_super_groups 次 queue entry store
-    可能短暂等待 publish_tail
-    1 次 release_store publish_tail
-```
-
-例如 `hidden=16384, super_group_n_tiles=4` 时，`num_super_groups=32`，每个 ready row 要写 32 个 queue entries。方案 A 通常只需要 1 次 `atomicOr_release` 发布这个 row 的 ready bits。
-
-但方案 B 避免了 consumer 轮询 ready words：
-
-```text
-每个 O_proj task:
-    1 次 publish_tail acquire load
-    1 次 consume_head CAS
-    1 次 queue entry load
-```
-
-考虑到一般 prefill 下 `num_ready_words` 可能达到 64、128、256，`super_group_n_tiles=2`
-时还会再翻倍，bitset consumer 如果设计不好会反复读取大量空 word。ready queue 的
-consumer 成本更确定，也更容易写对。因此当前设计采用方案 B。方案 A 不属于当前路径；
-如果 profiling 显示 queue producer 的 entry 写入和 ordered publish 成为瓶颈，再回到 bitset + 更精细的 cursor/frontier probe 方案。
-
-完整 happens-before 链路变为：
-
-```text
-FA head 写 O_scratch
-    -> atomicAdd_acq_rel(head_ready_count)
-    -> 最后一个 head 观察到计数达到 H_local
-    -> 写 oproj_queue entries
-    -> release_store(oproj_publish_tail)
-    -> O_proj consumer acquire 看到 publish_tail
-    -> atomicCAS claim consume_head
-    -> 读取 queue entry，解码 slot_id
-    -> 读取 O_scratch 并执行 O_proj
-```
-
-## Task 调度策略
-
-每个 CTA 都支持三类 work source：
-
-```text
-FA task:
-    来源: fa_task_counter
-    任务: (fa_row_tile_id, head)
-
-O_proj task:
-    来源: oproj_ready_queue
-    任务: slot_id -> (fa_row_tile_id, n_super_group)
-
-AR owner task:
-    来源: ar_ready_bits
-    任务: ar_slot_id -> (fa_row_tile_id, n_super_group)
-```
-
-每个 CTA 完成当前任务并回到全局调度循环后，按静态偏好表尝试取下一类任务。偏好只决定尝试顺序，不把 CTA 固定到某一类任务；当前优先级没有任务时，CTA 立即尝试下一类任务。
-
-偏好配比由 host 侧 launch 常量 `(w_fa, w_oproj, w_ar)` 驱动，不写死在 kernel 里。设
-`w_m = w_fa + w_oproj + w_ar`，按 `cta_id % w_m` 落入的区间决定该 CTA 的偏好顺序：
-
-```text
-w_m = w_fa + w_oproj + w_ar
-k   = cta_id % w_m
-
-k <  w_fa                 -> FA -> O_proj -> AR
-w_fa <= k < w_fa+w_oproj  -> O_proj -> AR -> FA
-否则                      -> AR -> FA -> O_proj
-```
-
-`cta_id % w_m` 天然跨 SM 交错，使三类偏好在物理 SM 上均匀分布。NVLS AR owner 由
-`ar_slot_id % tp_size` 决定，与 role 偏好正交，不受配比影响。`tp_size == 1` 时 AR 退化为
-identity，取 `w_ar = 0`，其 CTA 份额并入 FA 偏好。
-
-调度循环：
-
-```text
-while not done:
-    order = preference_order(cta_id % w_m)        # 由 (w_fa, w_oproj, w_ar) 决定
-
-    for source in order:
-        if source == FA:
-            如果 try_get_fa_task() 成功:
-                进入 FA mode
-                break
-
-        if source == O_proj:
-            如果 try_pop_oproj_queue() 成功:
-                进入 O_proj mode
-                break
-
-        if source == AR:
-            如果 try_claim_ar_owner_task() 成功:
-                进入 AR owner reduce mode
-                break
-
-    如果三类 source 都没有可执行任务:
-        先检查全局完成条件；未完成时短暂 backoff 后继续调度
-```
-
-因此配比只影响重叠阶段的稳态平衡与 mode 切换抖动，不影响「会不会闲置」：
-
-- `w_fa / w_m` 的 CTA 优先推进 FA，适合 prefill 早期 FA 任务最多的阶段。
-- `w_oproj / w_m` 的 CTA 优先处理 O_proj，使 row ready 后能尽早启动后接 GEMM。
-- `w_ar / w_m` 的 CTA 优先处理 AR owner task，使已经完成 local partial 的 tile 能及时尝试 NVLS AllReduce。
-- 所有 CTA 都有 fallback 顺序，所以某一类任务暂时为空时不会原地空转。
-
-`(w_fa, w_oproj, w_ar)` 的具体取值，以及 O_proj super group 粒度 `super_group_n_tiles`，
-都由 host 侧 launch 启发式按 shape 选择，不在本文档预设数值；机制与标定见子设计文档：
-
-```text
-docs/design/launch_heuristic_role_sg_plan_zh.md
-```
-
-该启发式以 FA/O_proj 的 MAC 比 `r = FA_macs / OPROJ_macs` 为分桶特征查表选配比，默认
-`(w_fa, w_oproj, w_ar) = (4, 1, 1)` 与早期固定 `cta_id % 6`（FA:O_proj:AR = 4:1:1）逐位等价，
-作为回归基线。
-
-AR owner task 的产生和领取规则：
-
-```text
-O_proj CTA 完成某个 ar_tile 的本 rank partial 后:
-    写 symmetric partial buffer
-    等待 partial store 真正完成
-    如果使用 TMA S2G store，则 cp_async_bulk_wait_group(0, read=False)
-    cute.arch.fence_proxy("alias")
-    system-scope release fence
-
-    owner_rank = ar_slot_id % tp_size
-    owner_idx  = ar_slot_id / tp_size
-
-    old = atomicAdd_acq_rel_system(owner_rank.ready_count_owner[owner_idx], 1)
-
-    if old + 1 == tp_size:
-        word_id = owner_idx / 64
-        bit     = 1 << (owner_idx % 64)
-        atomicOr_release_system(owner_rank.ar_ready_bits[word_id], bit)
-```
-
-这里 `word_id = owner_idx / 64`，`bit = 1 << (owner_idx % 64)`。`ar_ready_bits`
-只表示某个 `ar_slot_id` 已经由最后一个完成 partial 的 rank 确认 ready，可以由
-owner rank 执行 NVLS reduce/store。调度器只从 `ar_ready_bits` 领取已经 ready 的
-AR task。claim 与执行分两步：**先用 atomicAnd 清掉 ready bit 完成认领**（清成功即独占该 slot），
-**reduce/store 完成之后再设 done bit 计数**：
-
-```text
-# 调度循环内：认领（清 ready bit 即认领成功，独占该 ar_slot_id）
-word = acquire_load(ar_ready_bits[word_id])
-bit_index = ffs(word)
-bit = 1 << bit_index
-old_ready = atomicAnd_acq_rel(ar_ready_bits[word_id], ~bit)
-if old_ready & bit == 0:
-    没有成功 claim，直接返回调度循环
-owner_idx  = word_id * 64 + bit_index
-ar_slot_id = owner_idx * tp_size + my_rank
-
-# 进入 AR owner reduce mode：先做数据，再记终态
-执行 multimem.ld_reduce + multimem.st
-等待 final store 完成
-old_done = atomicOr_acq_rel(ar_done_bits[word_id], bit)
-if old_done & bit == 0:
-    atomicAdd(ar_done_count, 1)
-```
-
-reduce 的 exactly-once 由 ready bit 的 atomicAnd claim 独占保证（一个 ready bit 只能被一个 CTA
-清成功），`ar_done_bits` 只负责让 `ar_done_count` 对同一 slot 只 +1 一次。把 done bit 推迟到
-reduce 完成之后，使 `ar_done_bits`/`ar_done_count` 的语义是「reduce 已真正落地」而非「已认领」；
-kernel 退出条件 `ar_done_count == local_owned_ar_tasks_active` 因此严格对应所有 multimem reduce/store
-都已完成。`tp_size == 1` 时 AR 退化为 identity，没有数据搬运，只做 done bit 终态记账。
-
-全局完成条件：
-
-```text
-fa_done_count    == num_fa_tasks_active
-oproj_done_count == total_oproj_tasks_active
-ar_done_count    == local_owned_ar_tasks_active
-```
-
-每个 O_proj task 对应一个 `ar_tile`，但每个 rank 只负责自己 owner 的 AR tile。
-`total_oproj_tasks_active` 是本次 launch 的全局 O_proj partial 数量，
-`local_owned_ar_tasks_active` 是本 rank 本次要执行 NVLS reduce/store 的 owner task 数量。
-
-done counter 的递增点必须晚于对应数据和任务发布：
-
-```text
-fa_done_count:
-    O_scratch store completion
-    + head_ready_count 更新完成
-    + 如果是最后一个 head，则 O_proj queue publish 完成
-    之后递增
-
-oproj_done_count:
-    super group 内所有 valid partial store completion
-    + 如果使用 TMA S2G store，则等待 bulk store completion
-    + alias proxy fence
-    + system-scope release fence
-    + ready_count_owner 更新完成
-    + 如果是 last-arriver，则 ar_ready_bits 投递完成
-    之后递增
-
-ar_done_count:
-    ar_ready_bits claim 成功（atomicAnd 清 ready bit）
-    + multimem.ld_reduce / multimem.st 完成
-    + ar_done_bits 首次置位成功
-    之后递增
-```
-
-每次 CTA 从一种 mode 切换到另一种 mode 前，必须保证：
-
-```text
-TMA copy 已完成
-WGMMA 已 wait 完
-当前 mode 使用的 mbarrier / pipeline stage 已收尾
-所有 warp 回到 CTA 内一致的同步点
-```
-
-这里的“收尾”是 drain，不是 reset。drain 表示当前 task 不再有正在飞行的 TMA/WGMMA，
-所有已经消费过的 pipeline stage 都完成了 release，后续 mode 可以安全覆盖 tensor shared
-memory。drain 不表示 SMEM mbarrier 对象回到 kernel 刚启动时的初始 phase。
-
-persistent kernel 内同一个 CTA 会在一个 kernel launch 中连续执行多个 task。mbarrier 位于
-SMEM，kernel start 初始化一次，后续 task 复用同一组 mbarrier。CuTe/CUTLASS 的
-`PipelineState` 是寄存器/SSA 中的软件游标，包含当前 circular stage 的 `index` 和
-`phase`；`PipelineTmaAsync` 的 wait/arrive 操作会用这个 `index/phase` 去操作 SMEM
-mbarrier。两者必须同步推进：
-
-```text
-PipelineState:
-    软件游标，存在寄存器/SSA 值里
-    make_pipeline_state 初始化
-    state.advance() 推进 index，绕回 stage 0 时翻转 phase
-
-SMEM mbarrier:
-    硬件同步对象，存在 shared memory 里
-    PipelineTmaAsync.create 初始化
-    producer_acquire / consumer_wait / consumer_release 推进内部 phase/arrival 状态
-```
-
-因此不能在每个 FA 或 O_proj task 内重新 `make_pipeline_state`，除非同时重新初始化对应
-SMEM mbarrier。重新创建 `PipelineState` 只会把软件游标恢复到初始 `index/phase`，不会重置
-mbarrier 内部状态；下一次 `wait(state.index, state.phase)` 可能等待错误的 phase 并导致
-hang。当前设计采用长寿命 pipeline state：
-
-```text
-kernel start:
-    初始化 FA mbarrier、O_proj mbarrier
-    创建 PipelineTmaAsync 对象
-
-dispatch loop 外:
-    创建每个 mode 的 PipelineState 软件游标
-
-每个 task:
-    使用传入的 PipelineState
-    payload 内正常 acquire/wait/release/advance
-    task 结束时 drain，但不重建 state，也不重置 mbarrier
-```
-
-每个 CTA 至少需要下列长寿命 state。它们不放 SMEM，也不放 global memory；它们是 kernel
-局部变量，在 dispatch loop 外创建，在 payload 内推进：
-
-```text
-FA K pipeline:
-    fa_k_prod  # WG0 下一次写 K stage 的 producer state
-    fa_k_cons  # WG1/WG2 下一次读 K stage 的 consumer state
-
-FA V pipeline:
-    fa_v_prod  # WG0 下一次写 V stage 的 producer state
-    fa_v_cons  # WG1/WG2 下一次读 V stage 的 consumer state
-
-O_proj A/Wo pipeline:
-    oproj_ab_prod  # WG0 下一次写 A/Wo shared stage 的 producer state
-    oproj_ab_cons  # WG1/WG2 下一次读 A/Wo shared stage 的 consumer state
-```
-
-伪代码结构：
-
-```python
-# kernel start: mbarrier / pipeline object 初始化一次
-pipeline_k  = PipelineTmaAsync.create(barrier_storage=mbar_k,  ...)
-pipeline_v  = PipelineTmaAsync.create(barrier_storage=mbar_v,  ...)
-pipeline_ab = PipelineTmaAsync.create(barrier_storage=mbar_ab, ...)
-
-# dispatch loop 外：长寿命软件游标
-fa_k_prod = make_pipeline_state(Producer, kv_stages)
-fa_v_prod = make_pipeline_state(Producer, kv_stages)
-fa_k_cons = make_pipeline_state(Consumer, kv_stages)
-fa_v_cons = make_pipeline_state(Consumer, kv_stages)
-
-oproj_ab_prod = make_pipeline_state(Producer, oproj_stages)
-oproj_ab_cons = make_pipeline_state(Consumer, oproj_stages)
-
-while not done:
-    mode, arg = schedule_and_broadcast()
-
-    if mode == FA:
-        run_fa_payload(..., pipeline_k, pipeline_v,
-                       fa_k_prod, fa_v_prod, fa_k_cons, fa_v_cons)
-
-    if mode == OPROJ:
-        run_oproj_payload(..., pipeline_ab, oproj_ab_prod, oproj_ab_cons)
-```
-
-## FA Mode Warp Specialization
-
-FA mode 使用 12 warps，也就是 3 个 warp group：
-
-```text
-WG0 = warp 0..3
-WG1 = warp 4..7
-WG2 = warp 8..11
-```
-
-分工（FA_M_TILE=128，两个 consumer WG 沿 M 维各吃 64 行）：
-
-```text
-WG0:
-    TMA load Q/K/V
-    管 Q pipeline、K pipeline、V pipeline
-    计算当前 task 的 Q/K/V 地址和 varlen metadata
-
-WG1:
-    QK WGMMA / causal mask / online softmax / PV WGMMA，处理 FA tile rows 0..63
-    维护自己 64 行的 row_max、row_sum、acc_O
-
-WG2:
-    同 WG1，但处理 FA tile rows 64..127
-```
-
-WG1/WG2 各自用一个 64 行 WGMMA atom（`atom_layout_mnk=(2,1,1)`，
-`tiler_mn=(64, N_TILE)`，对应 `tile_m=128`）。softmax 规约只在各自 owned 的 64 行内完成，
-两个 WG 之间不交换 row_max/row_sum，也不合并 acc_O。
-
-FA 主流程：
-
-```text
-取 FA task: (fa_row_key, head)        # fa_row_key = (batch_idx, fa_m_block)
-
-WG0:
-    load Q[fa_row_key, head]          # 128 行
-    按 causal 允许范围逐块 load K/V，K 和 V 使用独立 pipeline
-
-WG1 (rows 0..63), WG2 (rows 64..127):
-    使用当前 block 的 K 做 QK
-    使用上一 block 已生成的 P 和 V 做 PV
-    通过 intra-wg overlap 让 QK(current) 和 PV(previous) 重叠
-```
-
-### FA K/V pipeline 与 intra-wg overlap
-
-当前设计 FA mode 对齐 FA4 Hopper 的默认思路：Q 使用 1-stage pipeline，K 和 V 使用两个独立的
-2-stage pipeline。不要把 K/V 合成一个 `pipeline_kv`，因为 K 和 V 的生命周期不同：
-
-```text
-K block:
-    QK WGMMA 完成后就不再需要
-    可以尽早 release K stage
-
-V block:
-    必须等该 block 的 P 已经生成后，才能参与 PV WGMMA
-    release 比对应的 K stage 晚一个节拍
-```
-
-当前设计固定：
-
-```text
-pipeline_q : 1 stage
-pipeline_k : 2 stages
-pipeline_v : 2 stages
-mma_pv_is_rs = True     # P 作为 PV 的 register A operand，不写 sP
-```
-
-SMEM 概念布局：
-
-```text
-SharedStorage for FA mode
-
-+-------------------------------------------------------------+
-| mbar_ptr_Q : Q full/empty barrier, 1 stage                  |
-| mbar_ptr_K : K full/empty barrier, 2 stages                 |
-| mbar_ptr_V : V full/empty barrier, 2 stages                 |
-+-------------------------------------------------------------+
-| sQ : [FA_M_TILE=128, D, stage=1]                            |
-+-------------------------------------------------------------+
-| sK : [N_TILE, D, stage=2]                                   |
-|      +---------------------------+------------------------+ |
-|      | K.stage0                  | K.stage1               | |
-|      +---------------------------+------------------------+ |
-+-------------------------------------------------------------+
-| sV : [N_TILE, Dv, stage=2]                                  |
-|      +---------------------------+------------------------+ |
-|      | V.stage0                  | V.stage1               | |
-|      +---------------------------+------------------------+ |
-+-------------------------------------------------------------+
-```
-
-每个 stage 有两个同步语义：
-
-```text
-empty: producer 等它，表示该 stage 可以写
-full : consumer 等它，表示 TMA 已经写完，该 stage 可以读
-```
-
-`M=128` 时，WG1/WG2 都是 K/V pipeline 的 consumer。某个 stage 只有在 WG1 和 WG2
-都 release 后才真正 empty，producer 才能在下一 phase 复用这个 stage：
-
-```text
-WG1 release K.stage0
-WG2 release K.stage0
-    => K.stage0 empty，producer 可以加载下一块 K 到 K.stage0
-```
-
-以 4 个 KV block 为例，causal prefill 通常从右向左处理：
-
-```text
-B3, B2, B1, B0
-```
-
-2-stage 的 producer 写入顺序可以理解为：
-
-```text
-time ->
-
-K.stage0 <- K(B3)
-Q stage  <- Q tile
-
-K.stage1 <- K(B2)
-V.stage0 <- V(B3)
-
-K.stage0 <- K(B1)    # 复用 K.stage0，必须等 K(B3) 已被两个 WG release
-V.stage1 <- V(B2)
-
-K.stage1 <- K(B0)
-V.stage0 <- V(B1)    # 复用 V.stage0，必须等 PV(B3) 完成并被两个 WG release
-
-V.stage1 <- V(B0)
-```
-
-consumer 侧采用“当前 block 做 QK，上一个 block 做 PV”的软件流水。下例只展示右到左
-顺序和 K/V 生命周期；具体 `mask` / `no-mask` 判定由本节后面的 block boundary 公式决定：
-
-```text
-Step A: first_half(B3)
-    wait K.stage0 full
-    QK(B3) -> acc_S
-    release K.stage0
-    mask + online_softmax(acc_S)      # 最右侧 block，必须至少做 k_len residual mask
-    tOrP = P(B3)
-
-Step B: current=B2, previous=B3
-    wait K.stage1 full
-    issue QK(B2) -> acc_S
-
-    wait V.stage0 full
-    issue PV(B3): tOrP=P(B3) @ V(B3) -> acc_O
-
-    wait_group(1)       # 等较老的 QK(B2) 完成，允许 PV(B3) 继续飞
-    release K.stage1
-    mask/no-mask + online_softmax(acc_S)
-
-    wait_group(0)       # 等 PV(B3) 完成
-    release V.stage0
-    tOrP = P(B2)        # 覆盖旧 P(B3)，给下一轮 PV(B2) 用
-
-Step C: current=B1, previous=B2
-    QK(B1) overlaps PV(B2)；按 block boundary 判断是否需要 mask
-    end: tOrP = P(B1)
-
-Step D: current=B0, previous=B1
-    QK(B0) overlaps PV(B1)；通常位于左侧 no-mask 区间
-    end: tOrP = P(B0)
-
-Step E: last_half(B0)
-    wait V.stage1 full
-    PV(B0): tOrP=P(B0) @ V(B0) -> acc_O
-    release V.stage1
-```
-
-掩码分段与 FA4 `BlockInfo` / `AttentionMask` 语义一致。对一个 Q row tile：
-
-```text
-m_idx_min = fa_m_block * FA_M_TILE
-m_idx_max = (fa_m_block + 1) * FA_M_TILE
-offset    = k_len - q_len
-
-n_block_min = 0
-n_block_max = min(ceil_div(k_len, N_TILE),
-                  ceil_div(m_idx_max + offset, N_TILE))
-
-# 从该 block 开始到 n_block_max 之间的 blocks 可能需要 causal/local mask。
-# 纯 causal 下 local 为空，因此这里只有右侧 causal mask 区间。
-n_block_min_causal_mask = max(n_block_min,
-                              (m_idx_min + offset) // N_TILE)
-```
-
-右到左遍历时：
-
-```text
-n = n_block_max - 1:
-    必须做 residual mask，至少屏蔽 k_index >= k_len；
-    同时如果 n >= n_block_min_causal_mask，也做 causal mask。
-
-n_block_min_causal_mask <= n < n_block_max - 1:
-    做 causal mask，但通常不需要 k_len tail mask。
-
-n_block_min <= n < n_block_min_causal_mask:
-    整块位于 causal 边界左侧，走 no-mask 快路径。
-```
-
-元素级 mask 条件固定为：
-
-```text
-q_pos  = fa_m_block * FA_M_TILE + row
-kv_pos = n_block * N_TILE + col
-
-valid = (row < valid_m)
-     && (kv_pos < k_len)
-     && (kv_pos <= q_pos + (k_len - q_len))
-```
-
-`row < valid_m` 用于最后一个 Q tile 的 residual mask。full prompt 情况下
-`offset = 0`，且 `FA_M_TILE == N_TILE == 128`，上述公式退化为只有对角块需要
-causal mask、左侧块 no-mask 的原始路径。chunked/append prefill 下不能依赖这个退化性质；
-当 `offset` 不是 `N_TILE` 整数倍时，右侧可能有多个 block 需要 causal mask。
-
-这里 `P` 不在 K/V stage 中。QK 的 WGMMA 输出 `acc_S` 是当前 WG 的寄存器 accumulator；
-`online_softmax(acc_S)` 会把 scores 原地改写成未归一化概率 `P`，再通过
-`reshape_acc_to_frgA / cvt_f16` 变成 PV 的 register A operand `tOrP`。默认
-`mma_pv_is_rs=True`，因此当前设计不分配 `sP`。
-
-`wait_group(1)` 和 `wait_group(0)` 的含义必须严格区分：
-
-```text
-wait_group(1):
-    当前有 QK(current) 和 PV(previous) 两个 WGMMA group outstanding 时，
-    等到最多只剩 1 个 outstanding group。
-    因此可以安全使用 QK(current) 的 acc_S，但不能认为 PV(previous) 已完成。
-
-wait_group(0):
-    等所有 outstanding WGMMA 完成。
-    之后才能 release V(previous) stage，也才能覆盖 tOrP。
-```
-
-因此 FA mode 切换或 tail 阶段必须保证所有 K/V stage 都完成 wait/release，不能留下正在飞的
-WGMMA 或未 release 的 pipeline stage。
-
-FA 尾声：
-
-```text
-WG1/WG2:
-    finalize online softmax
-    对各自 64 行无条件执行 warp_reduction_sum(row_sum)        # 见下方 hazard 说明
-    valid 行 (mask_q_off + row < q_len): rescale acc_O = acc_O / row_sum
-    invalid 行 (>= valid_fa_m):           acc_O 置零
-    将各自 64 行 acc_O 整块写入 O_scratch[fa_row_tile_id, wg_row_base : wg_row_base+64, head, :]
-    (wg_row_base = 0 for WG1, 64 for WG2；无谓词整块 store，无效行已置零)
-
-一个 elected lane (两个 WG 都写完后):
-    等待 O_scratch store 真正完成
-    old = atomicAdd_acq_rel(head_ready_count[fa_row_tile_id], 1)
-    如果 old + 1 == H_local:
-        acquire 已完成所有 head 的 O_scratch 发布
-        reserve/write/publish 该 fa_row_tile_id 的 O_proj queue entries
-```
-
-无效行处理 hazard：`warp_reduction_sum` 是 warp 级 collective shuffle，**必须对每一行无条件
-调用**。如果按 `valid_fa_m` 把它放进发散分支，partial row tile（最后一块不满 128 行）会让
-warp 内 lane 发散、collective 等不齐而 hang。因此当前设计的做法是：reduce 无条件执行，无效行
-acc_O 置零后随有效行一起整块 store，不使用按行 store 谓词。
-
-这样发布给 O_proj 的 O_scratch 无效行恒为 0，与下游 O_proj 只写 `m < valid_m` 的 C_sym 谓词
-形成纵深防御：即使谓词回归，最坏也只是写出 0 而非上一层残留 / 未初始化的脏值（O_scratch 是
-跨 layer 复用的本地显存，不整体清零）。O_proj 是逐行独立 GEMM，输出行 m 只依赖 A 行 m，无效
-行不会污染有效行；置零进一步消除 NaN 在未来引入跨行 epilogue 时横向扩散的风险。
-
-这里的“尾声”分两部分：
-
-- 计算尾声由 WG1/WG2 完成，因为 accumulator 在 WGMMA warp group 的寄存器里。
-- 控制尾声由 elected lane 完成，负责 ready 计数和 O_proj queue 发布。
-
-### FA 到 O_proj 的内存序
-
-`head_ready_count[fa_row_tile_id]` 不只是普通计数器，也是 FA producer 和 O_proj task producer 之间的同步点。粒度是 128 行 FA/O_proj row tile：一个 FA tile 的全部 H_local heads 写完后，该 row tile 的 O_proj super group task 才能发布。它必须使用 device-scope release/acquire 语义的 atomic；不能把普通 `atomicAdd` 默认当作数据发布协议。
-
-每个 FA CTA 对一个 `(fa_row_key, head)` 完成后：
-
-```text
-1. 等待所有 WGMMA 完成。
-2. 完成 O_scratch[fa_row_tile_id, :, head, :] 写出（128 行，两个 WG 各 64）。
-3. 如果使用 TMA S2G store，必须 wait 到 TMA store completion。
-   注意：TMA 发起不等于 TMA 写完。
-4. 执行 atomicAdd_acq_rel(head_ready_count[fa_row_tile_id], 1)。
-```
-
-这里的 release 语义保证：
-
-```text
-O_scratch[fa_row_tile_id, :, head, :] 的写入
-    happens-before
-head_ready_count[fa_row_tile_id] 的递增被后续 acquire 观察到
-```
-
-最后一个 head 的 FA CTA 看到 `old + 1 == H_local` 时，它的 acq_rel atomic 同时承担两件事：
-
-```text
-release : 发布自己这个 head 的 O_scratch。
-acquire : 获取之前其他 head 对 O_scratch 的发布。
-```
-
-因此它可以安全地发布该 FA row tile 的 O_proj queue entries。O_proj consumer 通过 acquire 读取 `oproj_publish_tail` 后，再用 `consume_head` CAS 领取 queue entry，才能读取对应的 `O_scratch`。
-
-完整 happens-before 链路是：
-
-```text
-FA head 写 O_scratch
-    -> atomicAdd_acq_rel(head_ready_count)
-    -> 最后一个 head 观察到计数达到 H_local
-    -> 写 oproj_queue entries
-    -> release_store(oproj_publish_tail)
-    -> O_proj consumer acquire 看到 publish_tail
-    -> atomicCAS claim consume_head
-    -> 读取 queue entry，解码 slot_id
-    -> 读取 O_scratch 并执行 O_proj
-```
-
-## O_proj/AR Mode Warp Specialization
-
-O_proj/AR mode 同样使用 3 个 warp group：
-
-```text
-WG0 = warp 0..3
-WG1 = warp 4..7
-WG2 = warp 8..11
-```
-
-采用 TensorRT-LLM SM90 GemmAllReduce 风格：
-
-```text
-WG0:
-    producer warp group
-    TMA load O_scratch 和 W_o
-    管多 stage pipeline
-
-WG1/WG2:
-    consumer warp group
-    共同负责同一个 out_n_tile 的不同行
-    WGMMA accumulate
-    store partial
-    完成自己负责的 64 行 partial store
-```
-
-关键约束：
-
-```text
-一个 out_n_tile 的 M 维由两个 consumer WG 分片：
-    WG1 -> rows 0..63
-    WG2 -> rows 64..127
-两个 WG 都执行完整 K_local loop，但各自只维护自己 64 行的 accumulator。
-```
-
-这样每个 output tile 的不同行 accumulator 始终归不同 warp group 所有；由于 M 行互不重叠，
-不需要跨 WG 做 accumulator 合并。
-
-O_proj task 内部以单个 `out_n_tile` 为一轮计算单位：
-
-```text
-WG1 -> out_n_tile_i, rows 0..63
-WG2 -> out_n_tile_i, rows 64..127
-```
-
-当前设计以 `n_super_group` 为 O_proj task 粒度：
-
-```text
-O_proj task         = (fa_row_tile_id, n_super_group)
-n_super_group       = 一组连续 out_n_tile
-super_group_n_tiles = 4
-```
-
-即一个 CTA 领取一个 `n_super_group`，并在 CTA 内按每轮一个 `out_n_tile` 推进：
-
-```text
-第 0 轮: WG1/WG2 -> 第 0 个 out_n_tile 的 rows 0..127
-第 1 轮: WG1/WG2 -> 第 1 个 out_n_tile 的 rows 0..127
-...
-```
-
-最后一个 row tile 如果 `valid_m <= 64`，WG2 的 store 全部被谓词屏蔽；如果
-`64 < valid_m < 128`，WG2 只写有效行。最后一个 hidden tile 如果 `valid_n < N_TILE`，
-WG1/WG2 都按 N 维谓词写出。
-
-## O_proj/AR Pipeline
-
-O_proj 的 K 维是：
-
-```text
-K_local = H_local * D
-```
-
-每个 consumer WG 对同一个 `out_n_tile` 的不同行执行完整 K loop：
-
-```text
-A = O_scratch[fa_row_tile_id, :, :, :]   # [128, H_local * D]
-
-for k_chunk in K_local:
-    A_chunk = view(A)[:, k_chunk]
-    B_chunk = W_o_local[k_chunk, out_n_tile]
-    WG1: acc_Y_rows_0_63    += A_chunk[0:64, :] @ B_chunk
-    WG2: acc_Y_rows_64_127  += A_chunk[64:128, :] @ B_chunk
-```
-
-WG0 负责向 shared memory stage 搬运数据。A/B stage 对两个 consumer WG 共享：
-
-```text
-sA[num_stages]   # [OPROJ_M_TILE, K_CHUNK] = [128, K_CHUNK]
-sB[num_stages]   # [K_CHUNK, N_TILE]
-```
-
-每个 stage 有一个 full/empty 状态。`empty` 必须等 WG1/WG2 都完成该 stage 的 WGMMA
-并且不再读取该 stage 后才能 release：
-
-```text
-full[stage]
-empty[stage]
-consumer_done_mask[stage]  # bit0 = WG1 done, bit1 = WG2 done
-```
-
-流程：
-
-```text
-WG0:
-    wait empty[stage]
-    TMA load A_chunk + B_chunk
-    release full[stage]
-
-WG1:
-    wait full[stage]
-    issue WGMMA accumulate rows 0..63
-    wait_group，确认本 WG 对该 stage 的 WGMMA 已经不再读取 sA/sB
-    mark consumer_done_mask[stage].WG1
-    如果 WG1/WG2 都 done:
-        release empty[stage]
-
-WG2:
-    wait full[stage]
-    issue WGMMA accumulate rows 64..127
-    wait_group，确认本 WG 对该 stage 的 WGMMA 已经不再读取 sA/sB
-    mark consumer_done_mask[stage].WG2
-    如果 WG1/WG2 都 done:
-        release empty[stage]
-```
-
-WG1/WG2 可以在同一 stage 上并行 issue WGMMA，但 stage 复用必须等待两个 WG 都完成。
-当前设计采用保守 release 规则：**不能在 WGMMA issue 后立刻 release empty**。某个 WG
-只有在 `wgmma.wait_group` 确认该 stage 对应的 WGMMA 已完成、不会再读 `sA/sB` 后，
-才能设置自己的 done bit。最后一个设置 done bit 的 WG 才 release `empty[stage]`。
-
-当前策略采用保守且容易验证的 release 方式：
-
-```text
-每处理一个 k_chunk:
-    wait full[stage]
-    issue WGMMA
-    wait_group(0)
-    mark consumer_done_mask
-    两个 WG 都 done 后 release empty[stage]
-```
-
-这个策略牺牲一部分 O_proj 内部 overlap，但 release 点清晰，不会发生 producer 复用 stage
-覆盖仍被 WGMMA 读取的 shared memory。功能跑通后再优化为多 stage outstanding：
-只在 stage 即将被复用前 wait 到该 stage 相关 WGMMA 完成。
-
-整个 `n_super_group` 的 local partial 写完后，CTA 再对该 `ar_slot_id` 发布一次 owner ready 信号。
-
-## Shared Memory 预算
-
-H200 基于 Hopper 架构。当前设计按 SM90/Hopper 的 shared memory 上限估算：
-
-```text
-per SM shared memory capacity       ~= 228 KB
-per thread block usable upper bound ~= 227 KB
-```
-
-设计上不能把 FA mode 和 O_proj/AR mode 的 shared storage 简单相加。一个 CTA 同一时刻只处于一种 mode，并且 mode 切换前要求 TMA/WGMMA/pipeline 全部收尾，因此 shared storage 必须按 union/overlay 复用：
-
-```text
-shared_storage = max(FA_mode_smem, O_proj_AR_mode_smem)
-                 + mbarrier / padding / alignment overhead
-```
-
-overlay 只用于 tensor payload buffer，不用于 mbarrier。mbarrier 是 pipeline 的同步对象，
-有独立 phase/arrival 状态，必须按 pipeline 类型单独分配并在 kernel start 初始化一次。
-FA mode 的 K/V mbarrier 和 O_proj mode 的 A/Wo mbarrier 不能互相覆盖。tensor shared
-memory 则可以覆盖，因为任一 CTA 同一时刻只执行一种 mode，且 mode 切换前要求当前 mode
-完全 drain。
-
-当前设计 shared storage 采用如下概念结构：
-
-```text
-SharedStorage
-
-+-------------------------------------------------------------+
-| mode broadcast / CTA-local small scalars                    |
-+-------------------------------------------------------------+
-| FA mbarriers                                                |
-|   mbar_k : K pipeline full/empty barriers                   |
-|   mbar_v : V pipeline full/empty barriers                   |
-|   mbar_q : Q pipeline full/empty barriers                     |
-+-------------------------------------------------------------+
-| O_proj mbarriers                                            |
-|   mbar_ab : shared A/Wo pipeline full/empty barriers         |
-+-------------------------------------------------------------+
-| tensor_overlay : MemRange[dtype, max(FA_tensor, OPROJ_tensor)] |
-|   同一块字节在不同 mode 下按不同 layout 和 offset 解释        |
-+-------------------------------------------------------------+
-```
-
-FA mode 进入时，`tensor_overlay` 被解释为：
-
-```text
-FA tensor view:
-    sQ = overlay[off_fa_sQ : off_fa_sQ + cosize(sQ_layout)]
-    sK = overlay[off_fa_sK : off_fa_sK + cosize(sK_layout)]
-    sV = overlay[off_fa_sV : off_fa_sV + cosize(sV_layout)]
-
-FA_tensor = aligned_cosize(sQ_layout)
-          + aligned_cosize(sK_layout)
-          + aligned_cosize(sV_layout)
-```
-
-O_proj mode 进入时，同一个 `tensor_overlay` 被解释为：
-
-```text
-O_proj tensor view:
-    sA  = overlay[off_op_sA  : off_op_sA  + cosize(sA_layout)]
-    sWo = overlay[off_op_sWo : off_op_sWo + cosize(sWo_layout)]
-
-OPROJ_tensor = aligned_cosize(sA_layout)
-             + aligned_cosize(sWo_layout)
-```
-
-最终分配：
-
-```text
-tensor_overlay_cosize = max(FA_tensor, OPROJ_tensor)
-```
-
-CuTe DSL 中没有 C/C++ union 语法，但 FA4 Hopper 已经使用过同类 reinterpret 思路：
-`Q_in_regs=True` 时只分配一块 `MemRange[max(cosize(sQ), cosize(sV))]`，然后同一个
-storage 字段既可以用 `sQ_layout` 取 `sQ` view，也可以用 `sV_layout` 取 `sV` view。
-本设计在此基础上多一步：同一个大 `tensor_overlay` 内部按 offset carving 出多段，再分别
-用 FA 或 O_proj 的 layout 取 tensor view。实现时必须以 `cute.cosize(layout)` 和 alignment
-后的 offset 为准，不能只按手算 KB 数硬编码。
-
-当前设计目标：
-
-```text
-hard limit      : <= 227 KB / CTA
-engineering goal: <= 200 KB / CTA
-reserve         : 20~30 KB 给 mbarrier、padding、layout alignment、编译器额外开销
-```
-
-### FA mode 粗估
-
-下面是当前设计 FA mode 的默认 shared memory 假设。这个估算是 logical tensor size，
-真实实现还要以 CuTe `cute.cosize(layout)`、mbarrier 数组、alignment padding 为准：
-
-```text
-FA_M_TILE    = 128
-N_TILE       = 128
-D            = 128
-Dv           = 128
-dtype        = fp16/bf16
-kv_stages    = 2
-Q_in_regs    = False       # sQ 单独分配，不和 sV overlay
-mma_pv_is_rs = True        # P/tOrP 在寄存器中，不分配 sP
-```
-
-当前设计采用 FA4 Hopper 风格的独立 K/V pipeline：
-
-```text
-pipeline_q : 1 stage
-pipeline_k : kv_stages
-pipeline_v : kv_stages
-```
-
-默认 2-stage K/V pipeline 下：
-
-```text
-sQ = FA_M_TILE * D  * 2 bytes             = 128 * 128 * 2 = 32 KB
-sK = 2 * N_TILE * D  * 2 bytes            = 2 * 128 * 128 * 2 = 64 KB
-sV = 2 * N_TILE * Dv * 2 bytes            = 2 * 128 * 128 * 2 = 64 KB
-sP = 0                                    # mma_pv_is_rs=True
-----------------------------------------------------------------
-FA tensor smem lower bound                                  = 160 KB
-```
-
-如果 `Dv != D`，`sV` 必须按 `Dv` 单独估算：
-
-```text
-sV = kv_stages * N_TILE * Dv * sizeof(dtype)
-```
-
-如果关闭 register-source PV，也就是 `mma_pv_is_rs=False`，需要额外分配 `sP`：
-
-```text
-sP = FA_M_TILE * N_TILE * 2 bytes = 128 * 128 * 2 = 32 KB
-
-2-stage FA tensor smem lower bound:
-    sQ + sK + sV + sP = 32 + 64 + 64 + 32 = 192 KB
-```
-
-192 KB 还没超过硬上限，但留给 O_scratch store staging、mbarrier、padding、调试余量的空间明显变小。
-当前设计因此固定 `mma_pv_is_rs=True`，让 P 作为寄存器 `tOrP` 直接进入 PV WGMMA。
-
-如果 K/V pipeline 取 3-stage，并保持 `mma_pv_is_rs=True`：
-
-```text
-sQ = 32 KB
-sK = 3 * 128 * 128 * 2 = 96 KB
-sV = 3 * 128 * 128 * 2 = 96 KB
-sP = 0
------------------------------------------
-FA tensor smem lower bound = 224 KB
-```
-
-224 KB 已经贴近 227 KB/block 上限，实际加上 mbarrier 和 alignment 后基本不可作为当前设计路径。
-如果 3-stage 同时 `mma_pv_is_rs=False`，还要再加 32 KB `sP`，直接不可行。
-
-官方 FA4 Hopper 还支持 `Q_in_regs=True` 时让 `sQ/sV` 共享一块 storage（取两者最大值），
-但当前 persistent fused kernel 不把这个作为默认路径。原因是本设计还要处理 FA/O_proj/AR
-mode overlay 和 mode 切换收尾，默认使用更直观的独立 `sQ/sK/sV` 布局便于验证。
-
-因此 FA shared memory 结论是：
-
-```text
-默认路径:
-    2-stage K/V pipeline
-    mma_pv_is_rs=True
-    Q_in_regs=False
-    D=Dv=128
-    FA tensor smem lower bound ~= 160 KB
-
-工程判断:
-    2-stage FA 是当前设计唯一默认配置。
-    3-stage FA 不作为默认路径。
-    启用 sP 或 Q_in_regs 需要重新计算 shared storage overlay 和 occupancy。
-```
-
-### O_proj/AR mode 粗估
-
-当前设计 O_proj 使用共享 A/B stage。WG1/WG2 读取同一个 `sA/sB` stage，
-分别计算同一个 `out_n_tile` 的上下两个 64 行半块：
-
-```text
-sA[num_stages]   # [OPROJ_M_TILE, K_CHUNK]
-sB[num_stages]   # [K_CHUNK, N_TILE]
-```
-
-按 `OPROJ_M_TILE=128, N_TILE=128, dtype=fp16/bf16`，当前设计默认：
-
-```text
-K_CHUNK = 64
-num_stages = 4
-```
-
-则：
-
-```text
-A per stage = 128 * 64  * 2 = 16 KB
-B per stage = 64  * 128 * 2 = 16 KB
-per stage                        = 32 KB
-four stages                      = 128 KB
-```
-
-这个配置让 O_proj mode 的 tensor smem 低于 FA mode 的 160 KB，同时 stage 数量为
-producer/consumer overlap 留出空间。不要为了和 FA mode 完全等大而硬凑到 160 KB；
-剩余空间留给 mbarrier、alignment、调试和尾声 staging 更稳。
-
-其它备选配置：
-
-```text
-K_CHUNK=64,  stages=2:
-    tensor smem = 64 KB
-    正确性最简单，但 pipeline 余量偏小，不作为默认。
-
-K_CHUNK=128, stages=2:
-    A per stage = 128 * 128 * 2 = 32 KB
-    B per stage = 128 * 128 * 2 = 32 KB
-    tensor smem = 128 KB
-    smem 与默认相同，但 K 粒度更粗，调度和 tail 处理不如 K_CHUNK=64 细。
-
-K_CHUNK=128, stages=3:
-    tensor smem = 192 KB
-    已接近 FA 2-stage + overhead 的压力区，不作为默认路径。
-```
-
-因此当前设计 O_proj/AR mode 约束为：
-
-```text
-K_CHUNK    = 64
-num_stages = 4
-stage type = shared A/B stage
-estimated tensor smem ~= 128 KB
-```
-
-这样 O_proj/AR mode 的 shared memory 小于 2-stage FA mode，整个 kernel 的 shared memory
-主要由 FA mode 决定。stage 复用时必须等 WG1/WG2 都完成该 stage 的 WGMMA 读取后再 release empty。
-
-## O_proj/AR 尾声
-
-O_proj compute 和 NVLS AllReduce 分成两个阶段：
-
-```text
-阶段 1: O_proj compute
-    计算 local partial
-    写入本 rank 的 symmetric partial buffer
-    递增 owner ready_count，last-arriver 投递 AR owner task
-
-阶段 2: AR owner reduce
-    只有 owner rank claim last-arriver 投递的 ready task
-    claim 到 task 后执行 multimem reduce/store
-    如果 ready_count 尚未到达 tp_size，则不会产生 owner task
-```
-
-### 跨 rank ready 方式
-
-当前设计采用 push-to-owner ready count。
-
-AR 的调度单位是 O_proj 的一个 super group：
-
-```text
-ar_tile    = (fa_row_tile_id, n_super_group)
-ar_slot_id = fa_row_tile_id * num_super_groups + n_super_group
-```
+## 9. AR Owner Readiness 与 Ready Bitset
 
-一个 `ar_tile` 覆盖该 super group 内的所有 `out_n_tile`。因此 ready count、
-ready bit、done bit 和 AR reduce/store 都以 `ar_slot_id` 为粒度，而不是以单个
-`out_n_tile` 为粒度。
+AR owner task 使用 ready bitset。不要把它和 O_proj ready queue 混淆。
 
-owner rank 和 owner-local 槽位使用确定性映射，不使用 hash 表：
+O_proj task 完成后，`slot_id` 同时作为 AR slot：
 
 ```text
+ar_slot_id = slot_id
 owner_rank = ar_slot_id % tp_size
 owner_idx  = ar_slot_id / tp_size
-
-ar_slot_id = owner_idx * tp_size + owner_rank
 ```
 
-每个 rank 只分配自己 owner 的控制状态。workspace 按 bucket 最大 O_proj task
-数分配 owner-local 槽位；每次 launch 只扫描 active prefix，尾部无效槽位不参与调度
-（清理在 kernel exit 全清 capacity，见 Workspace 生命周期）：
+每个 rank 对同一个 `ar_slot_id` 写完本 rank partial 后，向 owner rank 的
+`ready_count_owner[owner_idx]` 加一。最后一个到达的 rank 设置 owner-local ready bit：
 
 ```text
-max_owner_slots_bucket = ceil_div(max_total_oproj_tasks_bucket, tp_size)
-max_owner_words_bucket = ceil_div(max_owner_slots_bucket, 64)
-
-owner_slots_active = ceil_div(total_oproj_tasks_active, tp_size)
-owner_words_active = ceil_div(owner_slots_active, 64)
-local_owned_ar_tasks_active =
-    ceil_div(max(total_oproj_tasks_active - my_rank, 0), tp_size)
-
-ready_count_owner[max_owner_slots_bucket]  # uint32
-ar_ready_bits[max_owner_words_bucket]      # uint64 bitset
-ar_done_bits[max_owner_words_bucket]       # uint64 bitset
-ar_scan_cursor                             # uint32 word cursor，取值范围 [0, owner_words_active)
-```
-
-这里的 `owner_rank.ready_count_owner` 和 `owner_rank.ar_ready_bits` 表示通过 symmetric/control
-workspace 的 rank 映射得到的目标 rank 控制地址。跨 rank 写入使用 system-scope 原子语义；
-owner rank 本地 claim 远端发布的 ready bit 时也使用 system-scope acquire/acq_rel 语义。
-
-每个 rank 只写自己的 partial：
-
-```text
-O_proj CTA:
-    对 super group 内每个 valid out_n_tile:
-        consumer WG 将 acc_Y 写入 symmetric partial buffer
-    wait super group 内所有 partial store 完成
-    如果使用 TMA S2G store，则 cp_async_bulk_wait_group(0, read=False)
-    cute.arch.fence_proxy("alias")
-    system-scope release fence
-
+publish_ar_ready(ar_slot_id):
     owner_rank = ar_slot_id % tp_size
     owner_idx  = ar_slot_id / tp_size
 
-    old = atomicAdd_acq_rel_system(owner_rank.ready_count_owner[owner_idx], 1)
+    old = atomicAdd_acq_rel(owner.ready_count_owner[owner_idx], 1)
 
     if old + 1 == tp_size:
-        word_id = owner_idx / 64
-        bit     = 1 << (owner_idx % 64)
-        atomicOr_release_system(owner_rank.ar_ready_bits[word_id], bit)
+        word = owner_idx / 64
+        bit  = 1 << (owner_idx % 64)
+        atomicOr_release(owner.ar_ready_bits[word], bit)
 ```
 
-也就是说，ready count 的粒度是 `ar_slot_id = (fa_row_tile_id, n_super_group)`，不是单个 `out_n_tile`。一个 rank 对同一个 `ar_slot_id` 只加一次 ready count；只有这个 super group 内所有 `valid_n_tiles` 都已经写入 symmetric partial buffer 后，才能参与 ready count。
-
-`ar_ready_bits` 只由最后一个完成 partial 的 rank 设置。`old + 1 < tp_size` 的 rank
-只递增 ready count，不投递 owner task；`old + 1 == tp_size` 的 rank 负责把该
-`ar_slot_id` 发布到 owner rank 的 AR work source。`ar_ready_bits` 中的 bit 只表示
-“已经 ready，可以直接 reduce/store”。未 ready 的 `ar_slot_id` 不进入 AR work source。
-
-例如 `tp_size = 8`：
+`ready_count_owner` 的粒度是 `(row_tile_id, n_super_group)`，不是单个 `out_n_tile`。
+一个 rank 只有在该 super group 内所有 `valid_n_tiles` partial 都写入 `C_sym` 后，才能加
+ready count。`ready_count_owner` 不是普通进度计数器，它也是 O_proj partial 对 AR owner
+可见的发布点。发布顺序必须是：
 
 ```text
-global ar_slot_id:
-
-  0   1   2   3   4   5   6   7   8   9  10  11 ...
-  |   |   |   |   |   |   |   |   |   |   |   |
-  v   v   v   v   v   v   v   v   v   v   v   v
- R0  R1  R2  R3  R4  R5  R6  R7  R0  R1  R2  R3 ...
-
-owner-local slot:
-
- R0: idx 0 -> ar 0,   idx 1 -> ar 8,   idx 2 -> ar 16 ...
- R1: idx 0 -> ar 1,   idx 1 -> ar 9,   idx 2 -> ar 17 ...
- R2: idx 0 -> ar 2,   idx 1 -> ar 10,  idx 2 -> ar 18 ...
+1. super group 内所有 valid partial store 写入 C_sym。
+2. 等待 store 对后续跨 rank multicast 读取可见。
+   当前代码使用普通 global store + device fence；如果改成 TMA S2G store，
+   必须先等待 bulk store completion，再做 alias proxy fence。
+3. 对 owner_rank.ready_count_owner[owner_idx] 做 acq_rel atomicAdd。
+4. last-arriver 再 release 设置 owner_rank.ar_ready_bits[word]。
 ```
 
-以 `ar_slot_id = 10` 为例：
+跨 rank路径使用 system-scope peer atomic；最后一个 rank 的 acq_rel `atomicAdd` 同时发布
+自己的 partial，并 acquire 之前其它 rank 通过 ready count 发布的 partial。owner rank
+acquire claim 到 ready bit 后，才能执行 `multimem.ld_reduce`。
+
+owner CTA 领取 AR task：
 
 ```text
-owner_rank = 10 % 8 = R2
-owner_idx  = 10 / 8 = 1
-
-R0 partial done ----\
-R1 partial done -----\
-R2 partial done ------> R2.ready_count_owner[1]
-R3 partial done -----/
-R4 partial done ----/
-R5 partial done ---/
-R6 partial done --/
-R7 partial done -/
-
-R2.ready_count_owner[1]: 0 -> 1 -> ... -> 8
-last-arriver: set R2.ar_ready_bits[idx=1]
-```
-
-注意，ready count 不是 relaxed 计数器。它表示 partial 已经可以被跨 rank 的 multicast view 读取，
-因此 producer 必须在 partial store 完成后执行 alias proxy fence，再用 system-scope acq_rel
-语义递增 ready count。如果 partial 通过 TMA S2G 写入 symmetric buffer，TMA 发起不等于写完，
-必须先等待 bulk store completion，再执行 `cute.arch.fence_proxy("alias")` 和 release atomic。
-最后一个 rank 的 `atomicAdd_acq_rel_system` 同时承担两件事：
-
-```text
-release : 发布自己这个 rank 的 partial。
-acquire : 获取之前其它 rank 通过 ready_count 发布的 partial。
-```
-
-最后一个 rank 随后用 `atomicOr_release_system(owner_rank.ar_ready_bits, bit)` 发布 AR
-owner task。owner rank acquire claim 到该 bit 后，就能安全执行 `multimem.ld_reduce`。
-
-### 非阻塞 AR owner reduce task
-
-每个 O_proj task 完成 local partial 后，都会递增 owner rank 上的
-`ready_count_owner[owner_idx]`。只有最后一个让 ready count 达到 `tp_size` 的 rank，
-才把该 tile 加入 owner rank 的 AR owner work source。
-
-```text
-ready_count_owner[max_owner_slots_bucket]
-ar_ready_bits[max_owner_words_bucket]
-ar_done_bits[max_owner_words_bucket]
-ar_scan_cursor
-```
-
-`ar_ready_bits` 里的 bit 出现时，该 owner-local slot 已经 ready。当前设计
-`owner_words_active` 很小（典型 ≤ 8，hidden=16384 时也只 ~32），因此 claim
-直接全扫描 owner-local active bitset：从共享
-cursor 起步，找到最低置位的 bit 并用 atomicAnd 清掉——**清成功即认领成功**。done bit 不在
-claim 内设置，而是在 reduce/store 完成之后再设：
-
-```text
-try_claim_ar_owner_task():
-    start = atomic_load_relaxed(ar_scan_cursor)
-    if start >= owner_words_active:
-        start = 0
-
-    for i in 0 .. owner_words_active - 1:           # 全扫描 active words；owner_words_active 很小
+try_claim_ar():
+    start = C_AR_CURSOR
+    for i in 0 .. owner_words_active - 1:
         word_id = (start + i) % owner_words_active
         word = acquire_load(ar_ready_bits[word_id])
         if word == 0:
             continue
 
-        bit       = word & (-word)                  # 最低置位 bit
-        bit_index = trailing_zeros(word)
+        bit = lowest_set_bit(word)
         owner_idx = word_id * 64 + bit_index
-        old_ready = atomicAnd_acq_rel(ar_ready_bits[word_id], ~bit)
+        old = atomicAnd_acq_rel(ar_ready_bits[word_id], ~bit)
 
-        if old_ready & bit == 0:                     # 别人先清掉了，没抢到
-            continue
-        if owner_idx >= local_owned_ar_tasks_active: # 尾部无效 slot：已清，跳过，不认领不计数
-            continue
-
-        atomic_store_relaxed(ar_scan_cursor, word_id)   # 停在命中 word，下轮优先消费同 word 余 bit
-        ar_slot_id = owner_idx * tp_size + my_rank
-        return FOUND(ar_slot_id)
-
-    return EMPTY                                     # 全扫描已覆盖所有 word，空时不动 cursor
+        if old & bit:
+            if owner_idx < local_owned_ar_tasks_active:
+                ar_slot_id = owner_idx * tp_size + rank
+                C_AR_CURSOR = word_id
+                return FOUND(ar_slot_id)
+            else:
+                # tail-invalid bit: cleared and skipped
+                continue
 ```
 
-认领成功后进入 AR owner reduce mode，**先 reduce/store，完成后再设 done bit 计数**：
+清掉 ready bit 就是完成 owner task 认领。Exactly-once reduce 由 `ar_ready_bits` 上的
+`atomicAnd` 保证。`ar_done_bits` 不用于 claim，它只保护 done count：
 
 ```text
 run_ar_owner(ar_slot_id):
-    执行 multimem.ld_reduce + multimem.st          # 在 C_sym multicast view 上 in-place reduce
-    等待 final store 完成
-    owner_idx = ar_slot_id / tp_size
-    word_id   = owner_idx / 64
-    bit       = 1 << (owner_idx % 64)
-    old_done  = atomicOr_acq_rel(ar_done_bits[word_id], bit)
+    执行 NVLS reduce/store
+    old_done = atomicOr_acq_rel(ar_done_bits[word], bit)
     if old_done & bit == 0:
-        atomicAdd(ar_done_count, 1)
+        atomicAdd_release(C_AR_DONE, 1)
 ```
 
-`ar_scan_cursor` 只是 owner rank 内多个 CTA 共享的扫描 hint，不参与 correctness。多个 CTA 可以
-relaxed 读写它；reduce 的 exactly-once 由 `ar_ready_bits` 的 atomicAnd claim 独占保证，
-`ar_done_bits` 只负责让 `ar_done_count` 对同一 slot 只 +1 一次。
+`ar_done_bits` / `C_AR_DONE` 的语义是 reduce 已经落地，不是 task 已认领。
 
-当前设计不使用有界探测（`max_probe_words` + active/drain 区分）。引入它的唯一动机是
-`owner_words_active` 很大时避免 CTA 长时间空扫，但当前设计 `owner_words_active`
-≤ ~32，一次全扫描只是几十次 acquire load，
-远小于一次 mode 切换的 overlay drain；而且全扫描消除了「ready bit 已置但本轮探测窗口扫不到」
-造成的认领延迟——AR 是决定 kernel 退出的末级 task，认领延迟会直接拖长尾部。
-当前路径不使用有界探测。
+`C_AR_CURSOR` 只是扫描 hint，不参与 correctness。当前实现每次从 cursor 开始全扫描
+`owner_words_active` 个 active words，不使用 bounded probing，也不区分 active/drain
+扫描窗口。这样 owner words 很小时逻辑更直接：只要 ready bit 已经置位，本轮全扫描一定有机会
+claim 到；空扫成本只是几十次 acquire load。
 
-把 done bit 推迟到 reduce 完成之后是有意为之：`ar_done_bits`/`ar_done_count` 的语义因此是
-「reduce 已真正落地」而非「已认领」。kernel 退出条件
-`ar_done_count == local_owned_ar_tasks_active` 严格对应所有 multimem reduce/store
-都已完成，而不是认领完成。reduce 唯一性由 ready bit claim 保证，因此 done bit
-在 reduce 期间暂为 0 不会引起重复 reduce。
+## 10. NVLS AllReduce
 
-时间线示例：
+`tp_size == 1` 时，AR 是 identity path。`C_sym` 中的 O_proj partial 已经是 final，
+kernel 仍走 AR done 记账，保持调度终止协议一致。
+
+`tp_size > 1` 时，owner rank 在 `C_sym` multicast view 上执行 in-place reduce/store：
 
 ```text
-tp_size = 8, ar_slot_id = 10, owner_rank = R2, owner_idx = 1
-
-time ->
-rank2: partial done, ready_count 0->1, not last, no ready bit
-rank0: partial done, ready_count 1->2, not last, no ready bit
-...
-rank7: partial done, ready_count 7->8, last, set R2.ar_ready_bits[idx=1]
-
-owner rank2:
-    scan ar_ready_bits from ar_scan_cursor
-    claim ready bit idx=1
-    decode ar_slot_id = 1 * 8 + 2 = 10
-    set ar_done_bits
-    multimem.ld_reduce + multimem.st
-    ar_done_count++
+for sg_tile in valid_n_tiles:
+    out_n_tile = base_out_n_tile + sg_tile
+    for m in 0 .. 127:
+        for n in 0 .. N_TILE step 8:
+            y = multimem.ld_reduce.add(C_sym_mc[row_tile_id, m, out_n_tile, n:n+8])
+            multimem.st(C_sym_mc[row_tile_id, m, out_n_tile, n:n+8], y)
 ```
 
-这样 persistent worker 不会因为跨 rank 等待而长期卡住，也不会周期性检查未 ready 的 tile。跨 rank 等待只体现在 ready count 尚未到达 `tp_size` 时没有 AR owner task 被投递。
+所有 rank 的 symmetric allocation 使用相同 physical offset。owner 的 `multimem.ld_reduce`
+读取所有 rank 对应 offset 的 partial 并求和，再 `multimem.st` 写回同一 offset。
 
-### NVLS AllReduce 执行方式
-
-采用 in-place symmetric buffer 的思路。FA 的 attention 输出 `O_scratch` 写到本 rank
-普通本地显存，不放在 symmetric buffer 中；O_proj 的 local partial 写入 symmetric
-buffer，然后 owner 直接在这块 symmetric buffer 的 multicast view 上做 AllReduce。
-
-```text
-FA O:
-    O_scratch_local，普通本地显存，形状约为 [total_q_tokens, H_local * D]
-
-O_proj partial / final:
-    C_sym，symmetric buffer，按 FA row tile 和 output N tile 分块存储
-
-AR:
-    multimem.ld_reduce 从 C_sym_mc 读取 partial 并求和
-    multimem.st 将 final Y 写回 C_sym_mc 的同一 offset
-```
-
-当前设计把 symmetric partial buffer 和 final activation buffer 的物理布局固定为同一块
-in-place buffer。`C_sym` 的真实物理维度按 tile padding 后分配：
-
-```text
-C_sym[fa_row_tile_id, m, out_n_tile, n]
-    fa_row_tile_id : 0 .. num_fa_row_tiles - 1
-    m              : 0 .. OPROJ_M_TILE - 1
-    out_n_tile     : 0 .. num_out_n_tiles - 1
-    n              : 0 .. N_TILE - 1
-
-num_out_n_tiles = ceil_div(hidden, N_TILE)
-num_super_groups = ceil_div(num_out_n_tiles, super_group_n_tiles)
-```
-
-O_proj/AR task identity 仍使用 `ar_slot_id`，但它只用于调度和 ready count，不单独作为
-activation buffer 的主物理维度：
-
-```text
-ar_slot_id = fa_row_tile_id * num_super_groups + n_super_group
-out_n_tile = n_super_group * super_group_n_tiles + sg_tile
-```
-
-因此某个 super group 内第 `sg_tile` 个 output tile 的 element 地址由
-`(fa_row_tile_id, m, out_n_tile, n)` 唯一确定。每个 TP rank 在自己的 symmetric
-allocation 中按这个相同 offset 写本 rank partial。owner rank 使用该 symmetric allocation
-的 multicast view `C_sym_mc` 对同一 offset 做 `multimem.ld_reduce.add`，再通过
-`multimem.st` 写回同一 offset。写回后，同一块 `C_sym` 上该位置的语义从 local partial
-变成最终 activation，下一层可以直接把这块 symmetric allocation 作为输入。
-
-因为 final store 覆盖的是本 tile 的 partial 位置，所以同一个 `ar_slot_id` 必须只有一个
-owner 执行 reduce/store；owner 在写回前要先完成该元素的 `multimem.ld_reduce`。当前设计不把
-partial 和 final 分成两块 buffer，否则 activation workspace 会翻倍。
-
-O_proj partial store 和最终语义消费必须带谓词：
+AR reduce/store 覆盖 `valid_n_tiles` 内的完整物理 tile，包括 padding rows/cols。padding
+不属于语义输出。最终输出和 reference compare 只读取：
 
 ```text
 m < valid_m
-sg_tile < valid_n_tiles
 n < valid_n(out_n_tile)
 ```
 
-AR reduce/store 的执行范围是 `sg_tile < valid_n_tiles` 内的物理 tile：
+## 11. Persistent Scheduler
+
+每个 CTA 是一个 persistent worker。CTA leader 领取任务，然后把 `(mode, arg)` 通过
+shared memory broadcast 给整个 CTA：
 
 ```text
-m = 0 .. OPROJ_M_TILE - 1
-n = 0 .. N_TILE - 1
+MODE_FA
+MODE_OPROJ
+MODE_AR
+MODE_DONE
 ```
 
-因此无效 `m/n` padding 元素不要求清零，也不要求保持跨层稳定。由于 `C_sym`
-跨层复用且不整块清零，padding 区可能被 AR in-place reduce/store 反复写回；这些值
-允许是上一层残留、跨 rank reduce 后的值、Inf 或 NaN。它们不属于语义输出，任何
-consumer、debug dump 和 reference compare 都必须按 `valid_m/valid_n` 忽略 padding。
-
-owner rank 对 `ar_tile` 的 `valid_n_tiles` 个物理 output tile 执行 reduce/store。
-同一个 `ar_slot_id` 只有一个 owner；
-owner 使用 `ar_slot_id % tp_size` 在 rank 间轮转：
+三类 work source：
 
 ```text
-owner_rank = ar_slot_id % tp_size
-owner_idx  = ar_slot_id / tp_size
+FA:
+    source = C_FA_COUNTER
+    arg = fa_task_id
+
+O_proj:
+    source = O_proj ready queue
+    arg = slot_id
+
+AR:
+    source = ar_ready_bits
+    arg = ar_slot_id
 ```
 
-对 owner rank：
+role 只决定 probe order，不是静态分区：
 
 ```text
-for sg_tile in 0 .. valid_n_tiles - 1:
-    out_n_tile = base_out_n_tile + sg_tile
-
-    for m in 0 .. OPROJ_M_TILE - 1:
-        for chunk_n in 0 .. N_TILE - 1 step 8:
-            y = multimem.ld_reduce.add(C_sym_mc[fa_row_tile_id, m, out_n_tile, chunk_n : chunk_n + 8])
-            multimem.st(C_sym_mc[fa_row_tile_id, m, out_n_tile, chunk_n : chunk_n + 8], y)
+role 0: FA -> O_proj -> AR
+role 1: O_proj -> AR -> FA
+role 2: AR -> FA -> O_proj
 ```
 
-图示：
+role 来自 `bidx % (w_fa + w_oproj + w_ar)`。所有 role 都会 fallback 到其它 work source，
+所以某类 task 暂时为空不会让 CTA 固定闲置。
+
+done 条件：
 
 ```text
-              symmetric partials for valid elements of ar_tile T
-
-              rank0       rank1       rank2       rank3
-elem e:       p0     +    p1     +    p2     +    p3
-                \          |          |          /
-                 \         |          |         /
-                  multimem.ld_reduce.add by owner
-                              |
-                              v
-                    y = p0 + p1 + p2 + p3
-                              |
-                              v
-                    multimem.st multicast final Y[e]
+C_FA_DONE >= num_fa_tasks_active
+C_OP_DONE >= total_oproj_tasks_active
+C_AR_DONE >= local_owned_ar_tasks_active
 ```
 
-本文要求：
+`actv` 是 per-launch active counts，layout 与 `row_desc.active_counts()` 保持一致：
 
 ```text
-同一个 ar_tile 的所有 rank partial 写完并通过 owner ready_count 发布后，
-last-arriver 设置 owner rank 的 ar_ready_bits。
-owner rank claim ar_ready_bits 成功后，才能进行 multimem reduce/store。
+actv[0] = num_fa_tasks_active
+actv[1] = total_oproj_tasks_active
+actv[2] = num_row_tiles_active
+actv[3] = owner_slots_active
+actv[4] = owner_words_active
+actv[5] = local_owned_ar_tasks_active
 ```
 
-## Workspace 生命周期与全局同步
-
-TP rank 之间使用一块长期复用的 symmetric/control workspace。多层 Transformer 中不为每层重新分配 symmetric buffer；同一块 workspace 会被每层的 fused FA + O_proj + AR kernel 复用。
-
-### Workspace 容量估算
-
-当前设计 workspace 按下面的语义划分：
+active count 公式：
 
 ```text
-O_scratch_local:
-    普通本地显存，非 symmetric buffer。
-    保存 FA 输出，供本 rank 的 O_proj 读取。
-
-C_sym:
-    symmetric buffer。
-    先保存本 rank 的 O_proj partial。
-    owner reduce 后，final Y in-place 写回同一 tile-padded offset。
-
-control workspace:
-    symmetric/control 状态，包括 ready_count、bitset、queue counter、barrier 等。
-```
-
-设：
-
-```text
-T_q      = total Q tokens = sum_b seqlen_q[b]
-T_k      = total K/V tokens = sum_b seqlen_k[b]
-hidden   = 全局 hidden size
-tp       = tensor parallel size
-dtype    = fp16/bf16 = 2 bytes
-R        = OPROJ_M_TILE = 128
-N        = N_TILE
-row_tiles = num_fa_row_tiles = sum_b ceil(seqlen_q[b] / R)
-n_tiles   = num_out_n_tiles  = ceil_div(hidden, N)
-```
-
-则主 activation workspace 容量按 Q 输出的物理 tile padding 估算。`T_k` 只影响 FA
-读取 K/V 的工作量和 mask/block range，不直接扩大 `O_scratch_local` 或 `C_sym`：
-
-```text
-O_scratch_local:
-    row_tiles * R * (hidden / tp) * 2 bytes
-
-C_sym partial/final in-place:
-    row_tiles * R * n_tiles * N * 2 bytes
-
-总 activation workspace / rank:
-    row_tiles * R * (hidden / tp) * 2
-  + row_tiles * R * n_tiles * N * 2
-```
-
-如果把 O_proj partial 和 final Y 分成两块 symmetric buffer，则需要：
-
-```text
-O_scratch_local + C_partial_sym + Y_final_sym
-    = row_tiles * R * (hidden / tp) * 2
-    + 2 * row_tiles * R * n_tiles * N * 2
-```
-
-这会让 symmetric activation workspace 翻倍，当前设计不采用。
-
-典型容量估算。若所有 Q sequence 长度刚好对齐 128，且 `hidden` 对齐 `N_TILE`，则
-`row_tiles * R == T_q`、`n_tiles * N == hidden`，会退化成常见的近似公式：
-
-```text
-T_q=64k, hidden=4096, tp=4:
-    O_scratch_local = 64k * 1024 * 2 = 128 MiB
-    C_sym in-place  = 64k * 4096 * 2 = 512 MiB
-    activation workspace ~= 640 MiB / rank
-
-    如果 partial/final 分开:
-        128 + 512 + 512 = 1152 MiB / rank
-```
-
-只看 `C_sym` in-place 的大小：
-
-```text
-T_q=16k, hidden=4096   -> 128 MiB / rank
-T_q=32k, hidden=4096   -> 256 MiB / rank
-T_q=64k, hidden=4096   -> 512 MiB / rank
-
-T_q=64k, hidden=8192   -> 1024 MiB / rank
-T_q=64k, hidden=16384  -> 2048 MiB / rank
-```
-
-如果 varlen batch 中最后一个 FA row tile 不满 128 行，或 hidden 不是 `N_TILE` 的整数倍，
-实际分配应按上面的 tile-padded 公式计算，而不是按 `T * hidden` 的逻辑有效元素数计算。
-无效 `m/n` 元素不要求清零，但它们占用 symmetric buffer 地址空间。O_proj partial store
-用 `valid_m/valid_n` 谓词只写有效元素；AR reduce/store 覆盖 `valid_n_tiles` 内完整物理
-tile（含 padding），不带 `valid_m/valid_n` 谓词；最终输出消费和 reference 校验按
-`valid_m/valid_n` 忽略 padding。
-
-control workspace 相比 activation buffer 小很多。以 `T_q=64k, ROW_M_TILE=128,
-hidden=4096, super_group_n_tiles=4` 为例：
-
-```text
-max_num_row_tiles_bucket = 512
-num_out_n_tiles  = 32
-num_super_groups = 8
-max_total_oproj_tasks_bucket = 4096
-max_owner_slots_bucket = ceil_div(max_total_oproj_tasks_bucket, tp_size) = 512   # tp_size=8
-max_owner_words_bucket = ceil_div(max_owner_slots_bucket, 64) = 8
-
-head_ready_count[max_num_row_tiles_bucket] ~= 2 KB   # int32
-oproj_queue[max_total_oproj_tasks_bucket] ~= 16 KB  # uint32
-ready_count_owner[max_owner_slots_bucket] ~= 2 KB   # uint32, owner-local
-ar_ready_bits/ar_done_bits                ~= 128 B  # uint64 bitsets, owner-local
-其它 counter/barrier                     ~= KB 级
-```
-
-因此当前设计主要容量压力来自 activation workspace，而不是 control state。`O_scratch`
-放普通本地显存、`C_sym` partial/final in-place 复用，是当前设计下最省空间且协议清晰的方案。
-
-### Workspace 预分配与 kernel exit 定向清理
-
-面向 sglang 集成时，workspace 必须按 TP group 和最大 bucket shape 长期持有，
-不能在每一层重新分配 symmetric buffer，也不能依赖 host 在每次 launch 前对 control
-state 做 `zero_()`。测试和 benchmark 也必须走同样的 workspace 生命周期，否则会验证到
-“host reset 后运行”的假路径。
-
-当前设计把 per-layer control state 的清理放在 **kernel exit**（`local_done` 之后、
-跨 rank exit barrier 之前），而不是 kernel start。这样每层只需要一次跨 rank
-`nvl_barrier`：本层的 exit barrier 同时承担「发布本层已结束」和「发布下一层可启动」
-两个职责，下一层 kernel 不再需要独立的 init barrier。清理被藏进 early-finish rank
-在 exit barrier 上等待 straggler 的时间窗口里。首层 launch 不依赖前驱 exit 清理，
-由 workspace create 的一次性 full zero + 跨 rank barrier 兜底。
-
-host/runtime 侧提供面向 sglang 集成的正式 workspace API。它不是通用 attention
-public API，而是 fused FA + O_proj + NVLS AR kernel 的运行时资源管理契约：
-
-```python
-workspace = FusedFaOprojArWorkspace.create(
-    group=tp_group,
-    max_num_row_tiles=...,
-    max_total_oproj_tasks=...,
-    hidden=...,
-    H_local=...,
-    D=...,
-    N_TILE=...,
-    super_group_n_tiles=4,
-    dtype=torch.bfloat16,
-)
-
-launch_fused_fa_oproj_ar(
-    ...,
-    workspace=workspace,
-    num_row_tiles_active=...,
-    num_fa_tasks_active=...,
-    total_oproj_tasks_active=...,
-    owner_slots_active=...,
-    owner_words_active=...,
-    local_owned_ar_tasks_active=...,
-)
-```
-
-这个 workspace API 的职责和 MegaMoE 的 `get_symm_buffer_for_mega_moe(...)` 类似，但它是
-sglang 端到端部署路径的一部分：
-
-- 按最大 bucket shape 分配 `O_scratch_local`、`C_sym` 和 control arrays。
-- 对 `C_sym`、`ready_count_owner`、`ar_ready_bits` 和 `nvl_barrier_signal[2]`
-  等 symmetric allocation 做 `torch.distributed._symmetric_memory.empty` 和
-  `rendezvous`。
-- 分别保存 `C_sym` multicast pointer、`nvl_barrier_signal` local pointer 和每个 rank
-  的 `nvl_barrier_signal` peer pointer（`nvl_barrier` 用逐 peer `red_add to dst_rank`，
-  见后文 nvl_barrier 节）、每个 rank 的 `ready_count_owner` / `ar_ready_bits` peer pointer。
-- workspace 创建时完成一次初始化清零和跨 rank rendezvous；create 末尾必须做一次
-  `torch.cuda.synchronize()` + 跨 rank barrier，保证所有 rank 的 full zero 都已在
-  GPU 上执行完且跨 rank 可见，这样首层 scheduler 的远端写不会早于目标 rank 的清零。
-  后续每层 launch 不再 host reset。
-- 提供只用于故障定位的 `debug_zero_all()`；生产路径、benchmark 默认路径和 sglang
-  集成路径不得调用它。
-
-workspace allocation 使用最大容量，kernel launch 使用本次 active 范围：
-
-```text
-allocation capacity:
-    max_num_row_tiles
-    max_total_oproj_tasks
-    max_owner_slots = ceil_div(max_total_oproj_tasks, tp_size)
-    max_owner_words = ceil_div(max_owner_slots, 64)
-
-per-launch active range:
-    num_row_tiles_active
-    total_oproj_tasks_active
-    owner_slots_active = ceil_div(total_oproj_tasks_active, tp_size)
-    owner_words_active = ceil_div(owner_slots_active, 64)
-    local_owned_ar_tasks_active = ceil_div(max(total_oproj_tasks_active - rank, 0), tp_size)
-```
-
-kernel exit cleaner 清理 **整块 capacity**，不是 active prefix。control state 只有
-KB 量级（`head_ready_count`、`ready_count_owner`、bitset 加起来通常 ≤ 十几 KB），由所有
-persistent CTA 分摊清零几乎免费；而全清 capacity 使下一层任意 active range（包括比本层
-更大的 batch）都能直接启动 scheduler，不需要按下一层 active 范围再清一次，也就不需要
-kernel-start init barrier。`active range` 仍然只用于调度（done 目标、AR claim 扫描上界、
-owner-local 尾部过滤），不再用于决定清理范围。
-
-workspace 逻辑上分成两类状态：
-
-```text
-长期 barrier 状态:
-    sync_ctrl_local（rank-local 普通 allocation）:
-        grid_sync_count[]
-        nvl_barrier_counter
-
-    sync_ctrl_symm（symmetric allocation）:
-        nvl_barrier_signal[2]
-
-每次 kernel/layer 的 control 状态（kernel exit cleaner 全清 capacity）:
-    fa_task_counter
-    fa_done_count
-    head_ready_count[max_num_row_tiles]        # exit 全清 [0:max_num_row_tiles]
-
-    oproj_reserve_tail
-    oproj_publish_tail
-    oproj_consume_head
-    oproj_done_count
-
-    ready_count_owner[max_owner_slots]         # exit 全清 [0:max_owner_slots]，owner-local ready count
-    ar_ready_bits[max_owner_words]             # exit 全清 [0:max_owner_words]，owner-local ready bitset
-    ar_done_bits[max_owner_words]              # exit 全清 [0:max_owner_words]，owner-local terminal protection
-    ar_scan_cursor
-    ar_done_count
-```
-
-workspace 不携带任何 per-task 执行计数 / exactly-once 观测数组。task 完成性只由
-`fa_done_count`、`oproj_done_count`、`ar_done_count` 三个聚合计数表达；exactly-once
-由各 work source 的认领协议（FA atomic counter、O_proj queue CAS、AR ready bit
-atomicAnd claim）本身保证，不需要 per-task exec buffer。这样 workspace 复用时不会因为
-debug 数组而引入额外的清理范围或被误当成生产协议输入。
-
-barrier 状态按 barrier 类型使用固定复用协议，不依赖每次清零：
-
-```text
-grid_sync_count[]:
-    rank-local grid barrier counter。
-    使用 FINISH_TAG = 0x80000000 的 high-bit phase 翻转协议。
-
-nvl_barrier_counter / nvl_barrier_signal[2]:
-    跨 TP rank 的 NVLink barrier state。
-    nvl_barrier_counter 位于 rank-local sync_ctrl_local。
-    nvl_barrier_signal[2] 位于 symmetric sync_ctrl_symm。
-    使用 counter 低两位解码出的 phase/sign 协议：
-        phase = counter & 1
-        sign  = (counter >> 1) & 1
-    phase 在 nvl_barrier_signal[0/1] 之间切换。
-    sign 决定本轮把 signal 加到 tp_size 还是减回 0。
-```
-
-当前设计把 control workspace 固定拆成两个独立对象：
-
-```text
-task_ctrl:
-    每层 active control state。
-    kernel exit cleaner 只清 task_ctrl 和 per-layer control arrays（全清 capacity）。
-
-sync_ctrl:
-    长期 barrier state。
-    由 sync_ctrl_local 和 sync_ctrl_symm 两块 allocation 组成：
-        sync_ctrl_local: grid_sync_count[]、nvl_barrier_counter。
-        sync_ctrl_symm : nvl_barrier_signal[2]。
-    不进入 kernel exit cleaner 的清理范围。
-```
-
-kernel signature 和 host workspace helper 必须显式区分 `task_ctrl` 与 `sync_ctrl`。
-不能把二者混在同一个可被 cleaner 按范围清零的数组里，否则长期复用时可能误清
-`grid_sync_count[]`、`nvl_barrier_counter` 或 `nvl_barrier_signal[2]`，破坏对应的
-phase 复用协议。`sync_ctrl_local` 不能用 symmetric allocation 代替；`sync_ctrl_symm`
-只保存跨 rank signal 槽位。
-
-每层 kernel exit 必须把 per-layer control 状态全清 capacity 成 0：
-
-```text
-task_ctrl scalar:
-    fa_task_counter
-    fa_done_count
-    oproj_reserve_tail
-    oproj_publish_tail
-    oproj_consume_head
-    oproj_done_count
-    ar_scan_cursor
-    ar_done_count
-
-arrays:
-    head_ready_count[0 : max_num_row_tiles]
-    ready_count_owner[0 : max_owner_slots]
-    ar_ready_bits[0 : max_owner_words]
-    ar_done_bits[0 : max_owner_words]
-```
-
-以下状态不做 per-layer memset：
-
-```text
-O_scratch_local:
-    FA 覆盖本层有效 (row_tile, head, m, d)。
-    O_proj 只能在 head_ready_count 达到 H_local 后读取对应 row tile。
-
-C_sym:
-    O_proj partial 覆盖本层有效 (row_tile, m, out_n_tile, n)。
-    owner AR 对 valid_n_tiles 内的物理 tile 做 in-place reduce/store。
-    padding 区允许保留或累积任意值，语义路径必须按 valid_m / valid_n 忽略 padding。
-    C_sym 不整块清零，否则会把 activation workspace 成本放进每层关键路径。
-
-oproj_queue entries:
-    不清 entry 本身，只清 reserve/publish/consume counters。
-    producer 在 release publish 前覆盖 entry；consumer 只读 [consume_head, publish_tail)。
-
-row_desc / cu_seqlens / batch_idx / m_block:
-    由本次 batch metadata 覆盖或按 active 范围读取。
-
-Q/K/V, W_o, TMA descriptor, pointer table:
-    不属于跨层 workspace stale state。
-```
-
-kernel exit 清理由所有 persistent CTA 分摊，而不是用一个 CTA 串行 memset。清理范围是
-整块 capacity（不依赖 active counts）：
-
-```text
-global_tid = cta_idx * block_threads + thread_idx
-stride     = num_persistent_ctas * block_threads
-
-for i in range(global_tid, max_num_row_tiles, stride):
-    head_ready_count[i] = 0
-
-for i in range(global_tid, max_owner_slots, stride):
-    ready_count_owner[i] = 0
-
-for i in range(global_tid, max_owner_words, stride):
-    ar_ready_bits[i] = 0
-    ar_done_bits[i] = 0
-
-if cta_idx == 0:
-    thread 0..N 分摊清 task_ctrl scalar
-```
-
-清理时机和并发安全：清理发生在 `local_done` 之后。`local_done` 意味着本 rank 的
-`ar_done_count == local_owned_ar_tasks_active`，即本 rank owner 的所有 AR tile 都已
-reduce 完；而每个 owned tile 被 reduce 的前提是它的 `ready_count_owner` 已经到达
-`tp_size`，也就是**所有 rank 对本 rank owner control 的当前层远端写都已经发生过**。
-因此清理本 rank 的 `ready_count_owner`/`ar_ready_bits` 时没有在途远端写。仍在跑的
-straggler rank 只可能在处理它自己 owner 或其它 rank owner 的 tile，不会再写本 rank
-owner control；而且它还没越过本层 exit barrier，不可能进入下一层。
-
-清理前必须先做一次 local `grid_sync`：保证本 rank 所有 CTA 都已退出 scheduler、不再
-读写 `task_ctrl`，之后清零 `task_ctrl` 才安全。清理使用普通 global store 即可，不需要
-atomic；清理 store 之后再做一次 local `grid_sync`，把本 rank 的清理完成发布给 CTA0，
-随后由 CTA0 在跨 rank `nvl_barrier` 中以 system-scope release 发布给其它 rank。
-
-每层 kernel 的生命周期（每层只有一次跨 rank barrier）：
-
-```text
-1. kernel start:
-    无 start cleaner，无 init barrier。
-    上一层 exit 已清好本 rank control 并跨 rank 同步；首层由 workspace create 兜底。
-    CTA 直接进入 persistent task loop。
-
-2. persistent task loop:
-    FA task
-    O_proj ready queue task
-    AR owner reduce task
-
-3. local_done:
-    fa_done_count    == num_fa_tasks_active
-    oproj_done_count == total_oproj_tasks_active
-    ar_done_count    == local_owned_ar_tasks_active
-
-4. kernel exit:
-    local grid_sync                    # 所有 CTA 退出 scheduler，不再用 task_ctrl
-    所有 CTA 并行清理本 rank full-capacity control state   # 藏进 straggler 等待窗口
-    local grid_sync                    # 本 rank 清理完成、对 CTA0 可见
-    nvl_barrier(exit_clean)            # 所有 rank 完成旧工作 + 清理；= 下一层的 init
-    return
-```
-
-`nvl_barrier(exit_clean)` 同时保证两件事，因此可以取代下一层的 init barrier：
-
-```text
-1. 所有 rank 都完成本层 owner AR（不再读其它 rank 的 C_sym partial），
-   下一层覆盖 C_sym 不会与未完成的远端 reduce 冲突。
-2. 所有 rank 都完成本层 full-capacity 清理，下一层任意 active range 的远端写
-   都落在已清零的 control 上，不会与清理竞争。
-```
-
-barrier 之后只有 `return`，所以 `nvl_barrier(exit_clean)` 不需要 trailing local
-grid_sync：跨层顺序由 kernel launch 边界（下一层 kernel 必须等本层所有 CTA 含 CTA0
-返回）保证，而 CTA0 返回必然晚于它在 barrier 上等到所有 rank 到达。
-
-首层没有前驱 exit 清理：workspace create 已对全部 capacity 做 full zero，并在 create
-末尾用一次 `cuda.synchronize()` + 跨 rank barrier 保证该清零跨 rank 完成可见。因此首层
-可以直接启动 scheduler，其远端写不会早于目标 rank 的清零。
-
-当前设计的清理入口唯一，就是 kernel exit cleaner。kernel 不引入独立 `MODE_CLEAN` 或
-尾部 cleanup scheduler，也不依赖任何 in-flight 自清理（AR ready bit 在 owner claim 时
-被 atomic_and 清掉，这是 claim 协议的一部分，不作为跨层清理机制）。下一层 launch 的
-correctness boundary 就是上一层的 exit cleaner + exit barrier。
-
-`local_owned_ar_tasks_active` 是本 rank 作为 owner 的有效 AR tile 数量。它作为
-`ar_done_count` 的完成目标，也用于过滤 owner-local 尾部无效槽位：
-
-```text
-local_owned_ar_tasks_active =
-    ceil_div(max(total_oproj_tasks_active - my_rank, 0), tp_size)
-
+total_oproj_tasks_active = num_row_tiles_active * num_super_groups
 owner_slots_active = ceil_div(total_oproj_tasks_active, tp_size)
 owner_words_active = ceil_div(owner_slots_active, 64)
+local_owned_ar_tasks_active =
+    ceil_div(max(total_oproj_tasks_active - rank, 0), tp_size)
 ```
 
-`ready_count_owner`、`ar_ready_bits` 和 `ar_done_bits` 按 max owner-local 槽位分配。
-调度/认领只触及 active prefix（done 目标、claim 扫描上界、尾部过滤都用 active counts），
-而 exit cleaner 全清 capacity。
-远端 ready atomic 用 `owner_rank = ar_slot_id % tp_size` 定位目标 rank，用
-`owner_idx = ar_slot_id / tp_size` 定位目标 rank 上的槽位。owner rank claim ready bit 后，
-用 `ar_slot_id = owner_idx * tp_size + my_rank` 反解全局 AR task。
+kernel 按 bucket capacity 编译和分配 workspace，但调度、done 目标、AR claim 扫描上界
+都使用 active counts。
 
-每个 rank 都执行完整的本地 FA 和 O_proj partial，因此 `fa_done_count` 和
-`oproj_done_count` 都以本次 active task 数为完成目标；每个 rank 只 owner 一部分 AR
-tile，因此 `ar_done_count` 以 `local_owned_ar_tasks_active` 为完成目标。
-
-### local grid_sync
-
-`grid_sync` 是本 rank 内、本 kernel launch 内所有 persistent CTA 的 device-side barrier。它的计数器位于本 rank 的 workspace，只同步本 rank 的 CTA，不同步其它 rank。
-
-当前设计 exit 路径有两个 kernel-level grid sync 点，固定使用两个 grid sync counter：
+done counter 的递增点固定如下：
 
 ```text
-kQuiesceGridSyncIndex = 0   # scheduler 退出后、清理前，确保无 CTA 再用 task_ctrl
-kCleanDoneGridSyncIndex = 1 # 清理后、跨 rank signal 前，发布清理给 CTA0
+C_FA_DONE:
+    O_scratch store 完成
+    + head_ready 更新完成
+    + 如果是最后一个 head，则 O_proj queue publish 完成
+    之后递增。
+
+C_OP_DONE:
+    C_sym partial store 完成
+    + ready_count_owner 更新完成
+    + 如果是 last-arriver，则 ar_ready_bits 发布完成
+    之后递增。
+
+C_AR_DONE:
+    ar_ready_bits claim 成功
+    + NVLS reduce/store 完成
+    + ar_done_bits 首次置位成功
+    之后递增。
 ```
 
-两个 counter 不复用。虽然 `grid_sync` 自身通过最高位翻转表达 phase，但 quiesce 和
-clean-done 是不同 barrier 点，固定分开能避免长期 workspace 复用时不同 barrier 点之间的
-状态混淆。
+## 12. Warp Group 与 Pipeline
 
-`grid_sync` 的计数方式参考 Mega MoE：
+CTA 使用 384 threads，也就是 3 个 warp groups：
 
 ```text
-FINISH_TAG = 0x80000000
-
-sync_scope()
-
-if thread_idx == 0:
-    if cta_idx == 0:
-        old = atomicAdd_release(grid_sync_count,
-                                FINISH_TAG - (num_persistent_ctas - 1))
-    else:
-        old = atomicAdd_release(grid_sync_count, 1)
-
-    while ((load_acquire(grid_sync_count) ^ old) & FINISH_TAG) == 0:
-        wait
-
-sync_scope()
+WG0 = producer / TMA
+WG1 = consumer rows 0..63
+WG2 = consumer rows 64..127
 ```
 
-所有 persistent CTA 的 `thread_idx == 0` 都参与计数。最后一个到达者会让 `grid_sync_count` 的最高位翻转；所有 CTA 看到最高位相对自己的 `old` 发生变化，就说明本 rank 内所有 CTA 都到达了 barrier。
-
-这里的 `num_persistent_ctas` 必须等于实际参与 persistent kernel 的 CTA 数量。不能有 CTA 在其它 CTA 进入 `grid_sync` 前提前 return，否则会死锁。
-
-### nvl_barrier
-
-`nvl_barrier` 是跨 TP rank 的 device-side barrier。当前设计每层只调用它一次
-（kernel exit 的 `exit_clean`）。它的结构是：
+FA mode：
 
 ```text
-（caller 已先做 local grid_sync 把本 rank 清理发布给 CTA0）
-SM0 发跨 rank NVLink signal 并自旋等待所有 rank 到达
+pipeline_q: 1 stage
+pipeline_k: kv_stages
+pipeline_v: kv_stages
+
+sQ: [128, D, 1]
+sK: [128, D, kv_stages]
+sV: [128, D, kv_stages]
 ```
 
-`nvl_barrier(exit_clean)` 前面由 exit 路径的 local `grid_sync` 保证本 rank 所有 CTA
-都已完成清理（CTA0 因此能代表本 rank 发 signal）；它后面只有 `return`，所以不需要
-trailing local `grid_sync`——跨层顺序由 kernel launch 边界保证（下一层 kernel 等本层
-所有 CTA 含 CTA0 返回，而 CTA0 返回晚于它等到所有 rank 到达）。因为每层只有一次跨 rank
-barrier，`nvl_barrier_counter` 每层 +1（不再是 init/exit 各 +1 的每层 +2）。
+K 和 V 使用独立 pipeline，因为 K 在 QK 完成后即可 release，V 要等对应 P 生成并完成
+PV 后才能 release。PV 使用 register-source P，不分配 `sP`。
 
-跨 rank signal 只由本 rank 的 CTA/SM0 参与：
+FA consumer 的 release 规则：
 
 ```text
-if cta_idx == 0:
-    status = nvl_barrier_counter
-    phase  = status & 1
-    sign   = (status >> 1) & 1
+K stage:
+    QK WGMMA 完成并且不再读取该 K stage 后 release。
 
-    signal_ptr = nvl_barrier_signal[phase]
-    delta      = sign ? -1 : +1
-    target     = sign ? 0 : tp_size
-
-    if thread_idx < tp_size:
-        red_add_release_system(sym_map(signal_ptr, dst_rank=thread_idx), delta)
-
-    sync_scope()
-
-    if thread_idx == 0:
-        atomicAdd(nvl_barrier_counter, 1)
-        while load_acquire_system(signal_ptr) != target:
-            wait
+V stage:
+    对应 block 的 P 已生成，并且 PV WGMMA 完成后 release。
 ```
 
-每个 rank 的 CTA/SM0 都向所有 rank 的 `signal_ptr` 做一次 system-scope reduce add，包括写给自己。因此当本 rank 的 `signal_ptr` 达到 `target` 时，说明所有 TP ranks 都已经到达该次 barrier。
+当前 FA 右到左处理 K/V blocks，并用“当前 block 做 QK、上一 block 做 PV”的软件流水。
+`wait_group(1)` 只表示 outstanding WGMMA group 数降到最多 1 个，可安全使用刚完成的
+QK accumulator；它不表示上一轮 PV 已完成。`wait_group(0)` 才表示所有 outstanding WGMMA
+完成，之后才能 release V stage 或覆盖保存给 PV 的 `tOrP`。
 
-朴素方案只用一个 `signal`，第一轮从 `0` 加到 `tp_size`。它的问题是下一次 barrier 开始时 `signal` 已经等于 `tp_size`，会被误判为已经同步完成。
-
-加入 `sign` 后，可以在后续 barrier 中从 `tp_size` 减回 `0`，避免每次清零：
+O_proj mode：
 
 ```text
-sign = 0: delta = +1, target = tp_size
-sign = 1: delta = -1, target = 0
+pipeline_ab: oproj_stages
+
+sA : [128, K_CHUNK, oproj_stages]
+sWo: [K_CHUNK, N_TILE, oproj_stages]
 ```
 
-但只有 sign 仍然不够。假设某个 rank A 已经完成当前 barrier 并进入下一次 barrier，开始把同一个 signal 从 `tp_size` 减回去；另一个 rank B 虽然它本地 signal 已经到达 `tp_size`，但还没完成读取和退出当前 barrier。A 的下一轮减法可能让 B 错过 `tp_size`，造成死锁。
-
-因此还需要 `phase`，也就是两套 signal 槽位交替使用：
+O_proj stage 复用规则：
 
 ```text
-barrier 0: signal[0] 从 0       加到 tp_size
-barrier 1: signal[1] 从 0       加到 tp_size
-barrier 2: signal[0] 从 tp_size 减到 0
-barrier 3: signal[1] 从 tp_size 减到 0
+producer 只能在 empty stage 上写 sA/sWo。
+WG1/WG2 都会读取同一个 stage。
+某个 stage 只有在 WG1 和 WG2 对该 stage 的 WGMMA 都完成后才能 release empty。
 ```
 
-一个 rank 只有完成 barrier 1 后才可能进入 barrier 2；而完成 barrier 1 说明所有 rank 都已经进入并完成了 barrier 1，也就不会再有人停留在 barrier 0 等 `signal[0] == tp_size`。因此 `signal[0]` 可以安全地在 barrier 2 中复用。
+当前实现采用保守策略：每个 `K_CHUNK` 的 WGMMA issue 后等待完成，再 release 对应 stage。
+后续如果增加多 stage outstanding，仍必须保证 producer 复用 stage 前，所有会读取该 stage
+的 WGMMA 都已经完成。
 
-即使当前 kernel 每层只有一次跨 rank barrier（exit_clean），也采用 phase/sign 版本。这样 workspace 可以跨层复用，不依赖 host 每层清 barrier signal，也方便加入更多全局 barrier。
+Pipeline objects 和 PipelineState cursor 在 dispatch loop 外创建，并跨多个 task 长寿命复用。
+不能在每个 mode branch 内重新 `make_pipeline_state`，除非同时重新初始化对应 SMEM mbarrier。
 
-## 当前不做的事情
-
-当前验证完整 prompt prefill 与 Q rows 较多的 contiguous-KV chunked/append prefill，
-但不处理：
-
-- decode。
-- KV split。
-- paged KV。
-- 非连续 KV cache / page table 寻址。
-- partial O/LSE combine。
-- block sparsity。
-- pack_gqa 优化（标准 GQA 已支持，见“Q/K/V head 模型与 GQA”；这里仅排除把 group 维
-  折进 M 维、KV 整组复用的 pack_gqa 实现，该优化收益主要在 decode/短 query）。
-- 独立 comm warp group。
-- 跨 WG 合并同一行或同一元素的 accumulator。
-
-## 设计判断
-
-这个设计的核心取舍是：
+mode 切换前必须 drain 当前 mode：
 
 ```text
-FA 以 (fa_row_key, head) 为粒度，FA_M_TILE=128，WG1/WG2 沿 M 各吃 64 行，保留 head 维并行度。
-O_proj/AR 使用同一个 128 行 row tile，直接消费 FA 写出的 O_scratch。
-O_proj CTA task 以 (fa_row_tile_id, n_super_group) 为粒度；super group 内每个 out_n_tile 由 WG1/WG2 沿 M 分片共同完成。
-一个 persistent kernel 内，CTA 可以动态切换 FA mode 和 O_proj/AR mode。
+所有 TMA copy 已完成
+所有 WGMMA 已 wait 完
+已消费 stage 已 release
+CTA 内所有 warp 回到同步点
 ```
 
-它的主要优点：
+drain 不是 reset。mbarrier phase 和 PipelineState phase 会随着 task 持续推进。
 
-- 避免 attention 被多个 O_proj tile 重算。
-- 避免固定 FA CTA / O_proj CTA 比例带来的尾部空闲。
-- O_proj 和 AllReduce 可以在 row key ready 后尽早启动。
-- super group 把 O_proj task 和 AR ready atomic 数量降低到单个 out_n_tile 粒度的 `1 / super_group_n_tiles`。
-- O_proj ready queue 避免 consumer 轮询大量空 ready words，task identity 仍由 slot id 隐式解码。
-- O_proj compute 和 AR owner reduce 解耦，AR 未 ready 时不会投递 owner task，也不会阻塞 persistent worker。
-- AR owner 按 tile 轮转，避免每个 tile 使用 `tp_size * tp_size` ready 通知。
-- kernel exit cleaner + NVLink exit barrier（兼作下一层 init）允许 symmetric/control workspace 在多层 Transformer 中安全复用，每层只需一次跨 rank barrier。
-- DeepGEMM 风格的 device-side NVLink exit barrier 保证所有 rank 都完成本层 symmetric buffer 读写后才退出 kernel。
+## 13. Shared Memory 与 Register
 
-主要风险：
+FA tensor 和 O_proj tensor 共享一个 SMEM overlay。mbarrier 不 overlay。
 
-- 一个 kernel 内包含两套 mode，shared memory layout 和 pipeline 状态更复杂。
-- fused payload 必须以 runtime task descriptor 为准；FA 的
-  `q_start/k_len/valid_m/n_block_min/n_block_max` 和 O_proj 的
-  `slot_id/base_out_n_tile/valid_m/valid_n_tiles` 都是运行时值，不能把 task 级
-  `nblk` 当成 compile-time constant 并用 `range_constexpr(nblk)` 固化。
-- `q_len < k_len` 时不能使用完整 prompt 的 `nblk = fa_m_block + 1` 简化，也不能假设
-  只有最右侧一个 K block 需要 mask；必须按 FA4 `offset = k_len - q_len` 的 bottom-right
-  aligned causal 语义计算 block range 和 mask 分段。
-- FA mode 不能把 K/V 当作一个联合 stage 生命周期处理；当前设计必须验证独立 `pipeline_k`
-  和 `pipeline_v` 的 acquire/release 配对，以及 `tOrP` 寄存器覆盖时机。
-- CTA mode 切换前必须严格收尾所有异步操作。
-- O_proj/AR 的 owner ready_count、symmetric buffer、NVLS completion 协议必须独立验证。
-- O_proj ready queue 的 ordered publish 会引入短暂 head-of-line blocking，后 reserve 的 producer 即使先写完也必须等待前面的区间发布。
-- AR owner ready bitset 只由 last-arriver 投递；需要保证 ready_count acq_rel 链路和 ar_done_bits 终态保护正确，避免重复 reduce/store。
-- `grid_sync` 要求所有 persistent CTA 都参与；任何 CTA 提前 return 或错误进入 barrier 都会导致死锁。
-- workspace exit cleaner + exit barrier 必须覆盖所有会被远端 rank 读写的 control state，避免跨层复用时清零和远端写冲突；exit barrier 兼作下一层的 init 边界。
-- super group 过大时会降低 N 维并行度并推迟 AR 启动；当前设计不使用整行 CTA。
-- shared memory 必须按 mode overlay 复用；当前设计目标控制在 200 KB/CTA 内，优先采用 2-stage FA 和 `K_CHUNK=64, num_stages=4` 的 O_proj。
+当前代码的概念结构：
+
+```text
+SharedStorage:
+    bc[4]       # mode/arg broadcast
+    mbar_q
+    mbar_k
+    mbar_v
+    mbar_ab
+    overlay
+```
+
+FA mode 把 overlay 解释为：
+
+```text
+sQ, sK, sV
+```
+
+O_proj mode 把 overlay 解释为：
+
+```text
+sA, sWo
+```
+
+overlay 正确性的前提是同一个 CTA 同一时刻只执行一种 payload mode，且 mode 切换前完成
+drain。
+
+默认 smem 下界：
+
+```text
+FA:
+    sQ = 128 * 128 * 2 = 32 KB
+    sK = 2 * 128 * 128 * 2 = 64 KB
+    sV = 2 * 128 * 128 * 2 = 64 KB
+    total ~= 160 KB
+
+O_proj:
+    per stage = 128 * 64 * 2 + 64 * 128 * 2 = 32 KB
+    stages = 4
+    total ~= 128 KB
+```
+
+大 accumulator 和 fragment 必须放在 payload branch 内，且只在 consumer WG 创建。跨 task
+长寿命的只能是协议状态、pipeline 对象和 PipelineState cursor。
+
+## 14. Workspace 与生命周期
+
+control state 分两类：
+
+```text
+task_ctrl / per-layer control:
+    每层结束由 kernel exit cleaner 清零。
+
+sync_ctrl:
+    长寿命 barrier state。
+    不被 exit cleaner 清零。
+```
+
+`task_ctrl` scalar slots：
+
+```text
+C_FA_COUNTER
+C_FA_DONE
+C_OP_RESERVE
+C_OP_PUBLISH
+C_OP_CONSUME
+C_OP_DONE
+C_AR_DONE
+C_AR_CURSOR
+```
+
+per-layer arrays：
+
+```text
+head_ready[max_num_row_tiles]
+oproj_queue[max_total_oproj_tasks]
+ready_count_owner[max_owner_slots]
+ar_ready_bits[max_owner_words]
+ar_done_bits[max_owner_words]
+```
+
+`sync_ctrl` slots：
+
+```text
+S_GS_QUIESCE
+S_GS_CLEANDONE
+S_NVL_COUNTER
+```
+
+每层 kernel exit 流程：
+
+```text
+1. 所有 CTA 达到 local done。
+2. grid_sync(S_GS_QUIESCE)：
+       保证本 rank 没有 CTA 仍在读写 task_ctrl。
+3. 所有 CTA 并行清理 full capacity control state：
+       head_ready
+       ready_count_owner
+       ar_ready_bits
+       ar_done_bits
+       task_ctrl scalars
+4. grid_sync(S_GS_CLEANDONE)：
+       保证本 rank 清理对 CTA0 可见。
+5. tp_size > 1 时执行 nvl_barrier(exit_clean)：
+       所有 rank 都完成旧工作和清理。
+6. return。
+```
+
+exit cleaner 清 full capacity，不只清 active prefix。control state 很小，全清能保证下一层
+任意 active range 都可以直接启动，不需要 kernel-start cleaner 或 init barrier。
+
+以下状态不按层清零：
+
+```text
+O_scratch_local:
+    本层有效 row/head 会被 FA 覆盖。
+
+C_sym:
+    本层有效 partial/final 会被 O_proj/AR 覆盖。
+    padding 区允许任意值。
+
+oproj_queue entries:
+    entry 本身不清，只清 reserve/publish/consume counters。
+
+sync_ctrl:
+    使用 phase 复用协议，不能被 cleaner 清零。
+```
+
+activation workspace 按 tile-padded 物理容量分配：
+
+```text
+row_tiles = num_row_tiles_capacity
+num_out_n_tiles = ceil_div(hidden, N_TILE)
+
+O_scratch_local elements =
+    row_tiles * 128 * H_local * D
+
+C_sym elements =
+    row_tiles * 128 * num_out_n_tiles * N_TILE
+```
+
+`tot_k` 只影响 FA 读取 K/V 的范围和工作量，不扩大 `O_scratch_local` 或 `C_sym`。chunked
+prefill 下 `max_tot_k` 需要独立作为 K/V input buffer capacity 管理。
+
+paged-KV TMA-128 下，K/V input capacity 按 page 管理：
+
+```text
+K_cache/V_cache capacity =
+    max_num_pages * 128 * H_kv_local * D
+
+page_table capacity =
+    max_num_batch * max_num_pages_per_seq
+
+cache_seqlens capacity =
+    max_num_batch
+```
+
+Paged K/V cache、page table 和 cache seqlens 是 FA 输入 metadata，不改变
+`O_scratch_local`、`C_sym`、O_proj queue 或 AR owner control 的容量公式。
+
+control workspace 按 bucket capacity 分配：
+
+```text
+max_total_oproj_tasks = max_num_row_tiles * num_super_groups
+max_owner_slots = ceil_div(max_total_oproj_tasks, tp_size)
+max_owner_words = ceil_div(max_owner_slots, 64)
+```
+
+## 15. grid_sync 与 nvl_barrier
+
+`grid_sync` 是本 rank 内所有 persistent CTA 的 barrier。当前 exit path 使用两个独立
+counter：
+
+```text
+S_GS_QUIESCE
+S_GS_CLEANDONE
+```
+
+它采用 `FINISH_TAG = 0x80000000` 的 high-bit phase 翻转协议。所有 persistent CTA 都必须
+参与；任何 CTA 提前 return 都会死锁。
+
+`nvl_barrier` 是跨 TP rank 的 exit barrier，只在 `tp_size > 1` 时使用。它使用两槽
+signal 和 phase/sign 复用协议：
+
+```text
+phase = counter & 1
+sign  = (counter >> 1) & 1
+
+sign = 0: signal[phase] 从 0 加到 tp_size
+sign = 1: signal[phase] 从 tp_size 减到 0
+```
+
+两槽 signal 避免一个 rank 进入下一次 barrier 时修改另一个 rank 仍在等待的 signal。
+
+每层只有一次 cross-rank barrier：kernel exit 的 `exit_clean`。它同时承担下一层 init
+边界：
+
+```text
+所有 rank 的本层 AR 已完成
+所有 rank 的本层 control cleaner 已完成
+下一层可以复用 C_sym 和 control workspace
+```
+
+首层由 workspace create 的 full zero + rendezvous 兜底。
+
+跨 rank signal 由 CTA0 的前 `tp_size` 个线程逐 peer 执行 `+1` 或 `-1` system-scope
+atomic add，包括写给本 rank 自己。barrier 后面只有 `return`，不需要 trailing local
+`grid_sync`；下一层 kernel launch 边界会等待本层所有 CTA 返回。
+
+## 16. Host Wrapper 与 Launch Metadata
+
+host wrapper 可以提供统一入口，但底层 kernel variant 必须按 KV layout 在 JIT 编译期区分：
+
+```text
+contiguous_varlen:
+    K/V 使用 contiguous tensor。
+    使用 cu_seqlens_k。
+    mPageTable is None。
+
+paged_tma_varlen_128:
+    K/V 使用 K_cache/V_cache。
+    使用 page_table + cache_seqlens。
+    page_size constexpr == 128。
+    mPageTable is not None。
+```
+
+`mPageTable is None / is not None` 可以作为 CuTe/JIT compile-time specialization 条件，
+类似 FA4 的 Optional tensor 分支。未选分支必须被编译期消除；不能在同一个已编译 device
+kernel 里用 runtime `if page_table is None` 混跑两种 layout。
+
+contiguous-KV host 侧需要准备：
+
+```text
+row_desc:
+    batch_idx[row_tile_id]
+    m_block[row_tile_id]
+    cu_seqlens_q
+    cu_seqlens_k
+```
+
+paged-KV TMA-128 host 侧需要准备：
+
+```text
+row_desc:
+    batch_idx[row_tile_id]
+    m_block[row_tile_id]
+    cu_seqlens_q
+    cache_seqlens
+    page_table
+
+wrapper checks:
+    page_size == 128
+    page_table.dtype == int32
+    page_table.shape[0] == batch
+    page_table.shape[1] >= max_b ceil_div(cache_seqlens[b], 128)
+    K_cache/V_cache shape == [num_pages, 128, H_kv_local, D]
+```
+
+两种 KV layout 共用 task counts：
+
+```text
+task counts:
+    num_fa_tasks = num_row_tiles * H_local
+    num_out_n_tiles = ceil_div(hidden, N_TILE)
+    num_super_groups = ceil_div(num_out_n_tiles, super_group_n_tiles)
+    total_oproj_tasks = num_row_tiles * num_super_groups
+
+active counts:
+    active_counts(num_row_tiles, H_local, num_super_groups, tp_size, rank)
+```
+
+workspace capacity 按 bucket 最大 shape 分配；每次 launch 通过 `actv` 给 kernel 当前 active
+范围。`FusedFaOprojAr.__init__` 中的 `num_row_tiles`、`total_oproj`、owner slots/words
+是 capacity / compile-time sizing；`actv` 是 runtime active range。
+
+runtime workspace 契约由 `src/mega_attention/runtime/workspace.py` 实现。它不是通用
+attention API，而是 fused kernel 的长期资源对象：
+
+```text
+create:
+    按 bucket capacity 分配 Q/K/V、O_scratch、C_sym 和 control arrays。
+    paged variant 用 K_cache/V_cache/page_table/cache_seqlens 替代 contiguous K/V capacity。
+    tp_size > 1 时对 C_sym、ready_count_owner、ar_ready_bits、nvl signal 做 symmetric
+    allocation + rendezvous。
+    首层前完成 full zero、cuda synchronize 和跨 rank barrier。
+
+compile:
+    在 bucket capacity 上编译一次，并把 multicast / peer pointers bake 进 kernel。
+
+set_layer:
+    只填 active prefix、row_desc metadata 和 actv。
+    不做 host reset。
+
+launch:
+    直接启动 kernel。跨层 control 清理由上一层 kernel exit cleaner 保证。
+```
+
+`debug_zero_all()` 只用于故障定位。生产路径、benchmark 路径和默认测试路径不得依赖 host
+reset，否则会绕开 workspace reuse 协议。
+
+multi-rank NVLS 需要把以下指针作为 closure constants baked into kernel：
+
+```text
+C_sym multicast VA
+nvl signal local / peer VAs
+ready_count_owner peer VAs
+ar_ready_bits peer VAs
+```
+
+不要把这些 64-bit VA 放进普通 CuTe compile args，以免被截断或错误处理。
+
+## 17. Correctness Invariants
+
+必须保持的不变量：
+
+- `row_tile_id` 是 FA、O_proj、AR 的共享 row identity。
+- `O_scratch` layout 固定为 `[row_tile_id, 128, H_local, D]`。
+- GQA 只改变 K/V head 寻址，不改变 O_proj K 维和下游 task identity。
+- KV layout 只改变 FA K/V load 地址映射。contiguous 和 paged TMA-128 不改变
+  O_scratch、O_proj ready queue、AR owner bitset、scheduler 或 workspace lifecycle。
+- paged-KV TMA-128 中 `n_block` 是 logical K block，`physical_page` 只用于 TMA source index。
+- O_proj 使用 ready queue：`reserve -> write entries -> ordered publish -> CAS consume`。
+- AR owner 使用 ready bitset：`ready_count_owner -> ar_ready_bits -> atomicAnd claim`。
+- O_proj queue 和 AR bitset 是两套不同协议，不能混用。
+- `ready_count_owner` 必须晚于 C_sym partial store 可见性发布。
+- `q_len <= k_len` 使用 bottom-right aligned causal mask。
+- paged-KV TMA-128 的真实 `k_len` 来自 `cache_seqlens`；最后一个 page 的无效 token 必须
+  由 `kv_local < k_len` 屏蔽。
+- FA tail row 的 collective 不能放进 divergent branch。
+- O_proj 只写 valid `m/n`；padding 不属于语义输出。
+- AR done count 只能在 reduce/store 完成后递增。
+- PipelineState 和 SMEM mbarrier 长寿命配对复用，不能单独 reset state。
+- tensor SMEM 可以 overlay，mbarrier 不能 overlay。
+- exit cleaner 清 per-layer control full capacity，不清 sync_ctrl。
+- 所有 persistent CTA 必须参与 exit grid_sync。
+- runtime workspace 不依赖 host 每层 reset；首层靠 create full zero，后续层靠上一层
+  exit cleaner + nvl_barrier。
+
+## 18. Verification Matrix
+
+当前主要验证入口：
+
+```text
+tests/fused/test_fused_single_card.py
+tests/fused/test_fused_paged_single_card.py
+tests/fused/test_fused_production.py
+tests/fused/test_fused_paged_production.py
+tests/fused/test_role_weights.py
+benchmarks/bench_fused_fa_oproj_ar.py
+tests/metadata/test_row_desc.py
+tests/kernels/test_fa_varlen.py
+```
+
+单卡 fused 测试覆盖（contiguous: `test_fused_single_card.py`；
+paged-KV TMA-128: `test_fused_paged_single_card.py`）：
+
+- full prompt prefill。
+- `q_len < k_len` contiguous chunked / append prefill。
+- paged-KV TMA-128 full prompt prefill。
+- paged-KV TMA-128 `q_len < k_len` chunked / append prefill。
+- paged cache 最后一个 K page 不满 128。
+- page_table 使用非连续、乱序 physical pages。
+- wrapper 对 `page_size != 128` 拒绝进入 paged TMA variant。
+- MHA。
+- GQA。
+- 最后一个 Q tile 不满 128。
+- hidden tail / ragged super group。
+- O_scratch 数值。
+- C_sym O_proj 数值。
+- sentinel leak，验证 O_proj 不写 masked tail。
+- exit cleaner，验证 task_ctrl 退出后被清零。
+- multi-layer reuse，不依赖 host reset。
+- 大 active range 后接小 active range。
+- 长 `k_len` 后接短 `k_len`。
+- over-capacity `set_layer` 拒绝后 workspace 仍可复用。
+
+多卡 production 测试覆盖 TP/NVLS 路径（contiguous: `test_fused_production.py`；
+paged-KV TMA-128: `test_fused_paged_production.py`，已在 TP=4 H200 验证通过）。benchmark
+用于评估 role weights、super group 粒度和 end-to-end 性能。
+
+## 19. Paged KV TMA-128 实现设计
+
+Paged KV 已经作为 compile-time variant 进入 fused kernel（`FusedFaOprojAr(paged=True,
+page_size=128)`、`FusedFaOprojArWorkspace.create(paged=True, ...)`）。本节定义该实现遵守的设计。
+
+第一阶段只实现：
+
+```text
+page_size == FA_N_TILE == 128
+paged TMA load
+```
+
+不实现：
+
+```text
+page_size != 128 的 PagedKVManager / cp.async row gather
+decode
+SplitKV
+partial O/LSE combine
+```
+
+### 19.1 为什么固定 page_size = 128
+
+FA K/V tile 的 N 维是 128。当 `page_size == 128` 时，一个 logical K block 正好对应一个
+logical page：
+
+```text
+logical n_block -> physical_page = page_table[batch_idx, n_block]
+K tile = K_cache[physical_page, :, kv_head, :]
+V tile = V_cache[physical_page, :, kv_head, :]
+```
+
+这可以用 TMA 一次加载完整 `[128, D]` tile。最后一个 page 即使未满 128 token，也仍然整页
+加载；无效列由 `k_len` mask 屏蔽。
+
+当 `page_size != 128` 时，一个 128 行 logical K/V tile 会跨多个 physical pages：
+
+```text
+row_idx = n_block * 128 + row
+page_idx, page_offset = divmod(row_idx, page_size)
+physical_page = page_table[batch_idx, page_idx]
+```
+
+physical pages 不保证连续，不能用一次 TMA 表达完整 tile。这需要类似 FA4
+`PagedKVManager` 的 row gather 和 cp.async 路径。该路径会改变 K/V producer 的线程参与、
+pointer 计算、predicate 和 pipeline 类型，必须作为后续独立阶段。
+
+### 19.2 Runtime Metadata
+
+paged variant 的 FA descriptor 由下面信息组成：
+
+```text
+row_tile_id -> (batch_idx, m_block)
+
+q_start = cu_seqlens_q[batch_idx]
+q_len   = cu_seqlens_q[batch_idx + 1] - q_start
+k_len   = cache_seqlens[batch_idx]
+offset  = k_len - q_len
+valid_m = min(128, q_len - m_block * 128)
+```
+
+`cache_seqlens[batch_idx]` 必须是当前 request 已写入 paged cache 的完整有效 KV 前缀长度。
+`page_table` 的第二维必须覆盖：
+
+```text
+ceil_div(cache_seqlens[batch_idx], 128)
+```
+
+个 logical pages。page table 中超出 `ceil_div(k_len, 128)` 的 entries 对该 sequence 无语义；
+它们必须被 block range 和 mask 排除，不能参与 attention。
+
+### 19.3 K/V Load
+
+Paged TMA-128 的 block range 与 contiguous 路径相同：
+
+```text
+n_block_min = 0
+n_block_max = min(ceil_div(k_len, 128),
+                  ceil_div((m_block + 1) * 128 + offset, 128))
+```
+
+进入范围的每个 `n_block` 先查 logical page：
+
+```text
+physical_page = page_table[batch_idx, n_block]
+```
+
+然后把 `physical_page` 作为 TMA source index：
+
+```text
+TMA K: K_cache[physical_page, :, kv_head, :]
+TMA V: V_cache[physical_page, :, kv_head, :]
+```
+
+不在 tile 内计算 `page_offset`。`page_offset` 恒等于 tile row，因为 `page_size == 128`。
+
+mask 使用 logical token 坐标：
+
+```text
+q_local  = m_block * 128 + row
+kv_local = n_block * 128 + col
+
+valid = (row < valid_m)
+     && (kv_local < k_len)
+     && (kv_local <= q_local + offset)
+```
+
+`physical_page` 不参与 causal 计算。
+
+### 19.4 GQA 与 TP 责任边界
+
+Paged KV 不改变 GQA 语义：
+
+```text
+q_per_kv = H_local / H_kv_local
+kv_head = q_head / q_per_kv
+```
+
+kernel 只消费当前 rank 的 local paged cache view：
+
+```text
+K_cache : [num_pages, 128, H_kv_local, D]
+V_cache : [num_pages, 128, H_kv_local, D]
+```
+
+kernel 不负责 global KV head replication，也不要求 global `H_kv` 能被 TP 整除。框架层必须
+保证传入的 local view 满足：
+
+```text
+H_kv_local >= 1
+H_local % H_kv_local == 0
+```
+
+当 `global H_kv < TP` 时，框架可以采用 SGLang 风格 KV head replication，使每个 rank
+暴露至少一个 `H_kv_local`。
+
+### 19.5 SGLang 接口约束
+
+SGLang 集成进入 paged TMA variant 前，wrapper 必须把 token pool KV cache reshape 成：
+
+```text
+key_cache.view(-1, 128, H_kv_local, D)
+value_cache.view(-1, 128, H_kv_local, D)
+```
+
+并传入：
+
+```text
+page_table    : [batch, max_num_pages_per_seq] int32
+cache_seqlens : [batch] int32
+cu_seqlens_q  : [batch + 1] int32
+```
+
+如果运行时 page size 不是 128，wrapper 必须拒绝进入 `paged_tma_varlen_128`。
+
+### 19.6 对下游协议的影响
+
+Paged TMA-128 不改变：
+
+```text
+row_tile_id
+FA task identity
+O_scratch layout
+head_ready 粒度
+O_proj slot_id
+O_proj ready queue
+AR owner ready_count / ar_ready_bits / ar_done_bits
+persistent scheduler
+workspace exit cleaner
+nvl_barrier
+```
+
+因此实现 paged KV 时，改动边界应集中在：
+
+```text
+kernel compile-time variant
+wrapper 参数检查
+FA descriptor 解码中的 k_len 来源
+FA K/V TMA tensor view 与 source index
+reference / tests 中 paged cache -> logical contiguous K/V 的还原
+```
